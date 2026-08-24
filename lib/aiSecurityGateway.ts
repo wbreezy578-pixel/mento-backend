@@ -4,6 +4,7 @@ import { assessAndSecureChatRequest } from './aiSecurityIntegration';
 import { BillingDecision, BillingReservationInput, finalizeUsage, rollbackUsage, reserveUsage } from '../services/billingService';
 import { consumeLiveTutorSeconds } from '../services/liveTutorBillingService';
 import logger from './logger';
+import { observeMonitoringLatency } from './monitoring';
 
 export class AIRequestGatewayError extends Error {
   status: number;
@@ -90,6 +91,7 @@ interface ReserveUsageOptions {
   modelUsed?: string | null;
   metadata?: Record<string, unknown>;
   pending?: boolean;
+  finalize?: boolean;
 }
 
 export async function reserveAIUsage(options: ReserveUsageOptions): Promise<BillingDecision> {
@@ -131,6 +133,7 @@ interface ExecuteAIRequestOptions<T> {
   modelUsed?: string | null;
   metadata?: Record<string, unknown>;
   pending?: boolean;
+  finalize?: boolean;
   securityInput?: string;
   securityContext?: {
     conversationId?: string;
@@ -154,6 +157,7 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
   const userId = getUserId(options.user);
 
   if (typeof options.securityInput === 'string') {
+    const securityStartedAt = Date.now();
     const securityResult = await secureAITextInput({
       userId,
       requestId,
@@ -162,6 +166,7 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
       conversationId: options.securityContext?.conversationId,
       hasImage: options.securityContext?.hasImage,
     });
+    observeMonitoringLatency('api', Date.now() - securityStartedAt, { route: 'chat-stream', operation: 'security-check' });
     sanitizedInput = securityResult.sanitizedInput;
   }
 
@@ -190,7 +195,7 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
       sanitizedInput,
     });
 
-    await finalizeAIUsage({
+    if (options.finalize !== false) await finalizeAIUsage({
       userId,
       feature: options.feature,
       amount: options.amount,

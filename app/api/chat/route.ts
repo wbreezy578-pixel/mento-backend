@@ -6,6 +6,7 @@ import {
   getOrCreateLatestConversation,
   addMessageToConversation,
   setConversationTitleIfMissing,
+  updateConversationSummary,
 } from '@/lib/conversationDb';
 import { AIRequestGatewayError, authenticateAIRequest, enforceAIGatewayRateLimit, executeAIRequest, getClientIp, buildAIRequestId } from '../../../lib/aiSecurityGateway';
 import { validateImageBuffer } from '../../../lib/imageValidator';
@@ -51,9 +52,9 @@ export async function POST(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(userId, clientIp);
 
-    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown } | null = null;
+    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown } | null = null;
     try {
-      body = (await req.json()) as { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown };
+      body = (await req.json()) as { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown };
     } catch {
       return buildErrorResponse('Invalid JSON body', 400, 'validation_error', req.headers.get('origin'), requestId);
     }
@@ -63,6 +64,7 @@ export async function POST(req: Request) {
     requestId = typeof body?.requestId === 'string' && body.requestId.trim()
       ? body.requestId.trim()
       : requestId;
+    const answerMode = body?.answerMode === 'short' ? 'short' : 'detailed';
 
     if (!message && !image) {
       return buildErrorResponse('Invalid input: message or image is required', 400, 'validation_error', req.headers.get('origin'), requestId);
@@ -123,7 +125,10 @@ export async function POST(req: Request) {
       securityContext: { conversationId, hasImage: Boolean(validatedImage) },
       callback: async ({ billingDecision, sanitizedInput }) => {
         const sanitizedText = sanitizedInput ?? userText;
-        const userEntry: GeminiMessage = { role: 'user', parts: [{ text: sanitizedText }] };
+        const modeInstruction = answerMode === 'short'
+          ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
+          : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
+        const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${sanitizedText}${modeInstruction}` }] };
         const contents: Array<GeminiMessage | GeminiImageContent> = [...historyForAI, userEntry];
 
         if (validatedImage) {
@@ -148,6 +153,7 @@ export async function POST(req: Request) {
       const assistantText = typeof result.result === 'string' ? result.result : String(result.result ?? '');
       await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
       await addMessageToConversation(conversationId, 'assistant', assistantText, userId, { requestId });
+      await updateConversationSummary(conversationId);
     } catch (dbErr) {
       logger.error('Failed to save chat to DB', { error: String(dbErr) });
     }

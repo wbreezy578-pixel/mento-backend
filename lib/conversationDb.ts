@@ -1,6 +1,8 @@
 import { prisma } from './prisma';
 
 const messageDedupCache = new Map<string, { expiresAt: number; messageId: string }>();
+const AI_HISTORY_MESSAGE_LIMIT = 40;
+export const RECENT_MESSAGE_WINDOW = AI_HISTORY_MESSAGE_LIMIT;
 
 /**
  * Server-side conversation management.
@@ -8,11 +10,12 @@ const messageDedupCache = new Map<string, { expiresAt: number; messageId: string
  * This prevents session injection and history tampering.
  */
 
-export async function createConversation(userId: string, title?: string | null) {
+export async function createConversation(userId: string, title?: string | null, source = 'chat') {
   return await prisma.conversation.create({
     data: {
       userId,
       title: title?.trim() ? title.trim() : null,
+      source,
       messages: {
         create: [],
       },
@@ -38,6 +41,8 @@ export async function getConversation(conversationId: string) {
       pinned: true,
       createdAt: true,
       updatedAt: true,
+      summary: true,
+      summaryUpdatedAt: true,
       messages: {
         orderBy: { createdAt: 'asc' },
         select: {
@@ -74,7 +79,7 @@ export async function addMessageToConversation(
   role: 'user' | 'assistant',
   text: string,
   userId?: string,
-  options?: { requestId?: string }
+  options?: { requestId?: string; status?: 'streaming' | 'completed' | 'failed' }
 ) {
   const dedupKey = options?.requestId ? `${options.requestId}:${role}` : undefined;
   if (dedupKey) {
@@ -124,6 +129,7 @@ export async function addMessageToConversation(
       conversationId,
       userId: userId ?? '',
       role,
+        status: options?.status ?? 'completed',
       content: text,
       text,
     },
@@ -146,12 +152,41 @@ export async function addMessageToConversation(
  * Always retrieve from server; never trust frontend history.
  */
 export async function getConversationHistoryForAI(conversationId: string) {
-  const conv = await getConversation(conversationId);
+  const conv = await prisma.conversation.findUnique({
+    where: { id: conversationId },
+    select: {
+      messages: {
+        orderBy: { createdAt: 'desc' },
+        take: AI_HISTORY_MESSAGE_LIMIT,
+        select: {
+          role: true,
+          content: true,
+          text: true,
+        },
+      },
+    },
+  });
   if (!conv) return [];
-  return conv.messages.map((msg: { role: string; content?: string | null; text?: string | null }) => ({
+  return conv.messages.reverse().map((msg) => ({
     role: msg.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: msg.content ?? msg.text ?? '' }],
   }));
+}
+
+export async function updateConversationSummary(conversationId: string) {
+  const messages = await prisma.conversationMessage.findMany({
+    where: { conversationId, role: { in: ['user', 'assistant'] }, status: { not: 'failed' } },
+    orderBy: { createdAt: 'desc' },
+    take: 6,
+    select: { role: true, content: true, text: true },
+  });
+  const prompts = messages.filter((message) => message.role === 'user')
+    .map((message) => (message.content ?? message.text ?? '').trim())
+    .filter(Boolean)
+    .reverse();
+  if (!prompts.length) return null;
+  const summary = prompts.map((prompt) => prompt.replace(/\s+/g, ' ').slice(0, 140)).join(' | ').slice(0, 500);
+  return prisma.conversation.update({ where: { id: conversationId }, data: { summary, summaryUpdatedAt: new Date() } });
 }
 
 function titleize(value: string) {
@@ -238,9 +273,9 @@ export async function updateConversationTitle(conversationId: string, title: str
  * Get all conversations for a user, sorted by pinned (desc) then by updatedAt (desc).
  * Pinned conversations appear at the top.
  */
-export async function getUserConversations(userId: string) {
+export async function getUserConversations(userId: string, source?: string) {
   return await prisma.conversation.findMany({
-    where: { userId },
+    where: { userId, ...(source ? { source } : {}) },
     orderBy: [{ pinned: 'desc' }, { updatedAt: 'desc' }],
     select: {
       id: true,
@@ -248,6 +283,8 @@ export async function getUserConversations(userId: string) {
       pinned: true,
       createdAt: true,
       updatedAt: true,
+      summary: true,
+      summaryUpdatedAt: true,
       messages: {
         take: 1,
         orderBy: { createdAt: 'desc' },
@@ -287,6 +324,7 @@ export default {
   deleteConversation,
   updateConversationTitle,
   getUserConversations,
+  updateConversationSummary,
   pinConversation,
   unpinConversation,
 };

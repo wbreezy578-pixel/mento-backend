@@ -7,9 +7,11 @@ import { getCircuitBreaker } from '../lib/resilience';
 import logger from '../lib/logger';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
 import { trackShutdownOperation } from '../lib/crashRecovery';
+import { getPaddleNotificationWebhookSecret, getPaddleProPriceId, getPaddleTopUp50PriceId, getPaddleTopUp100PriceId } from '../lib/env';
+import { getPaddleInstance } from '../lib/paddle';
 import '../lib/metrics';
 
-export type PaymentProvider = 'STRIPE' | 'MPESA' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE';
+export type PaymentProvider = 'MPESA' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE' | 'PADDLE';
 export type PaymentType = 'SUBSCRIPTION' | 'TOP_UP';
 export type PaymentStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'REQUIRES_ACTION' | 'REFUNDED';
 
@@ -46,6 +48,8 @@ export interface PaymentTransactionView {
   providerSubscriptionId?: string | null;
   failureReason?: string | null;
   metadata?: Record<string, unknown> | null;
+  providerPayload?: Record<string, unknown> | null;
+  checkoutUrl?: string | null;
   receipt?: PaymentReceiptView | null;
   createdAt: string;
 }
@@ -58,6 +62,7 @@ interface PaymentRecord {
   status: PaymentStatus;
   currency: string;
   amountUsd: number;
+  amountMinor: number;
   description?: string | null;
   idempotencyKey?: string | null;
   receiptNumber?: string | null;
@@ -72,32 +77,32 @@ interface PaymentRecord {
 }
 
 const WEBHOOK_SECRET_ENV_KEYS: Record<PaymentProvider, string> = {
-  STRIPE: 'PAYMENT_STRIPE_WEBHOOK_SECRET',
   MPESA: 'PAYMENT_MPESA_WEBHOOK_SECRET',
   GOOGLE_PLAY: 'PAYMENT_GOOGLE_PLAY_WEBHOOK_SECRET',
   APPLE_APP_STORE: 'PAYMENT_APPLE_APP_STORE_WEBHOOK_SECRET',
+  PADDLE: 'PADDLE_NOTIFICATION_WEBHOOK_SECRET',
 };
 
 const PROVIDER_DISPLAY_NAMES: Record<PaymentProvider, string> = {
-  STRIPE: 'Stripe',
   MPESA: 'M-Pesa',
   GOOGLE_PLAY: 'Google Play Billing',
   APPLE_APP_STORE: 'Apple App Store',
+  PADDLE: 'Paddle',
 };
 
 const paymentBreakers: Record<PaymentProvider, ReturnType<typeof getCircuitBreaker>> = {
-  STRIPE: getCircuitBreaker('payment:stripe', 3, 60000),
   MPESA: getCircuitBreaker('payment:mpesa', 3, 60000),
   GOOGLE_PLAY: getCircuitBreaker('google_play', 3, 60000),
   APPLE_APP_STORE: getCircuitBreaker('apple_app_store', 3, 60000),
+  PADDLE: getCircuitBreaker('payment:paddle', 3, 60000),
 };
 
 function normalizeProvider(value: string): PaymentProvider {
   switch (value.toUpperCase()) {
-    case 'STRIPE': return 'STRIPE';
     case 'MPESA': return 'MPESA';
     case 'GOOGLE_PLAY': return 'GOOGLE_PLAY';
     case 'APPLE_APP_STORE': return 'APPLE_APP_STORE';
+    case 'PADDLE': return 'PADDLE';
     default: throw new Error('Unsupported payment provider');
   }
 }
@@ -153,21 +158,67 @@ function isPrismaUniqueConstraintError(error: unknown): error is Prisma.PrismaCl
   );
 }
 
+export function buildPaymentIdempotencyKey(input: Pick<StartPaymentInput, 'userId' | 'provider' | 'type' | 'amountUsd' | 'currency' | 'description' | 'metadata' | 'idempotencyKey'>): string {
+  const normalized = {
+    userId: input.userId,
+    provider: input.provider,
+    type: input.type,
+    amountUsd: Number(input.amountUsd).toFixed(2),
+    currency: (input.currency ?? 'USD').toUpperCase(),
+    description: (input.description ?? '').trim(),
+    metadata: input.metadata ?? {},
+  };
+  return `payment:${createHash('sha256').update(JSON.stringify(normalized)).digest('hex')}`;
+}
+
 function getWebhookSecret(provider: PaymentProvider): string {
+  if (provider === 'PADDLE') {
+    return getPaddleNotificationWebhookSecret()?.trim() ?? '';
+  }
+
   return process.env[WEBHOOK_SECRET_ENV_KEYS[provider]]?.trim() ?? '';
 }
 
-export function buildPaymentIdempotencyKey(input: Pick<StartPaymentInput, 'userId' | 'provider' | 'type' | 'amountUsd' | 'currency' | 'description' | 'metadata'>): string {
-  const normalized = {
-    userId: input.userId,
-    provider: input.provider.toUpperCase(),
-    type: input.type.toUpperCase(),
-    amountUsd: validateAmount(input.amountUsd),
-    currency: validateCurrency(input.currency),
-    description: (input.description || '').trim(),
-    metadata: JSON.stringify(input.metadata ?? {}),
-  };
-  return `payment:${createHash('sha256').update(JSON.stringify(normalized)).digest('hex')}`;
+/**
+ * Maps Paddle product price IDs to live tutor minutes.
+ * Returns the minute amount for known Paddle top-up price IDs.
+ * Returns null for unknown price IDs (including Pro subscription prices).
+ */
+function getPaddleTopUpMinutesForPriceId(priceId: string): number | null {
+  if (!priceId || typeof priceId !== 'string') {
+    return null;
+  }
+
+  const priceId50 = getPaddleTopUp50PriceId();
+  const priceId100 = getPaddleTopUp100PriceId();
+
+  if (priceId === priceId50) {
+    return 50;
+  }
+  if (priceId === priceId100) {
+    return 100;
+  }
+
+  return null;
+}
+
+/**
+ * Checks if a webhook has already been processed for this transaction.
+ * Used to prevent duplicate minute grants from duplicate Paddle webhooks.
+ */
+async function hasWebhookBeenProcessed(transactionId: string, webhookId: string): Promise<boolean> {
+  const tx = await prisma.paymentTransaction.findUnique({ where: { id: transactionId } });
+  if (!tx || !tx.providerPayload) {
+    return false;
+  }
+
+  try {
+    const payload = typeof tx.providerPayload === 'object' ? tx.providerPayload as any : {};
+    const webhookIds: string[] = Array.isArray(payload?.webhookIds) ? payload.webhookIds : [];
+    return webhookIds.includes(webhookId);
+  } catch {
+    return false;
+  }
 }
 
 async function getOrCreateTransaction(input: StartPaymentInput): Promise<PaymentRecord> {
@@ -258,7 +309,10 @@ async function startPaymentInternal(input: StartPaymentInput): Promise<PaymentTr
   }
 
   try {
-    const transaction = await getOrCreateTransaction(input);
+    let transaction = await getOrCreateTransaction(input);
+    // For Paddle flow, the client will perform checkout via Paddle.js and provide
+    // providerTransactionId/providerCustomerId back to the server when available.
+
     const receipt = await prisma.paymentReceipt.findUnique({ where: { transactionId: transaction.id } });
     breaker.recordSuccess();
     observeMonitoringLatency('billing', Date.now() - startedAt, { provider, operation: 'start_payment' });
@@ -323,8 +377,10 @@ async function finalizePaymentInternal(input: {
     throw new Error('Payment provider is temporarily unavailable. The payment remains pending and recoverable.');
   }
 
-  const updated = await prisma.$transaction(async (tx) => {
-    const current = await tx.paymentTransaction.update({
+  // Use longer transaction timeout to accommodate plan initialization
+  const updated = await prisma.$transaction(
+    async (tx) => {
+      const current = await tx.paymentTransaction.update({
       where: { id: transaction.id },
       data: {
         provider,
@@ -357,16 +413,85 @@ async function finalizePaymentInternal(input: {
             subscriptionStatus: 'active',
           },
         });
+
+        // Fix 1: Grant 200 live tutor minutes for Pro subscription
+        // Use webhook alert ID for idempotency to prevent duplicate grants from replay webhooks
+        const providerPayload = current.providerPayload && typeof current.providerPayload === 'object'
+          ? current.providerPayload as any
+          : {};
+        const webhookIds: string[] = Array.isArray(providerPayload?.webhookIds) ? providerPayload.webhookIds : [];
+        
+        // Only grant minutes if this is the first time processing this transaction for this webhook alert
+        // The webhook alert ID is appended during webhook processing in paddleWebhookService
+        if (webhookIds.length === 0 || !providerPayload?.minutesGrantedFromInitialWebhook) {
+          const liveTutorWallet = await tx.liveTutorWallet.findUnique({ where: { userId: current.userId } });
+          if (liveTutorWallet) {
+            await tx.liveTutorWallet.update({
+              where: { userId: current.userId },
+              data: { 
+                minutesBalance: { increment: 200 }
+              },
+            });
+            logger.info('Granted 200 live tutor minutes for Pro subscription', { userId: current.userId, transactionId: current.id });
+          }
+          
+          // Mark that we've granted minutes from the initial successful webhook
+          providerPayload.minutesGrantedFromInitialWebhook = true;
+          await tx.paymentTransaction.update({
+            where: { id: current.id },
+            data: { providerPayload: providerPayload as Prisma.InputJsonValue },
+          });
+        }
       }
 
       if (current.type === 'TOP_UP') {
-        const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: current.userId } });
-        if (wallet) {
-          const topUpMinutes = Math.max(1, Math.round(current.amountUsd * Number(process.env.PAYMENT_TOP_UP_MINUTES_PER_USD || 1)));
-          await tx.liveTutorWallet.update({
-            where: { userId: current.userId },
-            data: { minutesBalance: { increment: topUpMinutes } },
-          });
+        // Fix 2: Map Paddle top-up price IDs to exact minute amounts
+        let topUpMinutes: number | null = null;
+        
+        // First try to get price ID from provider payload (Paddle includes this)
+        const providerPayload = current.providerPayload && typeof current.providerPayload === 'object'
+          ? current.providerPayload as any
+          : {};
+        
+        const paddlePriceId = String(providerPayload?.product_id ?? providerPayload?.price_id ?? '').trim();
+        
+        if (paddlePriceId) {
+          topUpMinutes = getPaddleTopUpMinutesForPriceId(paddlePriceId);
+          if (topUpMinutes === null) {
+            // Unknown Paddle price ID for top-up - log and do not grant minutes
+            logger.warn('Received top-up payment with unknown Paddle price ID', {
+              userId: current.userId,
+              priceId: paddlePriceId,
+              transactionId: current.id,
+            });
+            topUpMinutes = 0; // Explicitly set to 0 to indicate no grant
+          } else {
+            logger.info('Mapped Paddle price ID to top-up minutes', {
+              userId: current.userId,
+              priceId: paddlePriceId,
+              minutes: topUpMinutes,
+              transactionId: current.id,
+            });
+          }
+        } else {
+          // Fallback: use legacy PAYMENT_TOP_UP_MINUTES_PER_USD for non-Paddle providers
+          topUpMinutes = Math.max(1, Math.round(current.amountUsd * Number(process.env.PAYMENT_TOP_UP_MINUTES_PER_USD || 1)));
+        }
+
+        // Only grant minutes if we have a positive amount
+        if (topUpMinutes && topUpMinutes > 0) {
+          const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: current.userId } });
+          if (wallet) {
+            await tx.liveTutorWallet.update({
+              where: { userId: current.userId },
+              data: { minutesBalance: { increment: topUpMinutes } },
+            });
+            logger.info('Granted live tutor minutes from top-up', {
+              userId: current.userId,
+              minutes: topUpMinutes,
+              transactionId: current.id,
+            });
+          }
         }
       }
 
@@ -438,7 +563,9 @@ async function finalizePaymentInternal(input: {
     }
 
     return current;
-  });
+  },
+  { timeout: 30000 }  // Increase timeout to 30 seconds for payment finalization
+  );
 
   try {
     const view = toView({
@@ -498,6 +625,10 @@ export async function getPayment(userId: string, paymentId: string): Promise<Pay
 }
 
 function toView(row: PaymentRecord & { receipt?: { receiptNumber: string; status: string; receiptUrl: string | null; documentHash: string | null } | null }): PaymentTransactionView {
+  const providerPayload = row.providerPayload && typeof row.providerPayload === 'object'
+    ? row.providerPayload as Record<string, unknown>
+    : null;
+
   return {
     id: row.id,
     provider: row.provider,
@@ -510,6 +641,8 @@ function toView(row: PaymentRecord & { receipt?: { receiptNumber: string; status
     providerSubscriptionId: row.providerSubscriptionId ?? null,
     failureReason: row.failureReason ?? null,
     metadata: row.metadata && typeof row.metadata === 'object' ? row.metadata as Record<string, unknown> : null,
+    providerPayload,
+    checkoutUrl: providerPayload && typeof providerPayload.url === 'string' ? String(providerPayload.url) : null,
     receipt: row.receipt ? {
       receiptNumber: row.receipt.receiptNumber,
       status: row.receipt.status,
@@ -527,18 +660,24 @@ export async function verifyWebhookSignature(input: { payload: string; signature
     return false;
   }
 
-  const expected = createHmac('sha256', secret).update(input.payload).digest('hex');
   const candidate = input.signature.trim();
   if (!candidate) {
     return false;
   }
 
-  if (provider === 'STRIPE') {
-    const stripPrefix = candidate.startsWith('sha256=') ? candidate.slice(7) : candidate;
-    return stripPrefix === expected;
-  }
+  try {
+    if (provider === 'PADDLE') {
+      const paddle = getPaddleInstance();
+      await paddle.webhooks.unmarshal(input.payload, secret, candidate);
+      return true;
+    }
 
-  return candidate === expected || candidate === `sha256=${expected}`;
+    const expected = createHmac('sha256', secret).update(input.payload).digest('hex');
+    return candidate === expected || candidate === `sha256=${expected}`;
+  } catch (err) {
+    logger.warn('Webhook signature verification error', { provider, err });
+    return false;
+  }
 }
 
 export async function getLedgerSummary(userId: string): Promise<{ balanceUsd: number; entries: Array<{ id: string; description: string; amountUsd: number; balanceAfter: number; createdAt: string }> }> {

@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildAuthCookieOptions, getClientIp, getLoginPolicyState, isAdminUser, isTokenExpired } from './auth';
+import * as auth from './auth';
 import { sanitizeForLogging } from '../../lib/sanitize';
 
 test('buildAuthCookieOptions applies secure defaults in production', () => {
-  const options = buildAuthCookieOptions({ isProduction: true, maxAgeSeconds: 3600, path: '/api/auth' });
+  const options = auth.buildAuthCookieOptions({ isProduction: true, maxAgeSeconds: 3600, path: '/api/auth' });
   assert.ok(options);
 
   assert.equal(options?.httpOnly, true);
@@ -15,15 +15,15 @@ test('buildAuthCookieOptions applies secure defaults in production', () => {
 });
 
 test('isTokenExpired detects expired tokens', () => {
-  const expired = isTokenExpired(Math.floor(Date.now() / 1000) - 10);
-  const active = isTokenExpired(Math.floor(Date.now() / 1000) + 600);
+  const expired = auth.isTokenExpired(Math.floor(Date.now() / 1000) - 10);
+  const active = auth.isTokenExpired(Math.floor(Date.now() / 1000) + 600);
 
   assert.equal(expired, true);
   assert.equal(active, false);
 });
 
 test('getLoginPolicyState blocks locked accounts and exposes remaining lockout time', () => {
-  const state = getLoginPolicyState({
+  const state = auth.getLoginPolicyState({
     failedLoginAttempts: 5,
     lockedAt: new Date(Date.now() + 60_000),
   });
@@ -34,7 +34,7 @@ test('getLoginPolicyState blocks locked accounts and exposes remaining lockout t
 });
 
 test('getLoginPolicyState allows unlocked accounts with low failure counts', () => {
-  const state = getLoginPolicyState({
+  const state = auth.getLoginPolicyState({
     failedLoginAttempts: 2,
     lockedAt: null,
   });
@@ -51,7 +51,7 @@ test('getClientIp extracts the left-most forwarded address', () => {
     },
   });
 
-  assert.equal(getClientIp(request), '198.51.100.10');
+  assert.equal(auth.getClientIp(request), '198.51.100.10');
 });
 
 test('isAdminUser honors explicit admin markers and configured admin emails', () => {
@@ -59,10 +59,10 @@ test('isAdminUser honors explicit admin markers and configured admin emails', ()
   process.env.ADMIN_EMAILS = 'admin@example.com';
 
   try {
-    assert.equal(isAdminUser({ email: 'admin@example.com' }), true);
-    assert.equal(isAdminUser({ email: 'user@example.com' }), false);
-    assert.equal(isAdminUser({ authProvider: 'admin' }), true);
-    assert.equal(isAdminUser({ role: 'admin' }), true);
+    assert.equal(auth.isAdminUser({ email: 'admin@example.com' }), true);
+    assert.equal(auth.isAdminUser({ email: 'user@example.com' }), false);
+    assert.equal(auth.isAdminUser({ authProvider: 'admin' }), true);
+    assert.equal(auth.isAdminUser({ role: 'admin' }), true);
   } finally {
     if (previous === undefined) {
       delete process.env.ADMIN_EMAILS;
@@ -70,6 +70,22 @@ test('isAdminUser honors explicit admin markers and configured admin emails', ()
       process.env.ADMIN_EMAILS = previous;
     }
   }
+});
+
+test('isBcryptHash detects valid bcrypt hashes', () => {
+  assert.equal(auth.isBcryptHash('$2a$12$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOpqrstuv'), true);
+  assert.equal(auth.isBcryptHash('$2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOpqrstuv'), true);
+  assert.equal(auth.isBcryptHash('not-a-bcrypt-hash'), false);
+});
+
+test('verifyPassword supports bcrypt and legacy raw passwords', async () => {
+  const rawPassword = 'TestPassword123!';
+  const bcryptHash = await auth.hashPassword(rawPassword);
+
+  assert.equal(await auth.verifyPassword(rawPassword, bcryptHash), true);
+  assert.equal(await auth.verifyPassword('wrong-password', bcryptHash), false);
+  assert.equal(await auth.verifyPassword(rawPassword, rawPassword), true);
+  assert.equal(await auth.verifyPassword('wrong-password', rawPassword), false);
 });
 
 test('sanitizeForLogging redacts secrets embedded in strings and objects', () => {

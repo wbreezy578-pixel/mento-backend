@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": { "value": "uksouth" },
+    "containerAppEnvironmentName": { "value": "mento-voice-env" },
+    "containerAppName": { "value": "mento-voice" },
+    "containerImage": { "value": "YOUR_REGISTRY/mento:YOUR_TAG" },
+    "containerRegistryServer": { "value": "YOUR_REGISTRY" },
+    "containerRegistryUsername": { "value": "YOUR_REGISTRY_USERNAME" },
+    "containerRegistryPassword": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "databaseUrl": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "directUrl": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "redisUrl": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "jwtSecret": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "geminiApiKey": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "supabaseServiceRoleKey": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "supabaseUrl": { "value": "https://YOUR_PROJECT.supabase.co" },
+    "supabaseAnonKey": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "simliApiKey": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "simliAvatarId": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "simliVoiceId": { "value": "Default" },
+    "paymentWebhookAuthSecret": { "value": "SET_AT_DEPLOYMENT_TIME" }
+  }
+}

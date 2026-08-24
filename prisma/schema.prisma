@@ -3,222 +3,75 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 model User {
-  id                    String                 @id @default(cuid())
-  email                 String                 @unique
-  password              String                 @default("")
-  name                  String?
-  createdAt             DateTime               @default(now())
-  updatedAt             DateTime               @updatedAt
-  authProvider          String                 @default("email")
-  lastOAuthReauthAt     DateTime?
-  emailVerified        Boolean                @default(false)
-  failedLoginAttempts   Int                    @default(0)
-  lockedAt              DateTime?
-  lastFailedLoginAt     DateTime?
-  lastLoginAt           DateTime?
-  conversations         Conversation[]
-  liveTutorWallet       LiveTutorWallet?
-  notifications         Notification[]
+  id                     String                  @id @default(cuid())
+  email                  String                  @unique
+  password               String                  @default("")
+  name                   String?
+  createdAt              DateTime                @default(now())
+  authProvider           String                  @default("email")
+  lastOAuthReauthAt      DateTime?
+  emailVerified          Boolean                 @default(false)
+  updatedAt              DateTime                @updatedAt
+  failedLoginAttempts    Int                     @default(0)
+  lastFailedLoginAt      DateTime?
+  lastLoginAt            DateTime?
+  lockedAt               DateTime?
+  clerkUserId            String?                 @unique
+  conversations          Conversation[]
+  liveTutorSession       LiveTutorSession?
+  liveTutorWallet        LiveTutorWallet?
+  notifications          Notification[]
   notificationPreference NotificationPreference?
-  usageLogs             UsageLog[]
-  wallet                UserWallet?
-  sessions              Session[]
-  securityEvents        SecurityEvent[]
-  userSettings          UserSetting?
-  payments              PaymentTransaction[]
-  paymentLedgerEntries  PaymentLedgerEntry[]
-  paymentReceipts       PaymentReceipt[]
-}
-
-enum PaymentProvider {
-  STRIPE
-  MPESA
-  GOOGLE_PLAY
-  APPLE_APP_STORE
-}
-
-enum PaymentType {
-  SUBSCRIPTION
-  TOP_UP
-}
-
-enum PaymentStatus {
-  PENDING
-  SUCCEEDED
-  FAILED
-  CANCELLED
-  REQUIRES_ACTION
-  REFUNDED
-}
-
-model PaymentTransaction {
-  id                     String           @id @default(cuid())
-  userId                 String?
-  user                   User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
-  provider               PaymentProvider
-  providerTransactionId  String?          @unique
-  providerSubscriptionId String?
-  providerCustomerId     String?
-  type                   PaymentType
-  status                 PaymentStatus    @default(PENDING)
-  currency               String           @default("USD")
-  amountUsd              Float            @default(0)
-  amountMinor            Int              @default(0)
-  description            String?
-  metadata               Json?
-  idempotencyKey         String?          @unique
-  receiptNumber          String?
-  providerPayload        Json?
-  failureReason          String?
-  lastWebhookAt          DateTime?
-  expiresAt              DateTime?
-  createdAt              DateTime         @default(now())
-  updatedAt              DateTime         @updatedAt
-
-  receipt                PaymentReceipt?
-  ledgerEntries          PaymentLedgerEntry[]
-
-  @@index([userId, createdAt])
-  @@index([status, createdAt])
-  @@index([provider, providerTransactionId])
-}
-
-model PaymentLedgerEntry {
-  id             String    @id @default(cuid())
-  userId         String?
-  transactionId  String?
-  entryType      String
-  amountUsd      Float     @default(0)
-  currency       String    @default("USD")
-  balanceAfter   Float     @default(0)
-  referenceType  String?
-  referenceId    String?
-  description    String
-  metadata       Json?
-  createdAt      DateTime  @default(now())
-
-  user           User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
-  transaction    PaymentTransaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
-
-  @@index([userId, createdAt])
-  @@index([transactionId])
-}
-
-model PaymentReceipt {
-  id             String    @id @default(cuid())
-  transactionId  String    @unique
-  userId         String?
-  receiptNumber  String    @unique
-  status         String    @default("ISSUED")
-  receiptUrl     String?
-  documentHash   String?
-  payload        Json?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
-
-  user           User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
-  transaction    PaymentTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
-
-  @@index([userId, createdAt])
-}
-
-model NotificationPreference {
-  id                  String   @id @default(cuid())
-  userId              String   @unique
-  emailEnabled        Boolean  @default(true)
-  pushEnabled         Boolean  @default(true)
-  marketingEnabled    Boolean  @default(false)
-  weeklyDigestEnabled Boolean  @default(true)
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
-  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-}
-
-model UserSetting {
-  id          String   @id @default(cuid())
-  userId      String   @unique
-  theme       String   @default("system")
-  language    String   @default("en")
-  timezone    String   @default("UTC")
-  compactMode Boolean  @default(false)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-}
-
-model Session {
-  id                  String    @id @default(cuid())
-  userId              String
-  tokenHash           String    @unique
-  userAgent           String?
-  ipAddress           String?
-  expiresAt           DateTime
-  createdAt           DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
-  lastUsedAt          DateTime?
-  revokedAt           DateTime?
-  replacedBySessionId String?
-  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId, revokedAt])
-  @@index([tokenHash])
-  @@index([expiresAt])
-}
-
-model SecurityEvent {
-  id        String   @id @default(cuid())
-  userId    String?
-  eventType String
-  severity  String   @default("info")
-  details   Json?
-  createdAt DateTime @default(now())
-  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@index([userId, createdAt])
-  @@index([eventType, createdAt])
+  passwordResetTokens    PasswordResetToken[]
+  paymentLedgerEntries   PaymentLedgerEntry[]
+  paymentReceipts        PaymentReceipt[]
+  paymentTransactions    PaymentTransaction[]
+  securityEvents         SecurityEvent[]
+  sessions               Session[]
+  usageLogs              UsageLog[]
+  chatAnalytics          ChatAnalyticsEvent[]
+  userSetting            UserSetting?
+  wallet                 UserWallet?
 }
 
 model Notification {
-  id        String   @id @default(cuid())
-  userId    String
-  title     String
-  body      String
-  type      String
-  category  NotificationCategory @default(PRODUCT_UPDATES)
-  externalId String? @unique
-  icon      String?
-  actionUrl String?
-  isRead    Boolean  @default(false)
-  metadata  Json?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id         String               @id @default(cuid())
+  userId     String
+  title      String
+  body       String
+  type       String
+  icon       String?
+  actionUrl  String?
+  isRead     Boolean              @default(false)
+  metadata   Json?
+  createdAt  DateTime             @default(now())
+  updatedAt  DateTime             @updatedAt
+  category   NotificationCategory
+  externalId String?              @unique
+  user       User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
 }
 
-enum NotificationCategory {
-  BILLING
-  TUTOR
-  SECURITY
-  SUPPORT
-  PRODUCT_UPDATES
-}
-
 model UserWallet {
-  id                 String   @id @default(cuid())
-  userId             String   @unique
-  subscriptionStatus String   @default("active")
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-  planId             String
-  plan               Plan     @relation(fields: [planId], references: [id])
-  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                    String    @id @default(cuid())
+  userId                String    @unique
+  subscriptionStatus    String    @default("active")
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  planId                String
+  paddleCustomerId      String?
+  paddlePriceId         String?
+  paddleSubscriptionId  String?
+  subscriptionExpiresAt DateTime?
+  plan                  Plan      @relation(fields: [planId], references: [id])
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model Plan {
@@ -247,6 +100,34 @@ model LiveTutorWallet {
   user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
+model LiveTutorSession {
+  id                    String        @id @default(cuid())
+  userId                String        @unique
+  streamId              String        @unique
+  billingRequestId      String?       @unique
+  status                String        @default("creating")
+  createdAt             DateTime      @default(now())
+  lastActivityAt        DateTime      @default(now())
+  expiresAt             DateTime?
+  secondsReserved       Int           @default(60)
+  secondsConsumed       Int           @default(0)
+  billingFinalized      Boolean       @default(false)
+  terminalStatus        String?
+  terminalReason        String?
+  finalizedAt           DateTime?
+  avatarVoiceProfile    String?
+  ownerProcessId        String?
+  finalizationStartedAt DateTime?
+  conversationId        String?
+  conversation          Conversation? @relation(fields: [conversationId], references: [id])
+  user                  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, lastActivityAt])
+  @@index([expiresAt])
+  @@index([ownerProcessId])
+  @@index([conversationId])
+}
+
 model UsageLog {
   id              String   @id @default(cuid())
   userId          String
@@ -271,6 +152,131 @@ model UsageLog {
   @@index([feature, provider])
 }
 
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  usedAt    DateTime?
+  revokedAt DateTime?
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Session {
+  id                  String    @id @default(cuid())
+  userId              String
+  tokenHash           String    @unique
+  userAgent           String?
+  ipAddress           String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  lastUsedAt          DateTime?
+  expiresAt           DateTime
+  revokedAt           DateTime?
+  replacedBySessionId String?
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+}
+
+model SecurityEvent {
+  id        String   @id @default(cuid())
+  userId    String?
+  eventType String
+  severity  String   @default("info")
+  details   Json?
+  createdAt DateTime @default(now())
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model NotificationPreference {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  emailEnabled        Boolean  @default(true)
+  pushEnabled         Boolean  @default(true)
+  marketingEnabled    Boolean  @default(false)
+  weeklyDigestEnabled Boolean  @default(true)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @default(now()) @updatedAt
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model UserSetting {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  theme       String   @default("system")
+  language    String   @default("en")
+  timezone    String   @default("UTC")
+  compactMode Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model PaymentTransaction {
+  id                     String               @id @default(cuid())
+  userId                 String?
+  provider               String
+  type                   String
+  status                 String
+  amountUsd              Float
+  amountMinor            Int
+  currency               String
+  description            String
+  idempotencyKey         String?              @unique
+  providerCustomerId     String?
+  providerSubscriptionId String?
+  providerTransactionId  String?              @unique
+  providerPayload        Json?
+  metadata               Json?
+  failureReason          String?
+  receiptNumber          String?
+  lastWebhookAt          DateTime?
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @updatedAt
+  ledgerEntries          PaymentLedgerEntry[]
+  receipt                PaymentReceipt?
+  user                   User?                @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model PaymentReceipt {
+  id            String             @id @default(cuid())
+  transactionId String             @unique
+  userId        String?
+  receiptNumber String
+  status        String
+  receiptUrl    String?
+  payload       Json?
+  documentHash  String?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @default(now()) @updatedAt
+  transaction   PaymentTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  user          User?              @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model PaymentLedgerEntry {
+  id            String             @id @default(cuid())
+  transactionId String
+  userId        String?
+  entryType     String
+  amountUsd     Float
+  currency      String
+  balanceAfter  Float
+  referenceType String
+  referenceId   String
+  description   String
+  metadata      Json?
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @default(now()) @updatedAt
+  transaction   PaymentTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  user          User?              @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
 model PricingConfig {
   id          String   @id @default(cuid())
   key         String   @unique
@@ -281,16 +287,38 @@ model PricingConfig {
 }
 
 model Conversation {
-  id        String                @id @default(cuid())
-  userId    String
-  title     String?
-  pinned    Boolean               @default(false)
-  createdAt DateTime              @default(now())
-  updatedAt DateTime              @updatedAt
-  user      User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  messages  ConversationMessage[]
+  id                String                @id @default(cuid())
+  userId            String
+  title             String?
+  pinned            Boolean               @default(false)
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  source            String                @default("chat")
+  summary           String?
+  summaryUpdatedAt  DateTime?
+  user              User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages          ConversationMessage[]
+  liveTutorSessions LiveTutorSession[]
+  analytics         ChatAnalyticsEvent[]
 
-  @@index([userId])
+  @@index([userId, source, updatedAt])
+}
+
+model ChatAnalyticsEvent {
+  id             String        @id @default(cuid())
+  userId         String
+  conversationId String?
+  messageId      String?
+  eventType      String
+  promptHash     String?
+  metadata       Json?
+  createdAt      DateTime      @default(now())
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([userId, eventType, createdAt])
+  @@index([conversationId, createdAt])
+  @@index([promptHash, createdAt])
 }
 
 model ConversationMessage {
@@ -298,6 +326,7 @@ model ConversationMessage {
   conversationId String
   userId         String       @default("")
   role           String       @default("user")
+  status         String       @default("completed")
   content        String       @default("")
   text           String?
   feedback       String?
@@ -307,4 +336,12 @@ model ConversationMessage {
 
   @@index([conversationId, createdAt])
   @@index([userId])
+}
+
+enum NotificationCategory {
+  BILLING
+  TUTOR
+  SECURITY
+  SUPPORT
+  PRODUCT_UPDATES
 }

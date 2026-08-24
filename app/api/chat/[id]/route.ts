@@ -85,8 +85,11 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         id: conv.id,
         createdAt: conv.createdAt,
         updatedAt: conv.updatedAt,
+        summary: conv.summary,
+        summaryUpdatedAt: conv.summaryUpdatedAt,
         messages,
         hasMore,
+        recentMessageWindow: 40,
       }
     }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   } catch (err: unknown) {

@@ -10,6 +10,7 @@ import {
 } from '../../../../../lib/aiSecurityGateway';
 import { buildCorsHeaders } from '../../../../../lib/securityHeaders';
 import logger from '../../../../../lib/logger';
+import { createSafeStreamWriter } from '../../../../lib/streamUtils';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
@@ -33,14 +34,15 @@ export async function POST(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
 
-    let body: { messageId?: unknown } | null = null;
+    let body: { messageId?: unknown; answerMode?: unknown } | null = null;
     try {
-      body = (await req.json()) as { messageId?: unknown };
+      body = (await req.json()) as { messageId?: unknown; answerMode?: unknown };
     } catch {
       return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     const messageId = typeof body?.messageId === 'string' ? body.messageId.trim() : '';
+    const answerMode = body?.answerMode === 'short' ? 'short' : 'detailed';
     if (!messageId) {
       return NextResponse.json({ error: 'Invalid input: messageId is required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
@@ -87,13 +89,23 @@ export async function POST(req: Request) {
       : messagesBeforeTarget;
 
     const historyForAI = toGeminiMessages(contextMessages);
-    const userEntry: GeminiMessage = { role: 'user', parts: [{ text: regeneratePrompt.trim() }] };
+    const modeInstruction = answerMode === 'short'
+      ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
+      : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
+    const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${regeneratePrompt.trim()}${modeInstruction}` }] };
     const contents: Array<GeminiMessage | GeminiImageContent> = [...historyForAI, userEntry];
 
     const encoder = new TextEncoder();
+    await prisma.conversationMessage.update({
+      where: { id: messageId },
+      data: { status: 'streaming', content: '', text: '' },
+    });
     const stream = new ReadableStream({
       async start(controller) {
+        const encoder = new TextEncoder();
+        const { enqueue, close, isStreamClosed } = createSafeStreamWriter(controller, req.signal);
         let finalText = '';
+
         try {
           const { result: aiResponse } = await executeAIRequest({
             user,
@@ -108,11 +120,14 @@ export async function POST(req: Request) {
             securityContext: { conversationId },
             callback: async ({ billingDecision }) => {
               const modelToUse = billingDecision.modelUsed ?? undefined;
-              await askGeminiStream(contents, (token: string) => {
+              await askGeminiStream(contents, async (token: string) => {
+                if (isStreamClosed()) {
+                  return;
+                }
                 finalText += token;
                 const payload = JSON.stringify({ type: 'token', token });
-                controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
-              }, modelToUse);
+                enqueue(encoder.encode(`data: ${payload}\n\n`));
+              }, modelToUse, req.signal);
               return finalText;
             },
           });
@@ -122,6 +137,7 @@ export async function POST(req: Request) {
             data: {
               content: aiResponse,
               text: aiResponse,
+              status: 'completed',
             },
           });
 
@@ -130,13 +146,21 @@ export async function POST(req: Request) {
             data: { updatedAt: new Date() },
           });
 
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
-          controller.close();
-        } catch (err: unknown) {
+          if (!isStreamClosed()) {
+            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
+          }
+          close();
+        } catch (_err: unknown) {
           const message = 'We couldn’t regenerate that reply right now. Please try again shortly.';
-          const errorPayload = JSON.stringify({ type: 'error', message });
-          controller.enqueue(encoder.encode(`data: ${errorPayload}\n\n`));
-          controller.close();
+          await prisma.conversationMessage.update({
+            where: { id: messageId },
+            data: { status: 'failed' },
+          }).catch(() => undefined);
+          if (!isStreamClosed()) {
+            const errorPayload = JSON.stringify({ type: 'error', message });
+            enqueue(encoder.encode(`data: ${errorPayload}\n\n`));
+          }
+          close();
         }
       },
     });

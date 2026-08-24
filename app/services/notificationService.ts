@@ -64,6 +64,24 @@ async function checkNotificationTableExists(): Promise<boolean> {
   }
 }
 
+function isSafeWebUrl(value: string | null | undefined): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === 'https:' || url.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 function normalizeNotificationInput(input: CreateNotificationInput) {
   const title = input.title.trim();
   const body = input.body.trim();
@@ -77,6 +95,10 @@ function normalizeNotificationInput(input: CreateNotificationInput) {
     throw new Error('Notification payload exceeds supported length');
   }
 
+  if (input.actionUrl != null && input.actionUrl !== '' && !isSafeWebUrl(input.actionUrl)) {
+    throw new Error('Notification actionUrl must be a valid http(s) URL.');
+  }
+
   const rawCategory = typeof input.category === 'string' && ALLOWED_CATEGORIES.has(input.category.toUpperCase())
     ? input.category.toUpperCase()
     : 'PRODUCT_UPDATES';
@@ -88,7 +110,7 @@ function normalizeNotificationInput(input: CreateNotificationInput) {
     category: rawCategory as NotificationCategory,
     externalId: input.externalId?.trim() || undefined,
     icon: input.icon ?? null,
-    actionUrl: input.actionUrl ?? null,
+    actionUrl: input.actionUrl ? input.actionUrl.trim() : null,
     metadata: input.metadata === undefined ? undefined : (input.metadata ?? Prisma.JsonNull),
   };
 }

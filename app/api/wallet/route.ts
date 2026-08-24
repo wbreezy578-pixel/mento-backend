@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../lib/auth';
 import logger from '../../../lib/logger';
 import { canUseChat, canGenerateImage, canUseLiveTutor } from '../../../services/billingService';
-import { getPlanForUser } from '../../../services/planService';
+import { getEffectivePlanForUser } from '../../../services/planService';
 import { getWalletSummary } from '../../../services/walletService';
 
 export async function GET(req: Request) {
@@ -17,7 +17,7 @@ export async function GET(req: Request) {
       canGenerateImage(user.id),
       canUseLiveTutor(user.id),
       getWalletSummary(user.id),
-      getPlanForUser(user.id),
+      getEffectivePlanForUser(user.id),
     ]);
 
     const resetTime = chatDecision.resetTime ?? imageDecision.resetTime ?? liveTutorDecision.resetTime ?? null;

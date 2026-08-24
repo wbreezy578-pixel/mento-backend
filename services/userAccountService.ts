@@ -22,6 +22,8 @@ export interface CreateUserAccountResult {
     emailVerified: boolean;
   };
   created: boolean;
+  requiresPasswordSetup?: boolean;
+  existingUserId?: string | null;
 }
 
 export class DuplicateEmailError extends Error {
@@ -89,6 +91,21 @@ async function createDefaultWalletsAndPreferences(tx: Prisma.TransactionClient, 
   });
 }
 
+function buildAccountResult(user: { id: string; email: string; password: string; name: string | null; authProvider: string; emailVerified: boolean }, created: boolean, extra?: Partial<CreateUserAccountResult>): CreateUserAccountResult {
+  return {
+    user: {
+      id: user.id,
+      email: user.email,
+      password: user.password,
+      name: user.name,
+      authProvider: user.authProvider,
+      emailVerified: user.emailVerified,
+    },
+    created,
+    ...extra,
+  };
+}
+
 async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
   const normalizedEmail = normalizeEmail(input.email);
   if (!normalizedEmail) {
@@ -100,7 +117,34 @@ async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateU
   });
 
   if (existingUser) {
-    throw new DuplicateEmailError(normalizedEmail);
+    const updateData: { name?: string | null; emailVerified?: boolean; lastOAuthReauthAt?: Date } = {};
+    const userName = sanitizeDisplayName(input.name);
+    if (!existingUser.name && userName) {
+      updateData.name = userName;
+    }
+
+    const authProvider = input.authProvider ?? 'email';
+    const shouldVerifyEmail = input.emailVerified ?? (authProvider === 'google' || authProvider === 'apple' || authProvider === 'admin');
+    if (shouldVerifyEmail && !existingUser.emailVerified) {
+      updateData.emailVerified = true;
+    }
+
+    if ((authProvider === 'google' || authProvider === 'apple' || authProvider === 'admin') && !existingUser.lastOAuthReauthAt) {
+      updateData.lastOAuthReauthAt = new Date();
+    }
+
+    let updatedUser = existingUser;
+    if (Object.keys(updateData).length > 0) {
+      updatedUser = await tx.user.update({
+        where: { id: existingUser.id },
+        data: updateData,
+      });
+    }
+
+    return buildAccountResult(updatedUser, false, {
+      requiresPasswordSetup: authProvider === 'email' && !(typeof updatedUser.password === 'string' && updatedUser.password.trim().length > 0),
+      existingUserId: updatedUser.id,
+    });
   }
 
   const authProvider = input.authProvider ?? 'email';
@@ -116,83 +160,102 @@ async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateU
   const userName = sanitizeDisplayName(input.name);
   const emailVerified = input.emailVerified ?? (authProvider === 'google' || authProvider === 'apple' || authProvider === 'admin');
 
-  const user = await tx.user.create({
-    data: {
-      email: normalizedEmail,
-      password: resolvedPassword,
-      name: userName,
-      authProvider,
-      emailVerified,
-    },
-  });
+  // If creating an OAuth-backed account, mark a recent OAuth reauthentication
+  // so that sensitive actions requiring recent OAuth reauth are allowed immediately after signup.
+  const lastOAuthReauthAt = authProvider === 'google' || authProvider === 'apple' || authProvider === 'admin' ? new Date() : undefined;
 
-  const freePlan = await ensureFreePlan(tx);
-  await createDefaultWalletsAndPreferences(tx, user.id, freePlan.id);
+  try {
+    const user = await tx.user.create({
+      data: {
+        email: normalizedEmail,
+        password: resolvedPassword,
+        name: userName,
+        authProvider,
+        lastOAuthReauthAt,
+        emailVerified,
+      },
+    });
 
-  return {
-    user: {
-      id: user.id,
-      email: user.email,
-      password: user.password,
-      name: user.name,
-      authProvider: user.authProvider,
-      emailVerified: user.emailVerified,
-    },
-    created: true,
-  };
+    const freePlan = await ensureFreePlan(tx);
+    await createDefaultWalletsAndPreferences(tx, user.id, freePlan.id);
+
+    return buildAccountResult(user, true);
+  } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+      const recoveredUser = await tx.user.findFirst({
+        where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
+      });
+      if (recoveredUser) {
+        return buildAccountResult(recoveredUser, false, {
+          requiresPasswordSetup: authProvider === 'email' && !(typeof recoveredUser.password === 'string' && recoveredUser.password.trim().length > 0),
+          existingUserId: recoveredUser.id,
+        });
+      }
+    }
+    throw error;
+  }
 }
 
 export async function createEmailAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
-  return prisma.$transaction(async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'email' }));
+  return prisma.$transaction(
+    async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'email' }),
+    { maxWait: 10000, timeout: 30000 }
+  );
 }
 
 export async function createGoogleOAuthAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
-  return prisma.$transaction(async (tx) => {
-    const normalizedEmail = normalizeEmail(input.email);
-    if (!normalizedEmail) {
-      throw new InvalidAccountInputError('Email is required');
-    }
-
-    const existingUser = await tx.user.findFirst({
-      where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
-    });
-
-    if (existingUser) {
-      const updateData: { name?: string | null; lastOAuthReauthAt?: Date } = {};
-      const displayName = sanitizeDisplayName(input.name);
-      if (!existingUser.name && displayName) {
-        updateData.name = displayName;
+  return prisma.$transaction(
+    async (tx) => {
+      const normalizedEmail = normalizeEmail(input.email);
+      if (!normalizedEmail) {
+        throw new InvalidAccountInputError('Email is required');
       }
-      updateData.lastOAuthReauthAt = new Date();
-      const updatedUser = await tx.user.update({
-        where: { id: existingUser.id },
-        data: updateData,
-      });
-      return {
-        user: {
-          id: updatedUser.id,
-          email: updatedUser.email,
-          password: updatedUser.password,
-          name: updatedUser.name,
-          authProvider: updatedUser.authProvider,
-          emailVerified: updatedUser.emailVerified,
-        },
-        created: false,
-      };
-    }
 
-    return createNewUserAccount(tx, { ...input, authProvider: 'google', emailVerified: true, password: '' });
-  });
+      const existingUser = await tx.user.findFirst({
+        where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
+      });
+
+      if (existingUser) {
+        const updateData: { name?: string | null; lastOAuthReauthAt?: Date; emailVerified?: boolean; authProvider?: string } = {};
+        const displayName = sanitizeDisplayName(input.name);
+        if (!existingUser.name && displayName) {
+          updateData.name = displayName;
+        }
+        updateData.lastOAuthReauthAt = new Date();
+        updateData.emailVerified = true;
+        updateData.authProvider = existingUser.password?.trim() ? 'mixed' : 'google';
+        const updatedUser = await tx.user.update({
+          where: { id: existingUser.id },
+          data: updateData,
+        });
+        return buildAccountResult(updatedUser, false, {
+          existingUserId: updatedUser.id,
+        });
+      }
+
+      return createNewUserAccount(tx, { ...input, authProvider: 'google', emailVerified: true, password: '' });
+    },
+    { maxWait: 10000, timeout: 15000 }
+  );
 }
 
 export async function createAppleAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
-  return prisma.$transaction(async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'apple', emailVerified: true, password: '' }));
+  return prisma.$transaction(
+    async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'apple', emailVerified: true, password: '' }),
+    { maxWait: 10000, timeout: 30000 }
+  );
 }
 
 export async function createAdminUserAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
-  return prisma.$transaction(async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'admin', emailVerified: true }));
+  return prisma.$transaction(
+    async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'admin', emailVerified: true }),
+    { maxWait: 10000, timeout: 30000 }
+  );
 }
 
 export async function createTestUserAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
-  return prisma.$transaction(async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'test-helper', emailVerified: true }));
+  return prisma.$transaction(
+    async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'test-helper', emailVerified: true }),
+    { maxWait: 10000, timeout: 30000 }
+  );
 }

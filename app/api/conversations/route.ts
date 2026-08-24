@@ -33,7 +33,8 @@ export async function GET(req: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    const conversations = await getUserConversations(user.id);
+    const source = new URL(req.url).searchParams.get('source')?.trim() || undefined;
+    const conversations = await getUserConversations(user.id, source);
 
     return NextResponse.json({
       conversations: conversations.map((conv) => ({
@@ -42,6 +43,9 @@ export async function GET(req: Request) {
         pinned: conv.pinned,
         createdAt: conv.createdAt,
         updatedAt: conv.updatedAt,
+        summary: conv.summary,
+        summaryUpdatedAt: conv.summaryUpdatedAt,
+        recentMessageWindow: 40,
         lastMessage: conv.messages[0]?.text || '(no messages)',
       })),
     }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });

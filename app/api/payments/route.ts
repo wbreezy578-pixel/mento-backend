@@ -1,20 +1,10 @@
 ﻿import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../lib/auth';
 import { listPayments, startPayment, getPayment, getLedgerSummary, finalizePayment, verifyWebhookSignature, type PaymentProvider, type PaymentStatus } from '../../../services/paymentService';
-import { getPaymentWebhookAuthSecret } from '../../../lib/env';
-
-function getWebhookAuthSecret() {
-  return getPaymentWebhookAuthSecret();
-}
+import { processPaddleWebhook } from '../../../services/paddleWebhookService';
 
 async function requireAuthenticatedUser(req: Request) {
   return await getUserFromRequest(req);
-}
-
-async function requirePaymentWebhookSecret(req: Request) {
-  const expectedSecret = getWebhookAuthSecret();
-  const providedSecret = req.headers.get('x-payment-webhook-secret')?.trim() || req.headers.get('x-webhook-secret')?.trim() || '';
-  return Boolean(expectedSecret && providedSecret && providedSecret === expectedSecret);
 }
 
 export async function GET(req: Request) {
@@ -40,16 +30,46 @@ export async function GET(req: Request) {
 }
 
 export async function POST(req: Request) {
+  const payload = await req.text();
+  const paddleSignature = req.headers.get('paddle-signature')?.trim() || '';
+
+  if (paddleSignature) {
+    const provider = 'PADDLE' as PaymentProvider;
+    const ok = await verifyWebhookSignature({ payload, signature: paddleSignature, provider });
+    if (!ok) {
+      return NextResponse.json({ error: 'Invalid webhook signature' }, { status: 401 });
+    }
+
+    try {
+      const result = await processPaddleWebhook(payload, paddleSignature);
+      if (result && (result.ok || result.duplicate || result.unmapped)) {
+        return NextResponse.json({ ok: true });
+      }
+      return NextResponse.json({ error: 'Webhook processing failed' }, { status: 500 });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Processing error';
+      const status = /ownership|conflict/i.test(message) ? 409 : 500;
+      return NextResponse.json({ error: message }, { status });
+    }
+  }
+
+  let body: any = {};
+  try {
+    body = payload ? JSON.parse(payload) : {};
+  } catch {
+    body = {};
+  }
+
+  // Normal authenticated POST for creating payments
   const user = await requireAuthenticatedUser(req);
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
   try {
-    const body = await req.json();
     const normalized = {
       userId: user.id,
-      provider: String(body?.provider || 'STRIPE').toUpperCase() as PaymentProvider,
+      provider: String(body?.provider || 'PADDLE').toUpperCase() as PaymentProvider,
       type: String(body?.type || 'SUBSCRIPTION').toUpperCase() as 'SUBSCRIPTION' | 'TOP_UP',
       amountUsd: Number(body?.amountUsd ?? 15),
       currency: String(body?.currency || 'USD'),
@@ -78,7 +98,7 @@ export async function PUT(req: Request) {
     const body = await req.json();
     const payment = await finalizePayment({
       transactionId: String(body?.transactionId || ''),
-      provider: String(body?.provider || 'STRIPE').toUpperCase() as PaymentProvider,
+      provider: String(body?.provider || 'PADDLE').toUpperCase() as PaymentProvider,
       status: String(body?.status || 'SUCCEEDED').toUpperCase() as PaymentStatus,
       providerTransactionId: body?.providerTransactionId ? String(body.providerTransactionId) : undefined,
       providerSubscriptionId: body?.providerSubscriptionId ? String(body.providerSubscriptionId) : undefined,
@@ -96,21 +116,34 @@ export async function PUT(req: Request) {
 export async function PATCH(req: Request) {
   try {
     const user = await getUserFromRequest(req);
-    const isWebhook = await requirePaymentWebhookSecret(req);
-    if (!user && !isWebhook) {
+    const payload = await req.text();
+    const paddleSignature = req.headers.get('paddle-signature')?.trim() || '';
+
+    if (paddleSignature) {
+      const ok = await verifyWebhookSignature({ payload, signature: paddleSignature, provider: 'PADDLE' });
+      if (!ok) {
+        return NextResponse.json({ error: 'Invalid webhook signature' }, { status: 401 });
+      }
+
+      try {
+        const result = await processPaddleWebhook(payload, paddleSignature);
+        if (result && (result.ok || result.duplicate || result.unmapped)) {
+          return NextResponse.json({ ok: true });
+        }
+        return NextResponse.json({ error: 'Webhook processing failed' }, { status: 500 });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'Processing error';
+        const status = /ownership|conflict/i.test(message) ? 409 : 500;
+        return NextResponse.json({ error: message }, { status });
+      }
+    }
+
+    if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await req.json();
-    const provider = String(body?.provider || 'STRIPE').toUpperCase() as PaymentProvider;
-    const signature = String(body?.signature || '');
-    const ok = await verifyWebhookSignature({ payload: JSON.stringify(body), signature, provider });
-
-    if (!ok) {
-      return NextResponse.json({ error: 'Invalid webhook signature' }, { status: 401 });
-    }
-
-    return NextResponse.json({ ok: true });
+    const body = payload ? JSON.parse(payload) : {};
+    return NextResponse.json({ error: 'Unsupported PATCH payload' }, { status: 400 });
   } catch {
     return NextResponse.json({ error: 'Invalid webhook signature' }, { status: 401 });
   }

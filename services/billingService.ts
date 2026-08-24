@@ -2,11 +2,16 @@ import type { Prisma } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import type { InputJsonValue } from '@prisma/client/runtime/library';
 import { prisma } from '../lib/prisma';
-import { ensureDefaultPlans, getPlanForUser, getEffectiveLimit, type PlanRecord } from './planService';
+import { ensureDefaultPlans, getPlanForUser, getEffectivePlanForUser, getEffectiveLimit, getFreePlan, isSubscriptionActive, type PlanRecord } from './planService';
 import { calculateProviderCost, calculateUserCharge, calculateProfit } from './economicsService';
 import type { UsageScope, UsageFeature, UsageSnapshot } from './usageService';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
+import { isDevLiveTutorFreeEnabled } from '../lib/env';
+import logger from '../lib/logger';
 import '../lib/metrics';
+
+// LiveTutorWallet.minutesBalance is stored in minutes; live_tutor amounts are always passed in seconds.
+const SECONDS_PER_MINUTE = 60;
 
 export interface BillingDecision {
   allowed: boolean;
@@ -193,6 +198,7 @@ function normalizePlanModelName(model: string | null | undefined): string {
   return typeof model === 'string' && model.trim() ? model.trim().toLowerCase() : '';
 }
 
+
 function resolvePlanModel(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tutor', requestedModel?: string | null): string {
   const fallbackModel = feature === 'image' ? (plan.features.imageModel as string | undefined) ?? plan.chatModel : plan.chatModel;
   const requested = typeof requestedModel === 'string' && requestedModel.trim() ? requestedModel.trim() : null;
@@ -256,14 +262,29 @@ function getUsageWindow(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tuto
 
 async function getBillingDecision(input: BillingReservationInput): Promise<BillingDecision> {
   const validatedInput = validateBillingReservationInput(input);
-  const plan = validatedInput.planOverride ?? await getPlanForUser(validatedInput.userId);
+  const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
   await ensureDefaultPlans();
 
   if (validatedInput.feature === 'live_tutor') {
     const liveTutorWallet = await prisma.liveTutorWallet.findUnique({ where: { userId: validatedInput.userId } });
-    const availableSeconds = liveTutorWallet?.minutesBalance ?? 0;
-    const allowed = availableSeconds >= validatedInput.amount;
-    const reason = allowed ? 'Live tutor seconds available.' : 'Live tutor balance is exhausted.';
+    const availableSeconds = (liveTutorWallet?.minutesBalance ?? 0) * SECONDS_PER_MINUTE;
+    
+    // Development-only bypass: allow Live Tutor with zero balance if DEV_LIVE_TUTOR_FREE=true
+    const devBypassEnabled = isDevLiveTutorFreeEnabled();
+    const allowed = devBypassEnabled || availableSeconds >= validatedInput.amount;
+    const reason = allowed 
+      ? (devBypassEnabled && availableSeconds < validatedInput.amount ? '[DEV] Live tutor free mode enabled.' : 'Live tutor seconds available.')
+      : 'Live tutor balance is exhausted.';
+    
+    if (devBypassEnabled && availableSeconds < validatedInput.amount) {
+      logger.info('Live Tutor dev bypass applied', {
+        userId: validatedInput.userId,
+        requestedSeconds: validatedInput.amount,
+        availableSeconds,
+        requestId: validatedInput.requestId,
+      });
+    }
+    
     const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, 0, null);
 
     return buildDecision(
@@ -461,6 +482,10 @@ async function resolveWalletAndPlanInTransaction(
     features: wallet.plan.features as Record<string, unknown>,
   } as PlanRecord : fallbackPlan;
 
+  const effectivePlan = isSubscriptionActive(wallet.subscriptionStatus as string, wallet.subscriptionExpiresAt)
+    ? planRecord
+    : await getFreePlan();
+
   return {
     wallet: {
       id: wallet.id,
@@ -469,7 +494,7 @@ async function resolveWalletAndPlanInTransaction(
       planName: wallet.plan.name,
       subscriptionStatus: wallet.subscriptionStatus,
     },
-    plan: planRecord,
+    plan: effectivePlan,
   };
 }
 
@@ -602,7 +627,7 @@ async function createUsageLedgerEntry(
 
 export async function reserveUsage(input: BillingReservationInput): Promise<BillingDecision> {
   const validatedInput = validateBillingReservationInput(input);
-  const plan = validatedInput.planOverride ?? await getPlanForUser(validatedInput.userId);
+  const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
   const resolvedModel = validatedInput.modelUsed ?? plan.chatModel;
 
   await ensureDefaultPlans();
@@ -702,17 +727,18 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           },
         });
 
-        const availableSeconds = liveTutorWallet.minutesBalance;
-        const allowed = availableSeconds >= validatedInput.amount;
+        const availableSeconds = liveTutorWallet.minutesBalance * SECONDS_PER_MINUTE;
+        const devBypassEnabled = isDevLiveTutorFreeEnabled();
+        const allowed = devBypassEnabled || availableSeconds >= validatedInput.amount;
         const pendingReservation = validatedInput.pending === true;
         const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
         const reason = pendingReservation
           ? 'Live tutor reservation pending.'
           : effectiveAllowed
-            ? 'Live tutor minutes available.'
+            ? (devBypassEnabled ? '[DEV] Live tutor free mode enabled.' : 'Live tutor minutes available.')
             : validatedInput.success === false
               ? 'Usage rollback requested.'
-              : 'Live tutor minutes are exhausted.';
+              : (devBypassEnabled ? '[DEV] Live tutor free mode enabled.' : 'Live tutor minutes are exhausted.');
         const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, 0, null);
         const metadata = {
           ...validatedInput.metadata,
@@ -722,6 +748,15 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           requestedBy: validatedInput.userId,
           requestedAt: new Date().toISOString(),
         };
+
+        if (devBypassEnabled && availableSeconds < validatedInput.amount) {
+          logger.info('Live Tutor dev bypass applied in reserveUsage', {
+            userId: validatedInput.userId,
+            requestedSeconds: validatedInput.amount,
+            availableSeconds,
+            requestId: validatedInput.requestId,
+          });
+        }
 
         if (!effectiveAllowed) {
           const deniedRecord = await createUsageLedgerEntry(
@@ -768,7 +803,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         if (!pendingReservation) {
           await tx.liveTutorWallet.update({
             where: { userId: validatedInput.userId },
-            data: { minutesBalance: { decrement: validatedInput.amount } },
+            data: { minutesBalance: { decrement: Math.ceil(validatedInput.amount / SECONDS_PER_MINUTE) } },
           });
         }
 
@@ -906,6 +941,10 @@ export async function canUseLiveTutor(userId: string, amount = 1): Promise<Billi
   return getBillingDecision({ userId, feature: 'live_tutor', amount });
 }
 
+export async function canUseFeature(userId: string, feature: 'chat' | 'image' | 'live_tutor', amount = 1): Promise<BillingDecision> {
+  return getBillingDecision({ userId, feature, amount });
+}
+
 export async function consumeLiveTutorMinutes(userId: string, amount = 1): Promise<BillingDecision> {
   return reserveUsage({ userId, feature: 'live_tutor', amount });
 }
@@ -934,7 +973,7 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
       }
 
       if (existing.success === true) {
-        const plan = validatedInput.planOverride ?? await getPlanForUser(validatedInput.userId);
+        const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
         const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
         const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
         const windowStart = usageWindow.windowStart;
@@ -979,13 +1018,13 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
         });
         await tx.liveTutorWallet.update({
           where: { userId: validatedInput.userId },
-          data: { minutesBalance: { decrement: validatedInput.amount } },
+          data: { minutesBalance: { decrement: Math.ceil(validatedInput.amount / SECONDS_PER_MINUTE) } },
         });
         await tx.usageLog.update({
           where: { id: existing.id },
           data: { success: true },
         });
-        const plan = validatedInput.planOverride ?? await getPlanForUser(validatedInput.userId);
+        const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
         const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
         const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
         const windowStart = usageWindow.windowStart;
@@ -1020,7 +1059,7 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
         data: { success: true },
       });
 
-      const plan = validatedInput.planOverride ?? await getPlanForUser(validatedInput.userId);
+      const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
       const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
       const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
       const windowStart = usageWindow.windowStart;
@@ -1086,7 +1125,7 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
       }
 
       if (existing.success === true) {
-        const plan = validatedInput.planOverride ?? await getPlanForUser(validatedInput.userId);
+        const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
         const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
         const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
         const windowStart = usageWindow.windowStart;
@@ -1120,7 +1159,7 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
       }
 
       if (existing.success === false) {
-        const plan = validatedInput.planOverride ?? await getPlanForUser(validatedInput.userId);
+        const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
         const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
         const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
         const windowStart = usageWindow.windowStart;
@@ -1170,7 +1209,7 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
         data: { success: false },
       });
 
-      const plan = validatedInput.planOverride ?? await getPlanForUser(validatedInput.userId);
+      const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
       const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
       const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
       const windowStart = usageWindow.windowStart;

@@ -31,6 +31,14 @@ function buildErrorResponse(message: string, status: number, code: string, reque
   return NextResponse.json(createApiErrorResponse(message, { status, code, requestId, details }), { status, headers: buildJsonHeaders(requestId) });
 }
 
+type MultipartFormLike = {
+  get: (key: string) => unknown;
+};
+
+function asMultipartForm(input: unknown): MultipartFormLike {
+  return input as unknown as MultipartFormLike;
+}
+
 export async function POST(req: Request) {
   try {
     const user = await authenticateAIRequest(req);
@@ -42,16 +50,17 @@ export async function POST(req: Request) {
     const contentType = req.headers.get('content-type') || '';
 
     const requestId = buildAIRequestId('image-analyze');
-    let formVar: FormData | null = null;
+    let formVar: MultipartFormLike | null = null;
     if (contentType.includes('multipart/form-data')) {
-      formVar = await req.formData();
+      formVar = asMultipartForm(await req.formData());
       const file = formVar.get('image');
-      if (!file || typeof file === 'string' || typeof file.arrayBuffer !== 'function') {
+      if (!file || typeof file === 'string' || typeof (file as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer !== 'function') {
         return buildErrorResponse('No image file provided', 400, 'validation_error', requestId);
       }
-      const ab = await file.arrayBuffer();
+      const fileBlob = file as { arrayBuffer: () => Promise<ArrayBuffer>; type?: string };
+      const ab = await fileBlob.arrayBuffer();
       buffer = Buffer.from(ab);
-      mimeType = file.type || detectImageMimeType(new Uint8Array(ab));
+      mimeType = fileBlob.type || detectImageMimeType(new Uint8Array(ab));
     } else {
       const json = await req.json().catch(() => null);
       const img = json?.image;

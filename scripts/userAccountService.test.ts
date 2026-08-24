@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { prisma } from '../lib/prisma';
-import { createEmailAccount, createGoogleOAuthAccount, DuplicateEmailError } from '../services/userAccountService';
+import { createEmailAccount, createGoogleOAuthAccount } from '../services/userAccountService';
 
 test('createEmailAccount provisions wallets, subscription and default preferences', async () => {
   const email = `email-service-${Date.now()}@example.com`;
@@ -50,16 +50,58 @@ test('createGoogleOAuthAccount creates a user without a usable password', async 
   }
 });
 
-test('createEmailAccount rejects duplicate emails', async () => {
-  const email = `duplicate-service-${Date.now()}@example.com`;
+test('createEmailAccount reuses an existing Google account for the same normalized email', async () => {
+  const originalEmail = `link-service-${Date.now()}@Example.com`;
+  const normalizedEmail = originalEmail.toLowerCase();
 
-  await createEmailAccount({ email, password: 'TestPassword123!', name: 'Duplicate User' });
+  const googleAccount = await createGoogleOAuthAccount({
+    email: originalEmail,
+    name: 'Linked Google User',
+  });
 
   try {
-    await createEmailAccount({ email, password: 'AnotherPassword123!', name: 'Duplicate User 2' });
-    assert.fail('Expected duplicate email to be rejected');
-  } catch (error) {
-    assert.ok(error instanceof DuplicateEmailError);
+    const result = await createEmailAccount({
+      email: originalEmail.toUpperCase(),
+      password: 'AnotherPassword123!',
+      name: 'Linked Email User',
+    });
+
+    assert.equal(result.created, false);
+    assert.equal(result.user.id, googleAccount.user.id);
+    assert.equal(result.user.email, normalizedEmail);
+    assert.equal(result.requiresPasswordSetup, true);
+  } finally {
+    await prisma.user.deleteMany({ where: { email: normalizedEmail } });
+  }
+});
+
+test('createEmailAccount reuses an existing email/password account for the same email', async () => {
+  const email = `duplicate-service-${Date.now()}@example.com`;
+
+  const first = await createEmailAccount({ email, password: 'TestPassword123!', name: 'Duplicate User' });
+
+  try {
+    const second = await createEmailAccount({ email, password: 'AnotherPassword123!', name: 'Duplicate User 2' });
+
+    assert.equal(second.created, false);
+    assert.equal(second.user.id, first.user.id);
+    assert.equal(second.user.email, email);
+  } finally {
+    await prisma.user.deleteMany({ where: { email } });
+  }
+});
+
+test('createGoogleOAuthAccount upgrades an existing password account to linked auth', async () => {
+  const email = `google-link-service-${Date.now()}@example.com`;
+
+  const passwordAccount = await createEmailAccount({ email, password: 'LinkedPassword123!', name: 'Linked Password User' });
+
+  try {
+    const result = await createGoogleOAuthAccount({ email, name: 'Linked Google User' });
+
+    assert.equal(result.created, false);
+    assert.equal(result.user.id, passwordAccount.user.id);
+    assert.equal(result.user.email, email);
   } finally {
     await prisma.user.deleteMany({ where: { email } });
   }

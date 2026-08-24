@@ -270,6 +270,19 @@ export async function getProPlan(): Promise<PlanRecord> {
   return plan;
 }
 
+export function isSubscriptionActive(status: string | null | undefined, expiresAt?: Date | string | null): boolean {
+  if (status === 'active') {
+    return true;
+  }
+
+  if (status === 'cancelled' && expiresAt) {
+    const expiration = typeof expiresAt === 'string' ? new Date(expiresAt) : expiresAt;
+    return expiration instanceof Date && !Number.isNaN(expiration.getTime()) && expiration > new Date();
+  }
+
+  return false;
+}
+
 export async function getPlanForUser(userId: string): Promise<PlanRecord> {
   await ensureDefaultPlans();
 
@@ -279,6 +292,25 @@ export async function getPlanForUser(userId: string): Promise<PlanRecord> {
   });
 
   if (wallet?.plan) {
+    return toPlanRecord(wallet.plan);
+  }
+
+  return getFreePlan();
+}
+
+export async function getEffectivePlanForUser(userId: string): Promise<PlanRecord> {
+  await ensureDefaultPlans();
+
+  const wallet = await prisma.userWallet.findUnique({
+    where: { userId },
+    include: { plan: true },
+  });
+
+  if (!wallet?.plan) {
+    return getFreePlan();
+  }
+
+  if (isSubscriptionActive(wallet.subscriptionStatus as string, wallet.subscriptionExpiresAt)) {
     return toPlanRecord(wallet.plan);
   }
 

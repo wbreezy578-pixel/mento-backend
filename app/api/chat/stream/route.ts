@@ -7,7 +7,8 @@ import {
   getOrCreateLatestConversation,
   addMessageToConversation,
   setConversationTitleIfMissing,
-} from '@/lib/conversationDb';
+  updateConversationSummary,
+} from '../../../../lib/conversationDb';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -19,6 +20,10 @@ import {
 import { validateImageBuffer } from '../../../../lib/imageValidator';
 import logger from '../../../../lib/logger';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
+import { createSafeStreamWriter } from '../../../lib/streamUtils';
+import { observeMonitoringLatency } from '../../../../lib/monitoring';
+import { createHash } from 'node:crypto';
+import { takeChatImage } from '../../../../lib/chatImageUpload';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
@@ -30,17 +35,29 @@ export async function OPTIONS(req: Request) {
 }
 
 export async function POST(req: Request) {
+  const requestStartedAt = Date.now();
   try {
+    logger.info('Chat stream auth attempt', {
+      origin: req.headers.get('origin') ?? null,
+      host: req.headers.get('host') ?? null,
+      method: req.method,
+      url: req.url,
+    });
+
+    const authStartedAt = Date.now();
     const user = await authenticateAIRequest(req);
+    observeMonitoringLatency('api', Date.now() - authStartedAt, { route: 'chat-stream', operation: 'auth' });
     const userId = user.id;
     logger.info('Authenticated chat stream user', { userId });
 
     const clientIp = getClientIp(req);
+    const rateLimitStartedAt = Date.now();
     await enforceAIGatewayRateLimit(userId, clientIp);
+    observeMonitoringLatency('api', Date.now() - rateLimitStartedAt, { route: 'chat-stream', operation: 'rate-limit' });
 
-    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown } | null = null;
+    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown } | null = null;
     try {
-      body = (await req.json()) as { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown };
+      body = (await req.json()) as { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown };
     } catch {
       return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
@@ -52,6 +69,7 @@ export async function POST(req: Request) {
     const requestId = typeof body?.requestId === 'string' && body.requestId.trim()
       ? body.requestId.trim()
       : buildAIRequestId('chat-stream');
+    const answerMode = body?.answerMode === 'short' ? 'short' : 'detailed';
 
     if (!message && !image) {
       return NextResponse.json({ error: 'Invalid input: message or image is required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
@@ -75,20 +93,30 @@ export async function POST(req: Request) {
     }
     logger.info('Chat stream conversation selected', { userId, conversationId });
 
+    const historyStartedAt = Date.now();
     const historyForAI = await getConversationHistoryForAI(conversationId);
+    observeMonitoringLatency('database', Date.now() - historyStartedAt, { route: 'chat-stream', operation: 'history' });
     const userText = message || (imagePayload ? 'Please analyze the attached image and explain it clearly as a tutor.' : '');
 
     // Validate image if provided
     let validatedImage: { data: string; mimeType: string; uri?: string | null } | null = null;
     if (imagePayload) {
-      if (typeof imagePayload.data !== 'string' || typeof imagePayload.mimeType !== 'string') {
-        return NextResponse.json({ error: 'Invalid image: data and mimeType are required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      let imageData = imagePayload.data;
+      let imageMimeType = imagePayload.mimeType;
+      if (typeof imageData !== 'string' && typeof imagePayload.uri === 'string') {
+        const uploadId = imagePayload.uri.split('/').pop() || '';
+        const uploaded = takeChatImage(uploadId);
+        imageData = uploaded?.data;
+        imageMimeType = uploaded?.mimeType;
+      }
+      if (typeof imageData !== 'string' || typeof imageMimeType !== 'string') {
+        return NextResponse.json({ error: 'Invalid image: upload has expired or is malformed' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
       }
       try {
-        const imageBuffer = Buffer.from(imagePayload.data, 'base64');
-        const validated = validateImageBuffer(imageBuffer, imagePayload.mimeType);
+        const imageBuffer = Buffer.from(imageData, 'base64');
+        const validated = validateImageBuffer(imageBuffer, imageMimeType);
         validatedImage = {
-          data: imagePayload.data,
+          data: imageData,
           mimeType: validated.mimeType,
           uri: typeof imagePayload.uri === 'string' ? imagePayload.uri : undefined,
         };
@@ -100,22 +128,40 @@ export async function POST(req: Request) {
 
     const stream = new ReadableStream({
       async start(controller) {
+        const encoder = new TextEncoder();
+        const { enqueue, close, isStreamClosed } = createSafeStreamWriter(controller, req.signal);
         let assistantMessageId: string | null = null;
         let assistantText = '';
+        let promptHash = '';
 
         try {
           const savedUserText = message || (validatedImage ? 'Image attached' : '');
+          promptHash = createHash('sha256').update(savedUserText.trim().toLowerCase()).digest('hex');
+          const repeatedPrompt = Boolean(savedUserText.trim()) && Boolean(await prisma.conversationMessage.findFirst({
+            where: { conversationId, role: 'user', content: savedUserText, status: { not: 'failed' } },
+            select: { id: true },
+          }));
           if (message) {
             await setConversationTitleIfMissing(conversationId, message);
           }
           await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
+          if (repeatedPrompt) {
+            await prisma.chatAnalyticsEvent.create({
+              data: { userId, conversationId, eventType: 'repeated_prompt', promptHash, metadata: { requestId } },
+            });
+          }
 
-          const assistantPlaceholder = await addMessageToConversation(conversationId, 'assistant', '', userId, { requestId });
+          const assistantPlaceholder = await addMessageToConversation(conversationId, 'assistant', '', userId, { requestId, status: 'streaming' });
           if (assistantPlaceholder?.id) {
             assistantMessageId = assistantPlaceholder.id;
           }
         } catch (dbErr) {
-          logger.error('Failed to save user message before streaming', { error: String(dbErr) });
+          logger.error('Failed to save initial conversation state before streaming', { error: String(dbErr) });
+          if (!isStreamClosed()) {
+            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', message: 'Unable to start the response. Please try again.' })}\n\n`));
+          }
+          close();
+          return;
         }
 
         try {
@@ -132,7 +178,10 @@ export async function POST(req: Request) {
             securityContext: { conversationId, hasImage: Boolean(validatedImage) },
             callback: async ({ billingDecision, sanitizedInput }) => {
               const sanitizedText = sanitizedInput ?? userText;
-              const userEntry: GeminiMessage = { role: 'user', parts: [{ text: sanitizedText }] };
+              const modeInstruction = answerMode === 'short'
+                ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
+                : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
+              const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${sanitizedText}${modeInstruction}` }] };
               const contents: Array<GeminiMessage | GeminiImageContent> = [...historyForAI, userEntry];
               if (validatedImage) {
                 contents.push({
@@ -146,20 +195,14 @@ export async function POST(req: Request) {
               const modelToUse = billingDecision.modelUsed ?? undefined;
               assistantText = '';
               await askGeminiStream(contents, async (token: string) => {
+                if (isStreamClosed()) {
+                  return;
+                }
                 assistantText += token;
                 const payload = JSON.stringify({ type: 'token', token });
-                controller.enqueue(new TextEncoder().encode(`data: ${payload}\n\n`));
+                enqueue(encoder.encode(`data: ${payload}\n\n`));
 
-                if (assistantMessageId) {
-                  await prisma.conversationMessage.update({
-                    where: { id: assistantMessageId },
-                    data: {
-                      content: assistantText,
-                      text: assistantText,
-                    },
-                  });
-                }
-              }, modelToUse);
+              }, modelToUse, req.signal);
 
               return assistantText;
             },
@@ -173,15 +216,25 @@ export async function POST(req: Request) {
                 data: {
                   content: finalAssistantText,
                   text: finalAssistantText,
+                    status: 'completed',
                 },
               });
             }
+            await updateConversationSummary(conversationId);
+            if (!finalAssistantText.trim()) {
+              await prisma.chatAnalyticsEvent.create({
+                data: { userId, conversationId, messageId: assistantMessageId, eventType: 'unanswered_question', promptHash, metadata: { requestId, reason: 'empty_response' } },
+              });
+            }
           } catch (dbErr) {
-            logger.error('Failed to finalize assistant message after streaming', { error: String(dbErr) });
+            logger.error('Failed to finalize assistant message after streaming', { error: String(dbErr), assistantMessageId });
           }
 
-          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
-          controller.close();
+          if (!isStreamClosed()) {
+            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
+          }
+          observeMonitoringLatency('api', Date.now() - requestStartedAt, { route: 'chat-stream', operation: 'total' });
+          close();
         } catch (err: unknown) {
           const appError = (() => {
             const status = typeof err === 'object' && err !== null && 'status' in err && typeof (err as { status?: unknown }).status === 'number' ? (err as { status?: number }).status : undefined;
@@ -191,9 +244,23 @@ export async function POST(req: Request) {
             };
           })();
           logger.error('Chat stream error', { error: { message: appError.message, status: appError.status } });
-          const errPayload = JSON.stringify({ type: 'error', message: appError.message });
-          controller.enqueue(new TextEncoder().encode(`data: ${errPayload}\n\n`));
-          controller.close();
+          if (assistantMessageId) {
+            await prisma.conversationMessage.update({
+              where: { id: assistantMessageId },
+              data: { status: 'failed' },
+            }).catch((dbErr) => {
+              logger.error('Failed to mark assistant message as failed', { error: String(dbErr), assistantMessageId });
+            });
+          }
+          await updateConversationSummary(conversationId).catch(() => undefined);
+          await prisma.chatAnalyticsEvent.create({
+            data: { userId, conversationId, messageId: assistantMessageId, eventType: 'unanswered_question', metadata: { requestId, reason: 'generation_failed' } },
+          }).catch(() => undefined);
+          if (!isStreamClosed()) {
+            const errPayload = JSON.stringify({ type: 'error', message: appError.message });
+            enqueue(encoder.encode(`data: ${errPayload}\n\n`));
+          }
+          close();
         }
       }
     });

@@ -3,7 +3,7 @@ import logger from '../../../lib/logger';
 import { signToken, normalizeEmail, validatePasswordStrength, buildUserSummary, recordSecurityEvent, applyAuthCookies } from '../../lib/auth';
 import { createSessionRecord, generateSecureToken } from '../../../lib/authSession';
 import { createNotification } from '../../services/notificationService';
-import { createEmailAccount, DuplicateEmailError, InvalidAccountInputError } from '../../../services/userAccountService';
+import { createEmailAccount, InvalidAccountInputError } from '../../../services/userAccountService';
 
 export async function POST(req: Request) {
   try {
@@ -29,13 +29,25 @@ export async function POST(req: Request) {
         name,
       });
     } catch (error) {
-      if (error instanceof DuplicateEmailError) {
-        return NextResponse.json({ error: 'Email already exists' }, { status: 409 });
-      }
       if (error instanceof InvalidAccountInputError) {
         return NextResponse.json({ error: error.message }, { status: 400 });
       }
       throw error;
+    }
+
+    if (!accountResult.created && accountResult.requiresPasswordSetup) {
+      return NextResponse.json({
+        error: 'An account already exists for this email. Please sign in with Google or use the password setup flow to add an email/password login to your existing account.',
+        requiresPasswordSetup: true,
+        existingUserId: accountResult.existingUserId,
+      }, { status: 409 });
+    }
+
+    if (!accountResult.created) {
+      return NextResponse.json({
+        error: 'An account already exists for this email. Please sign in with your existing credentials.',
+        existingUserId: accountResult.existingUserId,
+      }, { status: 409 });
     }
 
     const user = accountResult.user;

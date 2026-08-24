@@ -41,6 +41,16 @@ export async function POST(req: Request) {
       }
     });
 
+    await prisma.chatAnalyticsEvent.create({
+      data: {
+        userId: user.id,
+        conversationId: message.conversationId,
+        messageId,
+        eventType: 'response_feedback',
+        metadata: { feedback },
+      },
+    });
+
     return NextResponse.json({ success: true, message: updated, feedback: updated.feedback });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Internal Server Error';

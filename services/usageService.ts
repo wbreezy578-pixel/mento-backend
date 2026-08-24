@@ -1,6 +1,6 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { getEffectiveLimit, getPlanForUser } from './planService';
+import { getEffectiveLimit, getEffectivePlanForUser } from './planService';
 import { reserveUsage } from './billingService';
 
 export interface BillingDecision {
@@ -91,7 +91,7 @@ async function getUsageCount(userId: string, feature: UsageFeature, scope: Usage
 }
 
 export async function getUsage(userId: string, feature: UsageFeature, scope: UsageScope = 'day'): Promise<UsageSnapshot> {
-  const plan = await getPlanForUser(userId);
+  const plan = await getEffectivePlanForUser(userId);
   const windowStart = getWindowStart(scope);
   const resetAt = getResetTime(scope);
   const used = await getUsageCount(userId, feature, scope, windowStart);
@@ -134,7 +134,7 @@ export async function isLimitReached(userId: string, feature: UsageFeature, amou
 }
 
 export async function checkUsage(userId: string, feature: UsageFeature, amount = 1, scope: UsageScope = 'day'): Promise<UsageCheckResult> {
-  const plan = await getPlanForUser(userId);
+  const plan = await getEffectivePlanForUser(userId);
   const usage = await getUsage(userId, feature, scope);
   const remaining = typeof usage.limit === 'number' ? Math.max(usage.limit - usage.used - amount, 0) : null;
 

@@ -49,7 +49,7 @@ export async function POST(req: Request) {
     }
 
     const actionRequirements = getSensitiveActionRequirements(user);
-    if (credential.mode !== 'google' && actionRequirements.requiresRecentOAuthReauth) {
+    if (actionRequirements.requiresRecentOAuthReauth) {
       return NextResponse.json({ error: 'Please re-authenticate with Google recently before deleting your account.' }, { status: 403 });
     }
 
@@ -135,6 +135,19 @@ export async function POST(req: Request) {
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Account deletion failed.';
     logger.error('Account deletion failed', { error });
+
+    if (error instanceof Error) {
+      if (/incorrect password/i.test(message)) {
+        return NextResponse.json({ error: message }, { status: 401 });
+      }
+      if (/password confirmation|type "delete my account" to confirm|google re-authentication failed|google re-authentication is only supported|google re-authentication token does not match/i.test(message)) {
+        return NextResponse.json({ error: message }, { status: 400 });
+      }
+      if (/please re-authenticate with google recently|google-linked accounts require a recent google re-authentication/i.test(message)) {
+        return NextResponse.json({ error: message }, { status: 403 });
+      }
+    }
+
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

@@ -1,10 +1,11 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { getPlanById, getPlanByName } from './planService';
+import { getEffectivePlanForUser, getPlanById, getPlanByName } from './planService';
 
 export interface WalletSummary {
   userId: string;
   planName: string;
+  subscriptionStatus: string;
   liveTutorMinutesBalance: number;
   imageLimit: number | null;
   messageLimit: number | null;
@@ -61,10 +62,11 @@ function ensureValidPlanName(userId: string, planName: string | null | undefined
   return normalizedName;
 }
 
-function toWalletSummary(userId: string, planName: string, liveTutorWallet: LiveTutorWalletState | null): WalletSummary {
+function toWalletSummary(userId: string, planName: string, subscriptionStatus: string, liveTutorWallet: LiveTutorWalletState | null): WalletSummary {
   return {
     userId,
     planName,
+    subscriptionStatus,
     liveTutorMinutesBalance: liveTutorWallet?.minutesBalance ?? 0,
     imageLimit: null,
     messageLimit: null,
@@ -306,18 +308,18 @@ export async function downgradePlan(userId: string, planName: string): Promise<U
 export async function getWalletSummary(userId: string): Promise<WalletSummary> {
   const wallet = await getWallet(userId);
   const liveTutorWallet = await getLiveTutorWallet(userId);
-  const plan = await getPlanById(wallet?.planId ?? '');
-  const planName = wallet?.planName ?? plan?.name ?? 'FREE';
+  const plan = await getEffectivePlanForUser(userId);
 
   return {
     userId,
-    planName,
+    planName: plan.name,
+    subscriptionStatus: plan.name !== 'FREE' ? 'active' : 'inactive',
     liveTutorMinutesBalance: liveTutorWallet?.minutesBalance ?? 0,
-    imageLimit: plan?.imageLimit ?? plan?.imageDailyLimit ?? null,
-    messageLimit: plan?.messageLimit ?? null,
-    fairUseEnabled: plan?.fairUseEnabled ?? false,
-    liveTutorEnabled: plan?.liveTutorEnabled ?? false,
-    priority: plan?.priority ?? 0,
+    imageLimit: plan.imageLimit ?? plan.imageDailyLimit ?? null,
+    messageLimit: plan.messageLimit ?? null,
+    fairUseEnabled: plan.fairUseEnabled ?? false,
+    liveTutorEnabled: plan.liveTutorEnabled,
+    priority: plan.priority ?? 0,
   };
 }
 

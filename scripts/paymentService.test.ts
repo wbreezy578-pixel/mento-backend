@@ -4,7 +4,7 @@ import { buildPaymentIdempotencyKey, verifyWebhookSignature } from '../services/
 async function run() {
   const keyA = buildPaymentIdempotencyKey({
     userId: 'user-1',
-    provider: 'STRIPE',
+    provider: 'PADDLE',
     type: 'SUBSCRIPTION',
     amountUsd: 15,
     currency: 'USD',
@@ -14,7 +14,7 @@ async function run() {
 
   const keyB = buildPaymentIdempotencyKey({
     userId: 'user-1',
-    provider: 'STRIPE',
+    provider: 'PADDLE',
     type: 'SUBSCRIPTION',
     amountUsd: 15,
     currency: 'USD',
@@ -27,8 +27,7 @@ async function run() {
   const signed = await verifyWebhookSignature({
     payload: '{"event":"succeeded"}',
     signature: 'sha256=abc123',
-    secret: 'secret',
-    provider: 'STRIPE',
+    provider: 'PADDLE',
   });
 
   assert.equal(signed, false);

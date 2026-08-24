@@ -1,5 +1,5 @@
 ﻿import { NextResponse } from 'next/server';
-import { createSimliStreamingAvatarSession, closeRealtimeSession } from '../../../services/simliService';
+import { createSimliStreamingAvatarSession, closeRealtimeSession, getActiveSimliSessionForUser } from '../../../services/simliService';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -16,6 +16,17 @@ export async function POST(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
 
+    const existingSession = getActiveSimliSessionForUser(user.id);
+    if (existingSession?.streamId) {
+      return NextResponse.json({
+        sessionToken: existingSession.sessionToken,
+        streamId: existingSession.streamId,
+        sessionId: existingSession.sessionId,
+        avatarId: existingSession.avatarId,
+        expiresAt: existingSession.expiresAt,
+      });
+    }
+
     const requestId = buildAIRequestId('live-stream');
     const { result: session, billingDecision } = await executeAIRequest({
       user,
@@ -26,7 +37,7 @@ export async function POST(req: Request) {
       requestId,
       metadata: { streamType: 'avatar-session' },
       pending: true,
-      callback: async () => await createSimliStreamingAvatarSession(),
+      callback: async () => await createSimliStreamingAvatarSession({ requestId, userId: user.id, secondsReserved: 60 }),
     });
 
     if (billingDecision.remainingUsage !== null && billingDecision.remainingUsage <= 0) {

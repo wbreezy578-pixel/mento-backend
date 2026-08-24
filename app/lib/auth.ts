@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { Prisma } from '@prisma/client';
@@ -9,7 +10,6 @@ import { NextResponse } from 'next/server';
 import type { ResponseCookies } from 'next/dist/server/web/spec-extension/cookies';
 
 loadAndValidateEnvironment();
-const isProduction = process.env.NODE_ENV === 'production';
 const JWT_SECRET = getConfiguredJwtSecret();
 const resolvedJwtSecret = JWT_SECRET;
 const MAX_FAILED_LOGIN_ATTEMPTS = 5;
@@ -17,6 +17,11 @@ const LOCKOUT_DURATION_MS = 15 * 60 * 1000;
 
 function getJwtSecret(): string | undefined {
   return resolvedJwtSecret;
+}
+
+function getJwtSecretFingerprint(secret: string | undefined): string | null {
+  if (!secret) return null;
+  return createHash('sha256').update(secret).digest('hex');
 }
 
 function ensureJwtSecret(): string {
@@ -27,6 +32,8 @@ function ensureJwtSecret(): string {
 }
 
 const JWT_ALGORITHM = 'HS256';
+const JWT_ISSUER = process.env.JWT_ISSUER ?? 'mento';
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE ?? 'mento';
 const PASSWORD_MIN_LENGTH = 12;
 const RECENT_OAUTH_REAUTH_MS = 15 * 60 * 1000;
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
@@ -38,6 +45,7 @@ export interface JwtPayload {
   email: string;
   iat: number;
   exp: number;
+  type?: 'access' | 'refresh' | string;
 }
 
 export interface PasswordValidationResult {
@@ -80,23 +88,32 @@ export function getLoginPolicyState(user: { failedLoginAttempts?: number | null;
   };
 }
 
+function extractTokenFromRequest(req: Request): { token: string | null; source: 'authorization' | 'cookie' | 'none' } {
+  const headerValue = req.headers.get('authorization')?.trim() ?? '';
+  const headerMatch = headerValue.match(/^Bearer\s+(.+)$/i);
+  if (headerMatch?.[1]) {
+    return { token: headerMatch[1].trim(), source: 'authorization' };
+  }
+
+  const cookieHeader = req.headers.get('cookie') ?? '';
+  const cookieMatch = cookieHeader.match(/(?:^|;\s*)mento_access_token=([^;]+)/);
+  if (cookieMatch?.[1]) {
+    return { token: decodeURIComponent(cookieMatch[1]).trim(), source: 'cookie' };
+  }
+
+  return { token: null, source: 'none' };
+}
+
 export async function getUserFromRequest(req: Request) {
   const authHeader = req.headers.get('authorization')?.trim() || '';
   const authHeaderExists = authHeader.length > 0;
   const authScheme = authHeaderExists ? authHeader.split(' ')[0] : 'none';
-  logger.info('Auth header inspection', { authHeaderExists, authScheme });
+  const { token, source: tokenSource } = extractTokenFromRequest(req);
+  const tokenPresent = Boolean(token);
+  logger.info('Auth header inspection', { authHeaderExists, authScheme, tokenPresent, tokenSource });
 
-  if (!authHeader.toLowerCase().startsWith('bearer ')) {
-    logger.warn('Auth rejected: invalid scheme');
-    userContext.enterWith(null);
-    return null;
-  }
-
-  const token = authHeader.slice(7).trim();
-  const tokenPresent = token.length > 0;
-  logger.info('Bearer token inspection', { tokenPresent });
-  if (!tokenPresent) {
-    logger.warn('Auth rejected: missing token');
+  if (!tokenPresent || !token) {
+    logger.warn('Auth rejected: missing token', { tokenSource });
     userContext.enterWith(null);
     return null;
   }
@@ -104,23 +121,47 @@ export async function getUserFromRequest(req: Request) {
   logger.info('JWT verification started');
   try {
     const jwtSecret = getJwtSecret();
+    logger.info('JWT verification configuration', {
+      jwtSecretConfigured: Boolean(jwtSecret),
+      jwtSecretFingerprint: getJwtSecretFingerprint(jwtSecret),
+      algorithm: JWT_ALGORITHM,
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
     if (!jwtSecret) {
       logger.warn('JWT_SECRET not configured: auth verification is disabled');
       userContext.enterWith(null);
       return null;
     }
-    const payload = jwt.verify(token, jwtSecret, { algorithms: [JWT_ALGORITHM] });
+    const payload = jwt.verify(token, jwtSecret, {
+      algorithms: [JWT_ALGORITHM],
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    }) as Partial<JwtPayload>;
     const decodedUserId = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).sub ?? null : null;
     const decodedEmail = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).email ?? null : null;
+    const decodedIat = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).iat ?? null : null;
+    const decodedExp = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).exp ?? null : null;
     logger.info('JWT verification succeeded', {
       decodedUserId,
       decodedEmail,
+      decodedIat,
+      decodedExp,
       algorithm: JWT_ALGORITHM,
-      secretConfigured: Boolean(JWT_SECRET),
+      secretConfigured: Boolean(jwtSecret),
+      nowUnixSeconds: Math.floor(Date.now() / 1000),
+      tokenAgeSeconds: typeof decodedIat === 'number' ? Math.floor(Date.now() / 1000) - decodedIat : null,
+      tokenExpiresInSeconds: typeof decodedExp === 'number' ? decodedExp - Math.floor(Date.now() / 1000) : null,
     });
 
-    if (typeof payload !== 'object' || payload === null || typeof (payload as Partial<JwtPayload>).sub !== 'string') {
+    if (typeof payload !== 'object' || payload === null || typeof (payload as Partial<JwtPayload>).sub !== 'string' || typeof (payload as Partial<JwtPayload>).email !== 'string') {
       logger.warn('Auth rejected: invalid JWT payload');
+      userContext.enterWith(null);
+      return null;
+    }
+
+    if ((payload as JwtPayload).type === 'refresh') {
+      logger.warn('Auth rejected: refresh token used as access token');
       userContext.enterWith(null);
       return null;
     }
@@ -129,18 +170,7 @@ export async function getUserFromRequest(req: Request) {
     const email = (payload as JwtPayload).email;
     logger.info('JWT payload extracted', { userId, email });
 
-    let user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user && typeof email === 'string') {
-      const normalizedEmail = normalizeEmail(email);
-      if (normalizedEmail) {
-        user = await prisma.user.findFirst({
-          where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
-        });
-        if (user) {
-          logger.info('JWT fallback user found by email', { email: normalizedEmail, fallbackUserId: user.id });
-        }
-      }
-    }
+    const user = await prisma.user.findUnique({ where: { id: userId } });
 
     const userFound = Boolean(user);
     logger.info('User lookup result', { userFound, userId, userEmail: user?.email ?? null });
@@ -155,10 +185,13 @@ export async function getUserFromRequest(req: Request) {
   } catch (error: unknown) {
     const errorName = error instanceof Error ? error.name : 'UnknownError';
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    const tokenExpired = errorName === 'TokenExpiredError';
     logger.warn('JWT verification failed', {
       errorName,
       errorMessage,
       tokenPresent,
+      tokenExpired,
+      algorithm: JWT_ALGORITHM,
     });
     userContext.enterWith(null);
     return null;
@@ -167,6 +200,11 @@ export async function getUserFromRequest(req: Request) {
 
 export function normalizeEmail(email: string | null | undefined) {
   return typeof email === 'string' ? email.trim().toLowerCase() : '';
+}
+
+export function isBcryptHash(hash: string) {
+  // Accept common bcrypt prefixes and a base64-like payload of variable length
+  return /^\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]+$/.test(hash);
 }
 
 export function isAdminUser(user: { email?: string | null; authProvider?: string | null; role?: string | null }) {
@@ -210,7 +248,25 @@ export async function hashPassword(password: string) {
 
 export async function verifyPassword(password: string, passwordHash: string | null | undefined) {
   if (!passwordHash || !passwordHash.trim()) return false;
-  return bcrypt.compare(password, passwordHash);
+
+  const trimmedHash = passwordHash.trim();
+  const isBcrypt = isBcryptHash(trimmedHash);
+
+  if (isBcrypt) {
+    try {
+      return await bcrypt.compare(password, trimmedHash);
+    } catch (error) {
+      logger.warn('Password verification failed due to invalid bcrypt hash', {
+        error: error instanceof Error ? error.message : String(error),
+        hashLength: trimmedHash.length,
+      });
+      return false;
+    }
+  }
+
+  // Legacy compatibility: some older or migrated accounts may have stored passwords in plain text.
+  // Only accept raw matches for non-bcrypt strings to avoid degrading bcrypt-based security.
+  return password === trimmedHash;
 }
 
 export function getSensitiveActionRequirements(user: { authProvider?: string | null; lastOAuthReauthAt?: Date | string | null }, now = new Date()): SensitiveActionRequirements {
@@ -238,8 +294,24 @@ export function buildUserSummary(user: { id: string; email: string; name?: strin
 
 export function signToken(userId: string, email: string, options?: { expiresInSeconds?: number }) {
   const jwtSecret = ensureJwtSecret();
+  const jwtSecretFingerprint = getJwtSecretFingerprint(jwtSecret);
   const expiresInSeconds = options?.expiresInSeconds ?? ACCESS_TOKEN_TTL_SECONDS;
-  return jwt.sign({ sub: userId, email }, jwtSecret, { expiresIn: expiresInSeconds, algorithm: JWT_ALGORITHM });
+
+  logger.info('JWT signing configuration', {
+    jwtSecretConfigured: true,
+    jwtSecretFingerprint,
+    algorithm: JWT_ALGORITHM,
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+    expiresInSeconds,
+  });
+
+  return jwt.sign({ sub: userId, email, type: 'access' }, jwtSecret, {
+    expiresIn: expiresInSeconds,
+    algorithm: JWT_ALGORITHM,
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
+  });
 }
 
 export function signRefreshToken(userId: string, email: string) {
@@ -247,6 +319,8 @@ export function signRefreshToken(userId: string, email: string) {
   return jwt.sign({ sub: userId, email, type: 'refresh' }, jwtSecret, {
     expiresIn: REFRESH_TOKEN_TTL_SECONDS,
     algorithm: JWT_ALGORITHM,
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
   });
 }
 

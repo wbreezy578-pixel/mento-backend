@@ -195,6 +195,21 @@ function normalizeText(text?: string): string | undefined {
   return trimmedText ? trimmedText : undefined;
 }
 
+export function isGeminiResponseSuccessful(response: unknown): boolean {
+  if (!response || typeof response !== 'object') {
+    return false;
+  }
+
+  const candidateContent = (response as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> }).candidates?.[0]?.content;
+  const parts = candidateContent?.parts ?? [];
+  const textFromParts = parts.map((part) => normalizeText(part.text)).filter((text): text is string => Boolean(text)).join('').trim();
+  const rawText = (response as { text?: unknown }).text;
+  const directText = typeof rawText === 'string' ? rawText.trim() : '';
+  const candidates = (response as { candidates?: unknown }).candidates;
+
+  return Boolean(directText || textFromParts || (Array.isArray(candidates) && candidates.length > 0));
+}
+
 function compactParts(parts: GeminiMessage['parts']): GeminiMessage['parts'] {
   const compacted: GeminiMessage['parts'] = [];
   let pendingText: string[] = [];
@@ -227,6 +242,8 @@ function compactParts(parts: GeminiMessage['parts']): GeminiMessage['parts'] {
 function buildGeminiRequestPayload(input: string | GeminiContent[], kind: GeminiModelKind): GeminiRequestPayload {
   const baseInstruction = kind === 'image'
     ? `${SYSTEM_PROMPT}\nWhen analyzing images, return a clear, structured explanation. Include a short "category" (e.g., Homework, Math equation, Diagram), a concise "description", an array of detected "objects" with brief notes, and an optional list of "followUpQuestions" to ask the user.`
+    : kind === 'live-tutor'
+    ? `${SYSTEM_PROMPT}\n\nVoice Response Guidelines:\n• Keep responses to 1–3 short sentences.\n• Answer the user's question directly and immediately.\n• Use conversational, natural spoken language.\n• Avoid long introductions or preambles.\n• Do not repeat the user's question.\n• Only provide essay-length or detailed responses if the user explicitly asks for them.\n• Speak as if talking to someone face-to-face.`
     : SYSTEM_PROMPT;
 
   if (typeof input === 'string') {
@@ -451,12 +468,132 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
   throw lastError ? createGeminiError(getErrorText(lastError) || 'Unable to generate a response right now.', lastError) : new Error('Unable to generate a response right now.');
 }
 
+export async function askGeminiLiveTutor(input: string | GeminiContent[], modelOverride?: string): Promise<string> {
+  assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
+
+  if (!geminiApiKey) {
+    throw new Error('Gemini provider is not configured. Please try again later.');
+  }
+
+  if (geminiBreaker.isOpen()) {
+    throw new Error('Gemini is temporarily unavailable. Please try again shortly.');
+  }
+
+  await runSecurityCheck(input);
+  const payload = buildGeminiRequestPayload(input, 'live-tutor');
+  const requestStartedAt = Date.now();
+  const candidates = getModelCandidatesForKind('live-tutor', modelOverride);
+  const configuredModel = getConfiguredModelName('live-tutor');
+
+  // Calculate input character count (sum of all message text)
+  let inputCharCount = 0;
+  for (const msg of payload.contents) {
+    for (const part of msg.parts) {
+      if (part.text) {
+        inputCharCount += part.text.length;
+      }
+    }
+  }
+
+  logger.info('[LiveTutorGemini] live tutor Gemini request started', {
+    promptMessageCount: payload.contents.length,
+    promptCharCount: inputCharCount,
+    promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
+    model: configuredModel,
+  });
+
+  let lastError: unknown;
+  for (const model of candidates) {
+    try {
+      const response = await retryGeminiCall(async () => {
+        logger.info('[LiveTutorGemini] Calling Gemini provider', { model, kind: 'live-tutor', promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction) });
+        const result = await client.models.generateContent({
+          model,
+          contents: payload.contents,
+          config: {
+            systemInstruction: payload.systemInstruction,
+            safetySettings: SAFETY_SETTINGS,
+            temperature: AI_CONFIG.TEMPERATURE,
+            topP: AI_CONFIG.TOP_P,
+            topK: AI_CONFIG.TOP_K,
+            maxOutputTokens: payload.maxOutputTokens,
+          },
+        });
+        return result;
+      }, {
+        ...geminiProviderOptions,
+        timeoutMs: geminiProviderOptions.timeoutMs ?? AI_CONFIG.GEMINI_TIMEOUT_MS,
+        shouldRetry: (error: unknown) => isTransientGeminiError(error),
+      });
+
+      const text = response?.text || response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      const responseLength = text.length;
+      logger.info('[LiveTutorGemini] response completed', {
+        model,
+        latencyMs: Date.now() - requestStartedAt,
+        promptMessageCount: payload.contents.length,
+        promptCharCount: inputCharCount,
+        promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
+        responseCharCount: responseLength,
+      });
+
+      if (!text || text.trim() === '') {
+        geminiBreaker.recordFailure();
+        throw new Error('Gemini returned an empty response');
+      }
+
+      geminiBreaker.recordSuccess();
+      observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'live-tutor' });
+      return text.trim();
+    } catch (error: unknown) {
+      lastError = error;
+      const classification = classifyGeminiError(error);
+      logger.warn('[LiveTutorGemini] Gemini model attempt failed', {
+        provider: 'gemini',
+        kind: 'live-tutor',
+        model,
+        classification,
+        latencyMs: Date.now() - requestStartedAt,
+      });
+
+      if (classification.category === 'model_not_found' && model !== candidates[candidates.length - 1]) {
+        logger.warn('[LiveTutorGemini] Falling back to the next Gemini model', { provider: 'gemini', kind: 'live-tutor', fromModel: model, nextModel: candidates[candidates.indexOf(model) + 1] });
+        continue;
+      }
+
+      geminiBreaker.recordFailure();
+      observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'live-tutor', status: classification.status ?? 'error' });
+      incrementMonitoringFailure('tutor', { provider: 'gemini', feature: 'live-tutor', reason: classification.category });
+      const errorMessage = getErrorMessage(error);
+      const rootCause = classification.message || getClientErrorMessage(errorMessage, 'Unable to generate a response right now.');
+      logger.error('[LiveTutorGemini] Gemini request failed', {
+        error: sanitizeForLogging({
+          status: classification.status,
+          message: rootCause,
+          responseBody: classification.responseBody,
+          details: classification.details,
+          stack: getErrorStack(error),
+        }),
+        provider: 'gemini',
+        kind: 'live-tutor',
+        classification,
+        latencyMs: Date.now() - requestStartedAt,
+        promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
+      });
+      throw createGeminiError(rootCause, error);
+    }
+  }
+
+  throw lastError ? createGeminiError(getErrorText(lastError) || 'Unable to generate a response right now.', lastError) : new Error('Unable to generate a response right now.');
+}
+
 export default askGemini;
 
 export async function askGeminiStream(
   input: string | GeminiContent[],
-  onToken: (token: string) => void,
-  modelOverride?: string
+  onToken: (token: string) => Promise<void> | void,
+  modelOverride?: string,
+  abortSignal?: AbortSignal
 ): Promise<string> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
   assertFeatureEnabled(AI_FEATURES.STREAMING, 'Streaming is currently disabled.');
@@ -480,82 +617,118 @@ export async function askGeminiStream(
   });
 
   let lastError: unknown;
-  for (const model of candidates) {
-    try {
-      const stream = await retryGeminiCall(async () => {
-        logger.info('Calling Gemini streaming provider', {
-          model,
-          kind: 'chat',
-          promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
-        });
-        return await client.models.generateContentStream({
-          model,
-          contents: payload.contents,
-          config: {
-            systemInstruction: payload.systemInstruction,
-            safetySettings: SAFETY_SETTINGS,
-            temperature: AI_CONFIG.TEMPERATURE,
-            topP: AI_CONFIG.TOP_P,
-            topK: AI_CONFIG.TOP_K,
-            maxOutputTokens: payload.maxOutputTokens,
-          },
-        });
-      }, {
-        ...geminiProviderOptions,
-        timeoutMs: geminiProviderOptions.timeoutMs ?? AI_CONFIG.GEMINI_TIMEOUT_MS,
-        shouldRetry: (error: unknown) => isTransientGeminiError(error),
-      });
+  let currentStream: AsyncIterable<{ text?: string }> | null = null;
+  const abortHandler = async () => {
+    if (currentStream && typeof (currentStream as any).return === 'function') {
+      try {
+        await (currentStream as any).return();
+      } catch {
+        // Ignore provider stream cancellation failures.
+      }
+    }
+  };
 
-      let completionText = '';
-      for await (const chunk of stream) {
-        const chunkText = typeof chunk?.text === 'string' ? chunk.text : '';
-        if (!chunkText) {
-          continue;
+  const abortListener = () => {
+    void abortHandler();
+  };
+
+  if (abortSignal) {
+    abortSignal.addEventListener('abort', abortListener, { once: true });
+  }
+
+  try {
+    for (const model of candidates) {
+      if (abortSignal?.aborted) {
+        logger.info('Gemini stream aborted before provider request', { provider: 'gemini', kind: 'chat', model });
+        return '';
+      }
+
+      try {
+        currentStream = await retryGeminiCall(async () => {
+          logger.info('Calling Gemini streaming provider', {
+            model,
+            kind: 'chat',
+            promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
+          });
+          return await client.models.generateContentStream({
+            model,
+            contents: payload.contents,
+            config: {
+              systemInstruction: payload.systemInstruction,
+              safetySettings: SAFETY_SETTINGS,
+              temperature: AI_CONFIG.TEMPERATURE,
+              topP: AI_CONFIG.TOP_P,
+              topK: AI_CONFIG.TOP_K,
+              maxOutputTokens: payload.maxOutputTokens,
+            },
+          });
+        }, {
+          ...geminiProviderOptions,
+          timeoutMs: geminiProviderOptions.timeoutMs ?? AI_CONFIG.GEMINI_TIMEOUT_MS,
+          shouldRetry: (error: unknown) => isTransientGeminiError(error),
+        });
+
+        let completionText = '';
+        let firstTokenObserved = false;
+        for await (const chunk of currentStream) {
+          if (abortSignal?.aborted) {
+            await abortHandler();
+            break;
+          }
+
+          const chunkText = typeof chunk?.text === 'string' ? chunk.text : '';
+          if (!chunkText) {
+            continue;
+          }
+
+          completionText += chunkText;
+          if (!firstTokenObserved) {
+            firstTokenObserved = true;
+            observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'first-token' });
+          }
+          await onToken(chunkText);
         }
 
-        completionText += chunkText;
-        onToken(chunkText);
-      }
+        if (abortSignal?.aborted) {
+          logger.info('Gemini stream aborted while receiving content', { provider: 'gemini', kind: 'chat', model });
+          return completionText.trim();
+        }
 
-      if (!completionText.trim()) {
-        geminiBreaker.recordFailure();
-        throw new Error('Gemini returned an empty response');
-      }
+        if (!completionText.trim()) {
+          geminiBreaker.recordFailure();
+          throw new Error('Gemini returned an empty response');
+        }
 
-      geminiBreaker.recordSuccess();
-      observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'chat' });
-      logger.info('Gemini stream completed', {
-        provider: 'gemini',
-        kind: 'chat',
-        model,
-        latencyMs: Date.now() - requestStartedAt,
-        responseSizeBytes: Buffer.byteLength(completionText, 'utf8'),
-      });
-      return completionText.trim();
-    } catch (error: unknown) {
-      lastError = error;
-      const classification = classifyGeminiError(error);
-      logger.warn('Gemini stream attempt failed', {
-        provider: 'gemini',
-        kind: 'chat',
-        model,
-        classification,
-        latencyMs: Date.now() - requestStartedAt,
-      });
-
-      if (classification.category === 'model_not_found' && model !== candidates[candidates.length - 1]) {
-        logger.warn('Falling back to the next Gemini model for streaming', {
+        geminiBreaker.recordSuccess();
+        observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'chat' });
+        logger.info('Gemini stream completed', {
           provider: 'gemini',
           kind: 'chat',
-          fromModel: model,
-          nextModel: candidates[candidates.indexOf(model) + 1],
+          model,
+          latencyMs: Date.now() - requestStartedAt,
+          responseSizeBytes: Buffer.byteLength(completionText, 'utf8'),
         });
-        continue;
-      }
+        return completionText.trim();
+      } catch (error: unknown) {
+        if (abortSignal?.aborted) {
+          logger.info('Gemini stream aborted during provider attempt', { provider: 'gemini', kind: 'chat', model, error: String(error) });
+          return ''; // Return partial text if available but do not escalate as provider error.
+        }
 
-      geminiBreaker.recordFailure();
-      observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'chat', status: classification.status ?? 'error' });
-      incrementMonitoringFailure('tutor', { provider: 'gemini', feature: 'chat', reason: classification.category });
+        lastError = error;
+        const classification = classifyGeminiError(error);
+        logger.warn('Gemini stream attempt failed', {
+          provider: 'gemini',
+          kind: 'chat',
+          model,
+          classification,
+          latencyMs: Date.now() - requestStartedAt,
+        });
+      }
+    }
+  } finally {
+    if (abortSignal) {
+      abortSignal.removeEventListener('abort', abortListener);
     }
   }
 
@@ -685,6 +858,16 @@ export async function analyzeImage(
 
 let startupHealthCheckRan = false;
 
+export function buildGeminiHealthCheckResult(startedAt: number, success: boolean, message: string): { apiKeyLoaded: boolean; modelAvailable: boolean; responseTimeMs: number; success: boolean; message: string } {
+  return {
+    apiKeyLoaded: true,
+    modelAvailable: success,
+    responseTimeMs: Date.now() - startedAt,
+    success,
+    message,
+  };
+}
+
 export async function runGeminiStartupHealthCheck(): Promise<{ apiKeyLoaded: boolean; modelAvailable: boolean; responseTimeMs: number; success: boolean; message: string }> {
   if (!geminiApiKey) {
     logger.warn('Gemini startup health check skipped', { reason: 'missing_api_key', apiKeyLoaded: false });
@@ -692,45 +875,68 @@ export async function runGeminiStartupHealthCheck(): Promise<{ apiKeyLoaded: boo
   }
 
   const startedAt = Date.now();
-  try {
-    const response = await client.models.generateContent({
-      model: getModelForKind('chat'),
-      contents: 'Hello',
-      config: {
-        systemInstruction: 'Reply briefly with a greeting.',
-        maxOutputTokens: 16,
-      },
-    });
+  const candidates = getModelCandidatesForKind('chat');
+  let lastError: unknown;
+  let lastClassification: ReturnType<typeof classifyGeminiError> | undefined;
 
-    const success = Boolean(response?.text || response?.candidates?.[0]?.content?.parts?.[0]?.text);
-    const responseTimeMs = Date.now() - startedAt;
-    logger.info('Gemini startup health check completed', {
-      apiKeyLoaded: true,
-      modelAvailable: success,
-      responseTimeMs,
-      success,
-      model: getModelForKind('chat'),
-    });
-    return { apiKeyLoaded: true, modelAvailable: success, responseTimeMs, success, message: success ? 'Gemini is reachable.' : 'Gemini responded without text.' };
-  } catch (error: unknown) {
-    const classification = classifyGeminiError(error);
-    const responseTimeMs = Date.now() - startedAt;
-    logger.error('Gemini startup health check failed', {
-      apiKeyLoaded: true,
-      modelAvailable: false,
-      responseTimeMs,
-      success: false,
-      classification,
-      error: sanitizeForLogging({
-        status: classification.status,
-        message: classification.message,
-        responseBody: classification.responseBody,
-        details: classification.details,
-        stack: getErrorStack(error),
-      }),
-    });
-    return { apiKeyLoaded: true, modelAvailable: false, responseTimeMs, success: false, message: classification.message || 'Gemini health check failed.' };
+  for (const model of candidates) {
+    try {
+      const response = await client.models.generateContent({
+        model,
+        contents: 'Hello',
+        config: {
+          systemInstruction: 'Reply briefly with a greeting.',
+          maxOutputTokens: 16,
+        },
+      });
+
+      const success = isGeminiResponseSuccessful(response);
+      const message = success ? 'Gemini is reachable.' : 'Gemini responded without text.';
+      const result = buildGeminiHealthCheckResult(startedAt, success, message);
+      logger.info('Gemini startup health check completed', {
+        apiKeyLoaded: true,
+        modelAvailable: success,
+        responseTimeMs: result.responseTimeMs,
+        success,
+        model,
+      });
+      return result;
+    } catch (error: unknown) {
+      lastError = error;
+      lastClassification = classifyGeminiError(error);
+      logger.warn('Gemini startup health check attempt failed', {
+        apiKeyLoaded: true,
+        modelAvailable: false,
+        responseTimeMs: Date.now() - startedAt,
+        model,
+        classification: lastClassification,
+      });
+
+      if (lastClassification.category === 'model_not_found' && model !== candidates[candidates.length - 1]) {
+        continue;
+      }
+
+      break;
+    }
   }
+
+  const responseTimeMs = Date.now() - startedAt;
+  const classification = lastClassification ?? classifyGeminiError(lastError ?? new Error('Gemini health check failed.'));
+  logger.error('Gemini startup health check failed', {
+    apiKeyLoaded: true,
+    modelAvailable: false,
+    responseTimeMs,
+    success: false,
+    classification,
+    error: sanitizeForLogging({
+      status: classification.status,
+      message: classification.message,
+      responseBody: classification.responseBody,
+      details: classification.details,
+      stack: getErrorStack(lastError),
+    }),
+  });
+  return buildGeminiHealthCheckResult(startedAt, false, classification.message || 'Gemini health check failed.');
 }
 
 if (!startupHealthCheckRan) {

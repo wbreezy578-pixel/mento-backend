@@ -1,3 +1,5 @@
+import { getSensitiveActionRequirements } from './auth';
+
 export type DeletionCredentialMode = 'password' | 'google';
 
 export interface DeletionCredentialResolution {
@@ -15,7 +17,7 @@ export interface GoogleTokenVerifier {
   verifyGoogleAccessToken?: (token: string, context: DeletionCredentialContext) => Promise<{ email?: string | null } | null>;
 }
 
-export async function verifyGoogleAccessToken(token: string, context: DeletionCredentialContext = {}) {
+export async function verifyGoogleAccessToken(token: string, _context: DeletionCredentialContext = {}) {
   const trimmedToken = token.trim();
   if (!trimmedToken) {
     return null;
@@ -47,6 +49,10 @@ export async function resolveDeletionCredential(
   const googleAccessToken = typeof input.googleAccessToken === 'string' ? input.googleAccessToken.trim() : '';
 
   const isGoogleLinked = context.authProvider === 'google' || context.authProvider === 'mixed';
+  const actionRequirements = getSensitiveActionRequirements({
+    authProvider: context.authProvider,
+    lastOAuthReauthAt: context.lastOAuthReauthAt,
+  });
 
   if (password) {
     if (isGoogleLinked) {
@@ -74,10 +80,17 @@ export async function resolveDeletionCredential(
       throw new Error('Google re-authentication token does not match your signed-in account.');
     }
 
+    if (actionRequirements.requiresRecentOAuthReauth) {
+      throw new Error('Please re-authenticate with Google recently before deleting your account.');
+    }
+
     return { mode: 'google' as const, value: googleAccessToken };
   }
 
   if (isGoogleLinked) {
+    if (actionRequirements.requiresRecentOAuthReauth) {
+      throw new Error('Please re-authenticate with Google recently before deleting your account.');
+    }
     throw new Error('Google-linked accounts require a recent Google re-authentication before deletion.');
   }
 

@@ -1,11 +1,11 @@
-import Redis from 'ioredis';
 import { rateLimitAllowed, rateLimitDenied, rateLimitHits } from './metrics';
 import { getRedisUrl } from './env';
+import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REDIS_URL = getRedisUrl();
 const REQUIRE_DISTRIBUTED_RATE_LIMIT = process.env.REQUIRE_RATE_LIMIT_REDIS === 'true'
   || (process.env.NODE_ENV === 'production' && Boolean(REDIS_URL));
-let redis: Redis | null = null;
+let redis: MentoRedisClient | null = null;
 
 function distributedLimiterUnavailable(type: 'cooldown' | 'sliding' | 'daily') {
   rateLimitDenied.inc({ type });
@@ -14,7 +14,7 @@ function distributedLimiterUnavailable(type: 'cooldown' | 'sliding' | 'daily') {
 
 if (REDIS_URL) {
   try {
-    redis = new Redis(REDIS_URL);
+    redis = createRedisClient(REDIS_URL);
     // Define a Lua-backed atomic sliding window command for accuracy under concurrency
     try {
       redis.defineCommand('slidingWindowAtomic', {
@@ -107,7 +107,7 @@ export async function ensureSlidingWindow(
     const member = `${nowTs}-${Math.random().toString(36).slice(2, 10)}`;
 
         try {
-      const result = await (redis as Redis & {
+      const result = await (redis as MentoRedisClient & {
         slidingWindowAtomic: (
           key: string,
           nowTs: number,

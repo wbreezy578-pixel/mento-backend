@@ -1,18 +1,15 @@
-import Redis from 'ioredis';
 import { getRedisUrl } from './env';
 import logger from './logger';
+import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REALTIME_LEASE_TTL_SECONDS = 30;
 const redisUrl = getRedisUrl();
 const requireRedis = process.env.REQUIRE_REALTIME_REDIS === 'true';
 
-let redis: Redis | null = null;
+let redis: MentoRedisClient | null = null;
 
 if (redisUrl) {
-  redis = new Redis(redisUrl, {
-    maxRetriesPerRequest: 2,
-    enableOfflineQueue: false,
-  });
+  redis = createRedisClient(redisUrl);
   redis.on('error', (error) => {
     logger.warn('[RealtimeRedis] Redis connection error', {
       message: error.message,
@@ -29,7 +26,7 @@ function sessionKey(streamId: string): string {
   return `voice_session:${streamId}`;
 }
 
-function assertRedisAvailable(): Redis | null {
+function assertRedisAvailable(): MentoRedisClient | null {
   if (!redis && requireRedis) {
     throw new Error('Realtime Redis is required but REDIS_URL is not configured.');
   }

@@ -228,6 +228,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
               secretRef: 'redis-url'
             }
             {
+              name: 'REDIS_CLUSTER_MODE'
+              value: 'true'
+            }
+            {
               name: 'REQUIRE_REALTIME_REDIS'
               value: 'true'
             }

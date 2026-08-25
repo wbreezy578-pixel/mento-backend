@@ -37,7 +37,7 @@ export async function GET(req: Request) {
     const conversations = await getUserConversations(user.id, source);
 
     return NextResponse.json({
-      conversations: conversations.map((conv) => ({
+      conversations: conversations.filter((conv) => conv.messages.length > 0).map((conv) => ({
         id: conv.id,
         title: conv.title,
         pinned: conv.pinned,
@@ -46,7 +46,7 @@ export async function GET(req: Request) {
         summary: conv.summary,
         summaryUpdatedAt: conv.summaryUpdatedAt,
         recentMessageWindow: 40,
-        lastMessage: conv.messages[0]?.text || '(no messages)',
+        lastMessage: conv.messages[0].text,
       })),
     }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   } catch (error: unknown) {

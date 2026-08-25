@@ -5,6 +5,7 @@ export default defineConfig({
     include: [
       "app/lib/chatScroll.test.ts",
       "app/lib/notificationNavigator.test.ts",
+      "app/lib/aiSafety.test.ts",
       "app/api/payments/paymentSecurity.test.ts",
       "lib/authSession.test.ts",
       "services/liveTutorGeminiLiveService.test.ts",

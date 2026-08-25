@@ -23,6 +23,32 @@ export async function createConversation(userId: string, title?: string | null, 
   });
 }
 
+export async function createConversationWithInitialMessage(
+  userId: string,
+  initialMessage: string,
+  options?: { requestId?: string; source?: string },
+) {
+  const text = initialMessage.trim();
+  if (!text) throw new Error('Initial message is required.');
+
+  return prisma.$transaction(async (tx) => {
+    const conversation = await tx.conversation.create({
+      data: { userId, source: options?.source ?? 'chat' },
+    });
+    await tx.conversationMessage.create({
+      data: {
+        conversationId: conversation.id,
+        userId,
+        role: 'user',
+        status: 'completed',
+        content: text,
+        text,
+      },
+    });
+    return conversation;
+  });
+}
+
 export async function getOrCreateLatestConversation(userId: string) {
   let conversation = await prisma.conversation.findFirst({ where: { userId }, orderBy: { updatedAt: 'desc' } });
   if (!conversation) {
@@ -316,6 +342,7 @@ export async function unpinConversation(conversationId: string) {
 
 export default {
   createConversation,
+  createConversationWithInitialMessage,
   getConversation,
   validateConversationOwnership,
   addMessageToConversation,

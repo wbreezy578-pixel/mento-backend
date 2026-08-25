@@ -4,7 +4,8 @@ import { askGeminiStream, GeminiImageContent, GeminiMessage } from '../../../../
 import {
   getConversationHistoryForAI,
   validateConversationOwnership,
-  getOrCreateLatestConversation,
+  createConversation,
+  deleteConversation,
   addMessageToConversation,
   setConversationTitleIfMissing,
   updateConversationSummary,
@@ -83,13 +84,15 @@ export async function POST(req: Request) {
       : null;
 
     let conversationId = typeof body?.conversationId === 'string' ? body.conversationId : undefined;
+    let createdForRequest = false;
     if (conversationId && !(await validateConversationOwnership(conversationId, userId))) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     if (!conversationId) {
-      const conv = await getOrCreateLatestConversation(userId);
+      const conv = await createConversation(userId);
       conversationId = conv.id;
+      createdForRequest = true;
     }
     logger.info('Chat stream conversation selected', { userId, conversationId });
 
@@ -157,6 +160,7 @@ export async function POST(req: Request) {
           }
         } catch (dbErr) {
           logger.error('Failed to save initial conversation state before streaming', { error: String(dbErr) });
+          if (createdForRequest) await deleteConversation(conversationId).catch(() => undefined);
           if (!isStreamClosed()) {
             enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', message: 'Unable to start the response. Please try again.' })}\n\n`));
           }

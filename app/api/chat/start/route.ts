@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../../lib/auth';
-import { createConversation } from '../../../../lib/conversationDb';
+import { createConversationWithInitialMessage } from '../../../../lib/conversationDb';
 import { info, warn } from '../../../../lib/logger';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 
@@ -32,8 +32,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    const conversation = await createConversation(user.id);
-    info('New conversation created', { userId: user.id, conversationId: conversation.id });
+    const body = await req.json().catch(() => null) as { initialMessage?: unknown; requestId?: unknown } | null;
+    const initialMessage = typeof body?.initialMessage === 'string' ? body.initialMessage.trim() : '';
+    if (!initialMessage || initialMessage.length > 20_000) {
+      return NextResponse.json({ error: 'A valid initial message is required.' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }
+    const requestId = typeof body?.requestId === 'string' ? body.requestId.trim().slice(0, 200) : undefined;
+    const conversation = await createConversationWithInitialMessage(user.id, initialMessage, { requestId });
+    info('New conversation created with initial message', { category: 'conversation_created' });
 
     return NextResponse.json({ conversationId: conversation.id }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   } catch (error: unknown) {

@@ -6,6 +6,7 @@ export default defineConfig({
       "app/lib/chatScroll.test.ts",
       "app/lib/notificationNavigator.test.ts",
       "app/lib/aiSafety.test.ts",
+      "lib/supportReport.test.ts",
       "app/api/payments/paymentSecurity.test.ts",
       "lib/authSession.test.ts",
       "services/liveTutorGeminiLiveService.test.ts",

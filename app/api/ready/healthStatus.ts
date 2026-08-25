@@ -19,5 +19,5 @@ function isSuccessfulCheck(value: unknown): boolean {
 }
 
 export function isReadinessHealthy(checks: Record<string, unknown>): boolean {
-  return [checks.database, checks.redis, checks.gemini, checks.simli, checks.paymentProviders].every((value) => isSuccessfulCheck(value));
+  return [checks.database, checks.redis].every((value) => isSuccessfulCheck(value));
 }

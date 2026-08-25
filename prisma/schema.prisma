@@ -32,12 +32,29 @@ model User {
   paymentLedgerEntries   PaymentLedgerEntry[]
   paymentReceipts        PaymentReceipt[]
   paymentTransactions    PaymentTransaction[]
+  storePurchases         StorePurchase[]
   securityEvents         SecurityEvent[]
   sessions               Session[]
   usageLogs              UsageLog[]
+  consentRecords         ConsentRecord[]
   chatAnalytics          ChatAnalyticsEvent[]
   userSetting            UserSetting?
   wallet                 UserWallet?
+}
+
+model ConsentRecord {
+  id              String   @id @default(cuid())
+  userId          String
+  privacyVersion  String
+  termsVersion    String
+  aiNoticeVersion String
+  source          String   @default("android")
+  acceptedAt      DateTime @default(now())
+  revokedAt       DateTime?
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, privacyVersion, termsVersion, aiNoticeVersion])
+  @@index([userId, acceptedAt])
 }
 
 model Notification {
@@ -66,10 +83,11 @@ model UserWallet {
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
   planId                String
-  paddleCustomerId      String?
+  paddleCustomerId      String?   @unique
   paddlePriceId         String?
-  paddleSubscriptionId  String?
+  paddleSubscriptionId  String?   @unique
   subscriptionExpiresAt DateTime?
+  paddleLastEventAt     DateTime?
   plan                  Plan      @relation(fields: [planId], references: [id])
   user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
@@ -219,7 +237,7 @@ model UserSetting {
 }
 
 model PaymentTransaction {
-  id                     String               @id @default(cuid())
+  id                     String                @id @default(cuid())
   userId                 String?
   provider               String
   type                   String
@@ -228,20 +246,75 @@ model PaymentTransaction {
   amountMinor            Int
   currency               String
   description            String
-  idempotencyKey         String?              @unique
+  idempotencyKey         String?               @unique
   providerCustomerId     String?
   providerSubscriptionId String?
-  providerTransactionId  String?              @unique
+  providerTransactionId  String?               @unique
   providerPayload        Json?
   metadata               Json?
   failureReason          String?
   receiptNumber          String?
   lastWebhookAt          DateTime?
-  createdAt              DateTime             @default(now())
-  updatedAt              DateTime             @updatedAt
+  createdAt              DateTime              @default(now())
+  updatedAt              DateTime              @updatedAt
   ledgerEntries          PaymentLedgerEntry[]
   receipt                PaymentReceipt?
-  user                   User?                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  webhookEvents          PaymentWebhookEvent[]
+  storePurchase          StorePurchase?
+  user                   User?                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model StorePurchase {
+  id                    String              @id @default(cuid())
+  userId                String?
+  paymentTransactionId  String?             @unique
+  provider              String
+  productId             String
+  purchaseToken         String
+  transactionId         String?
+  originalTransactionId String?
+  purchaseType          String
+  status                String
+  quantity              Int                 @default(1)
+  purchasedAt           DateTime?
+  expiresAt             DateTime?
+  autoRenewing          Boolean?
+  acknowledged          Boolean             @default(false)
+  consumed              Boolean             @default(false)
+  environment           String?
+  rawPayload            Json?
+  lastVerifiedAt        DateTime            @default(now())
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+  user                  User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
+  paymentTransaction    PaymentTransaction? @relation(fields: [paymentTransactionId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, purchaseToken])
+  @@index([userId, status])
+  @@index([provider, transactionId])
+  @@index([provider, originalTransactionId])
+}
+
+model PaymentWebhookEvent {
+  id             String              @id @default(cuid())
+  provider       String
+  eventId        String
+  notificationId String?
+  eventType      String
+  occurredAt     DateTime
+  rawPayload     String
+  status         String              @default("RECEIVED")
+  attempts       Int                 @default(0)
+  error          String?
+  processedAt    DateTime?
+  transactionId  String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+  transaction    PaymentTransaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, eventId])
+  @@index([status, createdAt])
+  @@index([notificationId])
 }
 
 model PaymentReceipt {
@@ -265,6 +338,7 @@ model PaymentLedgerEntry {
   userId        String?
   entryType     String
   amountUsd     Float
+  amountMinor   Int                @default(0)
   currency      String
   balanceAfter  Float
   referenceType String
@@ -275,6 +349,8 @@ model PaymentLedgerEntry {
   updatedAt     DateTime           @default(now()) @updatedAt
   transaction   PaymentTransaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
   user          User?              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([transactionId, entryType])
 }
 
 model PricingConfig {

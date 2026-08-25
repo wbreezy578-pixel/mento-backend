@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { AI_CONFIG } from '../app/lib/aiConfig';
 import { AI_FEATURES } from '../app/lib/aiFeatures';
 import { SAFETY_SETTINGS } from '../app/lib/aiSafety';
@@ -167,6 +167,11 @@ export function classifyGeminiError(error: unknown): { category: GeminiErrorCate
 function isTransientGeminiError(error: unknown): boolean {
   const classification = classifyGeminiError(error);
   return classification.category === 'rate_limit' || classification.category === 'model_overloaded' || classification.category === 'timeout' || classification.category === 'network_failure';
+}
+
+export function shouldTryNextGeminiModel(error: unknown): boolean {
+  const { category } = classifyGeminiError(error);
+  return category === 'model_not_found' || category === 'rate_limit' || category === 'model_overloaded';
 }
 
 function assertFeatureEnabled(feature: boolean, message: string): void {
@@ -394,9 +399,7 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
           config: {
             systemInstruction: payload.systemInstruction,
             safetySettings: SAFETY_SETTINGS,
-            temperature: AI_CONFIG.TEMPERATURE,
-            topP: AI_CONFIG.TOP_P,
-            topK: AI_CONFIG.TOP_K,
+            ...getGeminiGenerationTuning(model),
             maxOutputTokens: payload.maxOutputTokens,
           },
         });
@@ -437,7 +440,7 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
         latencyMs: Date.now() - requestStartedAt,
       });
 
-      if (classification.category === 'model_not_found' && model !== candidates[candidates.length - 1]) {
+      if (shouldTryNextGeminiModel(error) && model !== candidates[candidates.length - 1]) {
         logger.warn('Falling back to the next Gemini model', { provider: 'gemini', kind: 'chat', fromModel: model, nextModel: candidates[candidates.indexOf(model) + 1] });
         continue;
       }
@@ -513,9 +516,7 @@ export async function askGeminiLiveTutor(input: string | GeminiContent[], modelO
           config: {
             systemInstruction: payload.systemInstruction,
             safetySettings: SAFETY_SETTINGS,
-            temperature: AI_CONFIG.TEMPERATURE,
-            topP: AI_CONFIG.TOP_P,
-            topK: AI_CONFIG.TOP_K,
+            ...getGeminiGenerationTuning(model),
             maxOutputTokens: payload.maxOutputTokens,
           },
         });
@@ -556,7 +557,7 @@ export async function askGeminiLiveTutor(input: string | GeminiContent[], modelO
         latencyMs: Date.now() - requestStartedAt,
       });
 
-      if (classification.category === 'model_not_found' && model !== candidates[candidates.length - 1]) {
+      if (shouldTryNextGeminiModel(error) && model !== candidates[candidates.length - 1]) {
         logger.warn('[LiveTutorGemini] Falling back to the next Gemini model', { provider: 'gemini', kind: 'live-tutor', fromModel: model, nextModel: candidates[candidates.indexOf(model) + 1] });
         continue;
       }
@@ -612,16 +613,20 @@ export async function askGeminiStream(
   const candidates = getModelCandidatesForKind('chat', modelOverride);
 
   logger.info('Gemini stream request started', {
-    inputPreview: typeof input === 'string' ? input.slice(0, 80) : 'conversation-array',
+    inputKind: typeof input === 'string' ? 'text' : 'conversation-array',
+    inputLength: typeof input === 'string' ? input.length : input.length,
     promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
   });
 
   let lastError: unknown;
   let currentStream: AsyncIterable<{ text?: string }> | null = null;
   const abortHandler = async () => {
-    if (currentStream && typeof (currentStream as any).return === 'function') {
+    const cancellableStream = currentStream as (AsyncIterable<{ text?: string }> & {
+      return?: () => Promise<unknown>;
+    }) | null;
+    if (typeof cancellableStream?.return === 'function') {
       try {
-        await (currentStream as any).return();
+        await cancellableStream.return();
       } catch {
         // Ignore provider stream cancellation failures.
       }
@@ -656,9 +661,7 @@ export async function askGeminiStream(
             config: {
               systemInstruction: payload.systemInstruction,
               safetySettings: SAFETY_SETTINGS,
-              temperature: AI_CONFIG.TEMPERATURE,
-              topP: AI_CONFIG.TOP_P,
-              topK: AI_CONFIG.TOP_K,
+              ...getGeminiGenerationTuning(model),
               maxOutputTokens: payload.maxOutputTokens,
             },
           });
@@ -775,16 +778,14 @@ export async function analyzeImage(
   for (const model of candidates) {
     try {
       const response = await retryGeminiCall(async () => {
-        logger.info('Calling Gemini Vision provider', { model, mimeType, preview: (base64 || '').slice(0, 40), promptSizeBytes: getPromptSizeBytes(contents, payload.systemInstruction) });
+        logger.info('Calling Gemini Vision provider', { model, mimeType, imageBytes: imageBuffer.length, promptSizeBytes: getPromptSizeBytes(contents, payload.systemInstruction) });
         const result = await client.models.generateContent({
           model,
           contents,
           config: {
             systemInstruction: payload.systemInstruction,
             safetySettings: SAFETY_SETTINGS,
-            temperature: AI_CONFIG.TEMPERATURE,
-            topP: AI_CONFIG.TOP_P,
-            topK: AI_CONFIG.TOP_K,
+            ...getGeminiGenerationTuning(model),
             maxOutputTokens: payload.maxOutputTokens,
           },
         });
@@ -825,7 +826,7 @@ export async function analyzeImage(
         latencyMs: Date.now() - requestStartedAt,
       });
 
-      if (classification.category === 'model_not_found' && model !== candidates[candidates.length - 1]) {
+      if (shouldTryNextGeminiModel(error) && model !== candidates[candidates.length - 1]) {
         logger.warn('Falling back to the next Gemini image model', { provider: 'gemini', kind: 'image', fromModel: model, nextModel: candidates[candidates.indexOf(model) + 1] });
         continue;
       }
@@ -855,8 +856,6 @@ export async function analyzeImage(
 
   throw lastError ? createGeminiError(getErrorText(lastError) || 'Unable to analyze image right now.', lastError) : new Error('Unable to analyze image right now.');
 }
-
-let startupHealthCheckRan = false;
 
 export function buildGeminiHealthCheckResult(startedAt: number, success: boolean, message: string): { apiKeyLoaded: boolean; modelAvailable: boolean; responseTimeMs: number; success: boolean; message: string } {
   return {
@@ -939,7 +938,16 @@ export async function runGeminiStartupHealthCheck(): Promise<{ apiKeyLoaded: boo
   return buildGeminiHealthCheckResult(startedAt, false, classification.message || 'Gemini health check failed.');
 }
 
-if (!startupHealthCheckRan) {
-  startupHealthCheckRan = true;
-  void runGeminiStartupHealthCheck();
+function getGeminiGenerationTuning(model: string) {
+  // Gemini 3.x uses thinking configuration. Google recommends omitting the
+  // legacy sampling parameters for these models.
+  if (model.startsWith('gemini-3')) {
+    return { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } };
+  }
+
+  return {
+    temperature: AI_CONFIG.TEMPERATURE,
+    topP: AI_CONFIG.TOP_P,
+    topK: AI_CONFIG.TOP_K,
+  };
 }

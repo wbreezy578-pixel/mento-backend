@@ -7,10 +7,14 @@ import {
   AIRequestGatewayError,
 } from '../../../../lib/aiSecurityGateway';
 import { LiveTutorStreamingTtsService } from '../../../../services/liveTutorStreamingTtsService';
-import { getActiveSimliSessionForUser } from '../../../../services/simliService';
+import { getOwnedActiveLiveTutorSession } from '../../../../services/simliService';
 import logger from '../../../../lib/logger';
 
-const MAX_TEXT_LENGTH = 5000;
+const MAX_TEXT_LENGTH = 1000;
+const LEGACY_ROUTE_HEADERS = {
+  Deprecation: 'true',
+  Sunset: 'Wed, 30 Sep 2026 00:00:00 GMT',
+};
 
 /**
  * Streaming TTS endpoint using persistent Gemini Live sessions.
@@ -22,6 +26,13 @@ const MAX_TEXT_LENGTH = 5000;
  */
 export async function POST(req: Request) {
   const requestId = buildAIRequestId('live-tutor-tts-stream');
+
+  if (process.env.NODE_ENV === 'production') {
+    return NextResponse.json(
+      { error: 'Legacy streaming TTS has been retired. Use the Live Tutor voice WebSocket.' },
+      { status: 410, headers: LEGACY_ROUTE_HEADERS },
+    );
+  }
 
   try {
     const user = await authenticateAIRequest(req);
@@ -77,9 +88,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // Get Simli session for user
-    const simliSession = getActiveSimliSessionForUser(user.id);
-    const finalStreamId = typeof streamId === 'string' ? streamId : simliSession?.streamId;
+    const finalStreamId = typeof streamId === 'string' ? streamId.trim() : '';
 
     if (!finalStreamId) {
       logger.warn('[StreamingTts] No Simli session found for user', {
@@ -87,8 +96,22 @@ export async function POST(req: Request) {
         requestId,
       });
       return NextResponse.json(
-        { error: 'No active Simli session. Please start a Live Tutor session first.' },
+        { error: 'streamId is required.' },
         { status: 400 }
+      );
+    }
+
+    const ownedSession = await getOwnedActiveLiveTutorSession(user.id, finalStreamId);
+    if (!ownedSession) {
+      logger.warn('[StreamingTts] Stream ownership rejected', {
+        userId: user.id,
+        streamId: finalStreamId,
+        requestId,
+        category: 'streaming_tts_ownership_rejected',
+      });
+      return NextResponse.json(
+        { error: 'Live Tutor session is invalid, expired, or not owned by this user.' },
+        { status: 403 },
       );
     }
 
@@ -96,17 +119,33 @@ export async function POST(req: Request) {
       userId: user.id,
       streamId: finalStreamId,
       textLength: trimmedText.length,
-      textPreview: trimmedText.slice(0, 100),
       requestId,
       category: 'streaming_tts_starting',
     });
 
     // Create ReadableStream that will emit audio chunks as events
+    let ttsService: LiveTutorStreamingTtsService | null = null;
+    let streamClosed = false;
+    const closeTtsService = async (reason: string) => {
+      if (streamClosed) return;
+      streamClosed = true;
+      if (ttsService) await ttsService.close(reason);
+    };
     const stream = new ReadableStream({
       async start(controller) {
-        let ttsService: LiveTutorStreamingTtsService | null = null;
         let chunksSent = 0;
         const streamStartMs = Date.now();
+        const enqueue = (payload: Record<string, unknown>) => {
+          if (req.signal.aborted) throw new Error('TTS stream request was cancelled.');
+          if (controller.desiredSize !== null && controller.desiredSize <= 0) {
+            throw new Error('TTS stream client is not consuming audio fast enough.');
+          }
+          controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(payload)}\n\n`));
+        };
+        const abortHandler = () => {
+          void closeTtsService('Client cancelled TTS stream');
+        };
+        req.signal.addEventListener('abort', abortHandler, { once: true });
 
         try {
           // Initialize the streaming TTS service
@@ -140,8 +179,7 @@ export async function POST(req: Request) {
             };
 
             // Send as SSE event
-            const eventData = `data: ${JSON.stringify(chunkEvent)}\n\n`;
-            controller.enqueue(new TextEncoder().encode(eventData));
+            enqueue(chunkEvent);
 
             logger.info('[StreamingTts] Audio chunk sent to client', {
               chunkIndex: chunksSent,
@@ -173,11 +211,7 @@ export async function POST(req: Request) {
             category: 'streaming_tts_complete',
           };
 
-          controller.enqueue(
-            new TextEncoder().encode(
-              `data: ${JSON.stringify(completeEvent)}\n\n`
-            )
-          );
+          enqueue(completeEvent);
 
           logger.info('[StreamingTts] Audio stream complete', {
             userId: user.id,
@@ -188,7 +222,7 @@ export async function POST(req: Request) {
             category: 'streaming_tts_stream_complete',
           });
 
-          controller.close();
+          if (!req.signal.aborted) controller.close();
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
 
@@ -201,26 +235,21 @@ export async function POST(req: Request) {
             category: 'streaming_tts_stream_error',
           });
 
-          // Send error event
-          const errorEvent = {
-            type: 'error',
-            message,
-            chunksSent,
-          };
-
-          controller.enqueue(
-            new TextEncoder().encode(
-              `data: ${JSON.stringify(errorEvent)}\n\n`
-            )
-          );
-
-          controller.close();
-        } finally {
-          // Clean up resources
-          if (ttsService) {
-            await ttsService.close('Stream ended');
+          if (!req.signal.aborted) {
+            try {
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: 'error', message, chunksSent })}\n\n`));
+              controller.close();
+            } catch {
+              // The consumer may already have cancelled the stream.
+            }
           }
+        } finally {
+          req.signal.removeEventListener('abort', abortHandler);
+          await closeTtsService(req.signal.aborted ? 'Client cancelled TTS stream' : 'Stream ended');
         }
+      },
+      async cancel(reason) {
+        await closeTtsService(`Readable stream cancelled: ${String(reason ?? 'no reason')}`);
       },
     });
 
@@ -232,6 +261,7 @@ export async function POST(req: Request) {
         'Connection': 'keep-alive',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'POST, OPTIONS',
+        ...LEGACY_ROUTE_HEADERS,
       },
     });
   } catch (error: unknown) {
@@ -252,7 +282,7 @@ export async function POST(req: Request) {
   }
 }
 
-export async function OPTIONS(req: Request) {
+export async function OPTIONS() {
   return new NextResponse(null, {
     headers: {
       'Access-Control-Allow-Origin': '*',

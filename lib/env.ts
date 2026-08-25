@@ -169,6 +169,15 @@ export function getPaddleClientToken(): string | null {
   // This is a client-facing token that is safe to expose to the browser when configured.
   return resolveEnvValue('NEXT_PUBLIC_PADDLE_CLIENT_TOKEN') ?? null;
 }
+
+export function getPaddleCheckoutUrl(): string {
+  ensureEnvironmentLoaded();
+  const value = resolveEnvValue('PADDLE_CHECKOUT_URL');
+  if (!value || !/^https:\/\//i.test(value)) {
+    throw new Error('Environment variable "PADDLE_CHECKOUT_URL" is required and must be an HTTPS URL.');
+  }
+  return value;
+}
 export type PaddleEnvironment = 'sandbox' | 'production';
 
 function normalizePaddleEnvironment(value: string | undefined): PaddleEnvironment {
@@ -218,12 +227,6 @@ export function getSimliApiUrl(): string {
 export function getRedisUrl(): string | null {
   ensureEnvironmentLoaded();
   return resolveEnvValue('REDIS_URL') ?? resolveEnvValue('REDIS_HOST') ?? null;
-}
-
-export function isDevLiveTutorFreeEnabled(): boolean {
-  ensureEnvironmentLoaded();
-  const value = resolveEnvValue('DEV_LIVE_TUTOR_FREE');
-  return value === 'true' || value === '1' || value === 'yes';
 }
 
 export function loadAndValidateEnvironment(): void {

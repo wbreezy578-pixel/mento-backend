@@ -20,6 +20,20 @@
     "simliApiKey": { "value": "SET_AT_DEPLOYMENT_TIME" },
     "simliAvatarId": { "value": "SET_AT_DEPLOYMENT_TIME" },
     "simliVoiceId": { "value": "Default" },
-    "paymentWebhookAuthSecret": { "value": "SET_AT_DEPLOYMENT_TIME" }
+    "paymentWebhookAuthSecret": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "paddleApiKey": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "paddleNotificationWebhookSecret": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "paddleEnv": { "value": "production" },
+    "paddleProPriceId": { "value": "pri_REPLACE" },
+    "paddleTopUp50PriceId": { "value": "pri_REPLACE" },
+    "paddleTopUp100PriceId": { "value": "pri_REPLACE" },
+    "paddleCheckoutUrl": { "value": "https://YOUR_VERCEL_DOMAIN/billing/checkout" },
+    "googlePlayServiceAccountJson": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "googlePlayRtdnAudience": { "value": "https://YOUR_AZURE_DOMAIN/api/payments/mobile/google-rtdn" },
+    "googlePlayRtdnServiceAccountEmail": { "value": "google-play-rtdn@YOUR_PROJECT.iam.gserviceaccount.com" },
+    "appleRootCertificatesBase64": { "value": "SET_BEFORE_IOS_LAUNCH" },
+    "appleAppId": { "value": "SET_BEFORE_IOS_LAUNCH" },
+    "metricsAuthToken": { "value": "SET_AT_DEPLOYMENT_TIME" },
+    "retentionJobSecret": { "value": "SET_AT_DEPLOYMENT_TIME" }
   }
 }

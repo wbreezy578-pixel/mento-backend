@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { isReadinessHealthy } from './healthStatus';
 
-test('treats successful Gemini health as healthy', () => {
+test('treats critical infrastructure as ready', () => {
   const checks = {
     database: { status: 'ok' },
     redis: { status: 'ok' },
@@ -17,7 +17,7 @@ test('treats successful Gemini health as healthy', () => {
   assert.equal(isReadinessHealthy(checks), true);
 });
 
-test('marks readiness as degraded when Gemini reports a failure', () => {
+test('does not restart the application when an external provider is degraded', () => {
   const checks = {
     database: { status: 'ok' },
     redis: { status: 'ok' },
@@ -29,7 +29,7 @@ test('marks readiness as degraded when Gemini reports a failure', () => {
     },
   };
 
-  assert.equal(isReadinessHealthy(checks), false);
+  assert.equal(isReadinessHealthy(checks), true);
 });
 
 test('marks readiness as degraded when required Redis is unavailable', () => {

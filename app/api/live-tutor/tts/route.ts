@@ -9,11 +9,23 @@ import {
 } from '../../../../lib/aiSecurityGateway';
 import logger from '../../../../lib/logger';
 
-const MAX_TEXT_LENGTH = 5000;
+const MAX_TEXT_LENGTH = 1000;
 const TTS_TIMEOUT_MS = 35000; // 35s to account for TTS generation time
+
+const LEGACY_ROUTE_HEADERS = {
+  Deprecation: 'true',
+  Sunset: 'Wed, 30 Sep 2026 00:00:00 GMT',
+};
 
 export async function POST(req: Request) {
   const requestId = buildAIRequestId('live-tutor-tts');
+
+  if (process.env.NODE_ENV === 'production') {
+    return NextResponse.json(
+      { error: 'Legacy Live Tutor TTS has been retired. Use the Live Tutor voice WebSocket.' },
+      { status: 410, headers: LEGACY_ROUTE_HEADERS },
+    );
+  }
 
   try {
     const user = await authenticateAIRequest(req);
@@ -98,7 +110,7 @@ export async function POST(req: Request) {
       sampleRate: result.sampleRate,
       channels: result.channels,
       bitsPerSample: result.bitsPerSample,
-    });
+    }, { headers: LEGACY_ROUTE_HEADERS });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     const status = error instanceof AIRequestGatewayError ? error.status : 500;

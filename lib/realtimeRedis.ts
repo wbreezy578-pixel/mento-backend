@@ -104,10 +104,9 @@ export function getRealtimeRedisStatus(): { configured: boolean; required: boole
 }
 
 export async function checkRealtimeRedisHealth(): Promise<'ok' | 'not_configured' | 'fail'> {
-  const client = assertRedisAvailable();
-  if (!client) return 'not_configured';
-
   try {
+    const client = assertRedisAvailable();
+    if (!client) return 'not_configured';
     return (await client.ping()) === 'PONG' ? 'ok' : 'fail';
   } catch {
     return 'fail';

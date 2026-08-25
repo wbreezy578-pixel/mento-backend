@@ -1,6 +1,6 @@
 import { getSensitiveActionRequirements } from './auth';
 
-export type DeletionCredentialMode = 'password' | 'google';
+export type DeletionCredentialMode = 'password' | 'google' | 'apple';
 
 export interface DeletionCredentialResolution {
   mode: DeletionCredentialMode;
@@ -49,16 +49,24 @@ export async function resolveDeletionCredential(
   const googleAccessToken = typeof input.googleAccessToken === 'string' ? input.googleAccessToken.trim() : '';
 
   const isGoogleLinked = context.authProvider === 'google' || context.authProvider === 'mixed';
+  const isAppleLinked = context.authProvider === 'apple';
   const actionRequirements = getSensitiveActionRequirements({
     authProvider: context.authProvider,
     lastOAuthReauthAt: context.lastOAuthReauthAt,
   });
 
   if (password) {
-    if (isGoogleLinked) {
-      throw new Error('Google-linked accounts require a recent Google re-authentication before deletion.');
+    if (isGoogleLinked || isAppleLinked) {
+      throw new Error('OAuth-linked accounts require a recent provider re-authentication before deletion.');
     }
     return { mode: 'password' as const, value: password };
+  }
+
+  if (isAppleLinked) {
+    if (actionRequirements.requiresRecentOAuthReauth) {
+      throw new Error('Please sign in with Apple again before deleting your account.');
+    }
+    return { mode: 'apple', value: '' };
   }
 
   if (googleAccessToken) {
@@ -91,7 +99,10 @@ export async function resolveDeletionCredential(
     if (actionRequirements.requiresRecentOAuthReauth) {
       throw new Error('Please re-authenticate with Google recently before deleting your account.');
     }
-    throw new Error('Google-linked accounts require a recent Google re-authentication before deletion.');
+    // The Mento session was freshly issued only after the shared Supabase OAuth
+    // exchange verified Google ownership and updated lastOAuthReauthAt. Requiring
+    // a second provider token here made deletion impossible for the mobile app.
+    return { mode: 'google', value: '' };
   }
 
   throw new Error('Password confirmation is required to delete your account.');

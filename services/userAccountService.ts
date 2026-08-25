@@ -241,7 +241,25 @@ export async function createGoogleOAuthAccount(input: CreateUserAccountInput): P
 
 export async function createAppleAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
   return prisma.$transaction(
-    async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'apple', emailVerified: true, password: '' }),
+    async (tx) => {
+      const normalizedEmail = normalizeEmail(input.email);
+      if (!normalizedEmail) throw new InvalidAccountInputError('Email is required');
+      const existingUser = await tx.user.findFirst({ where: { email: { equals: normalizedEmail, mode: 'insensitive' } } });
+      if (existingUser) {
+        const displayName = sanitizeDisplayName(input.name);
+        const updatedUser = await tx.user.update({
+          where: { id: existingUser.id },
+          data: {
+            name: existingUser.name || displayName,
+            lastOAuthReauthAt: new Date(),
+            emailVerified: true,
+            authProvider: existingUser.password?.trim() ? 'mixed' : 'apple',
+          },
+        });
+        return buildAccountResult(updatedUser, false, { existingUserId: updatedUser.id });
+      }
+      return createNewUserAccount(tx, { ...input, authProvider: 'apple', emailVerified: true, password: '' });
+    },
     { maxWait: 10000, timeout: 30000 }
   );
 }

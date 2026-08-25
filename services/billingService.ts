@@ -6,7 +6,6 @@ import { ensureDefaultPlans, getPlanForUser, getEffectivePlanForUser, getEffecti
 import { calculateProviderCost, calculateUserCharge, calculateProfit } from './economicsService';
 import type { UsageScope, UsageFeature, UsageSnapshot } from './usageService';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
-import { isDevLiveTutorFreeEnabled } from '../lib/env';
 import logger from '../lib/logger';
 import '../lib/metrics';
 
@@ -269,21 +268,10 @@ async function getBillingDecision(input: BillingReservationInput): Promise<Billi
     const liveTutorWallet = await prisma.liveTutorWallet.findUnique({ where: { userId: validatedInput.userId } });
     const availableSeconds = (liveTutorWallet?.minutesBalance ?? 0) * SECONDS_PER_MINUTE;
     
-    // Development-only bypass: allow Live Tutor with zero balance if DEV_LIVE_TUTOR_FREE=true
-    const devBypassEnabled = isDevLiveTutorFreeEnabled();
-    const allowed = devBypassEnabled || availableSeconds >= validatedInput.amount;
-    const reason = allowed 
-      ? (devBypassEnabled && availableSeconds < validatedInput.amount ? '[DEV] Live tutor free mode enabled.' : 'Live tutor seconds available.')
+    const allowed = availableSeconds >= validatedInput.amount;
+    const reason = allowed
+      ? 'Live tutor seconds available.'
       : 'Live tutor balance is exhausted.';
-    
-    if (devBypassEnabled && availableSeconds < validatedInput.amount) {
-      logger.info('Live Tutor dev bypass applied', {
-        userId: validatedInput.userId,
-        requestedSeconds: validatedInput.amount,
-        availableSeconds,
-        requestId: validatedInput.requestId,
-      });
-    }
     
     const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, 0, null);
 
@@ -565,7 +553,6 @@ async function createUsageLedgerEntry(
   const secondsUsed = typeof input.secondsUsed === 'number' ? input.secondsUsed : (input.feature === 'live_tutor' ? (input.amount ?? 1) * 60 : 0);
 
   try {
-    console.log('[billingService] createUsageLedgerEntry start', { userId: input.userId, feature: input.feature, requestId: input.requestId, provider, allowed, successValue });
     const record = await tx.usageLog.create({
       data: {
         userId: input.userId,
@@ -591,7 +578,6 @@ async function createUsageLedgerEntry(
         profitUSD: true,
       },
     });
-    console.log('[billingService] createUsageLedgerEntry success', { userId: input.userId, requestId: input.requestId, id: record.id });
     return record;
   } catch (error) {
     console.error('[billingService] createUsageLedgerEntry failed', { userId: input.userId, requestId: input.requestId, provider, allowed, error });
@@ -728,17 +714,16 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         });
 
         const availableSeconds = liveTutorWallet.minutesBalance * SECONDS_PER_MINUTE;
-        const devBypassEnabled = isDevLiveTutorFreeEnabled();
-        const allowed = devBypassEnabled || availableSeconds >= validatedInput.amount;
+        const allowed = availableSeconds >= validatedInput.amount;
         const pendingReservation = validatedInput.pending === true;
         const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
         const reason = pendingReservation
           ? 'Live tutor reservation pending.'
           : effectiveAllowed
-            ? (devBypassEnabled ? '[DEV] Live tutor free mode enabled.' : 'Live tutor minutes available.')
+            ? 'Live tutor minutes available.'
             : validatedInput.success === false
               ? 'Usage rollback requested.'
-              : (devBypassEnabled ? '[DEV] Live tutor free mode enabled.' : 'Live tutor minutes are exhausted.');
+              : 'Live tutor minutes are exhausted.';
         const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, 0, null);
         const metadata = {
           ...validatedInput.metadata,
@@ -748,15 +733,6 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           requestedBy: validatedInput.userId,
           requestedAt: new Date().toISOString(),
         };
-
-        if (devBypassEnabled && availableSeconds < validatedInput.amount) {
-          logger.info('Live Tutor dev bypass applied in reserveUsage', {
-            userId: validatedInput.userId,
-            requestedSeconds: validatedInput.amount,
-            availableSeconds,
-            requestId: validatedInput.requestId,
-          });
-        }
 
         if (!effectiveAllowed) {
           const deniedRecord = await createUsageLedgerEntry(

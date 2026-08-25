@@ -27,6 +27,26 @@ param simliAvatarId string
 param simliVoiceId string = 'Default'
 @secure()
 param paymentWebhookAuthSecret string
+@secure()
+param paddleApiKey string = ''
+@secure()
+param paddleNotificationWebhookSecret string = ''
+param paddleEnv string = 'production'
+param paddleProPriceId string = ''
+param paddleTopUp50PriceId string = ''
+param paddleTopUp100PriceId string = ''
+param paddleCheckoutUrl string = ''
+@secure()
+param googlePlayServiceAccountJson string = ''
+param googlePlayRtdnAudience string = ''
+param googlePlayRtdnServiceAccountEmail string = ''
+@secure()
+param appleRootCertificatesBase64 string = ''
+param appleAppId string = ''
+@secure()
+param metricsAuthToken string = ''
+@secure()
+param retentionJobSecret string = ''
 
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: '${containerAppEnvironmentName}-logs'
@@ -102,8 +122,32 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
           value: paymentWebhookAuthSecret
         }
         {
+          name: 'paddle-api-key'
+          value: paddleApiKey
+        }
+        {
+          name: 'paddle-webhook-secret'
+          value: paddleNotificationWebhookSecret
+        }
+        {
+          name: 'google-play-service-account-json'
+          value: googlePlayServiceAccountJson
+        }
+        {
+          name: 'apple-root-certificates-base64'
+          value: appleRootCertificatesBase64
+        }
+        {
           name: 'registry-password'
           value: containerRegistryPassword
+        }
+        {
+          name: 'metrics-auth-token'
+          value: metricsAuthToken
+        }
+        {
+          name: 'retention-job-secret'
+          value: retentionJobSecret
         }
       ]
       registries: empty(containerRegistryServer) ? [] : [
@@ -188,6 +232,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: 'true'
             }
             {
+              name: 'REQUIRE_RATE_LIMIT_REDIS'
+              value: 'true'
+            }
+            {
               name: 'GEMINI_API_KEY'
               secretRef: 'gemini-api-key'
             }
@@ -222,6 +270,62 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'PAYMENT_WEBHOOK_AUTH_SECRET'
               secretRef: 'payment-webhook-auth-secret'
+            }
+            {
+              name: 'PADDLE_ENV'
+              value: paddleEnv
+            }
+            {
+              name: 'PADDLE_API_KEY'
+              secretRef: 'paddle-api-key'
+            }
+            {
+              name: 'PADDLE_NOTIFICATION_WEBHOOK_SECRET'
+              secretRef: 'paddle-webhook-secret'
+            }
+            {
+              name: 'PADDLE_PRO_PRICE_ID'
+              value: paddleProPriceId
+            }
+            {
+              name: 'PADDLE_TOP_UP_50_PRICE_ID'
+              value: paddleTopUp50PriceId
+            }
+            {
+              name: 'PADDLE_TOP_UP_100_PRICE_ID'
+              value: paddleTopUp100PriceId
+            }
+            {
+              name: 'PADDLE_CHECKOUT_URL'
+              value: paddleCheckoutUrl
+            }
+            {
+              name: 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'
+              secretRef: 'google-play-service-account-json'
+            }
+            {
+              name: 'GOOGLE_PLAY_RTDN_AUDIENCE'
+              value: googlePlayRtdnAudience
+            }
+            {
+              name: 'GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT_EMAIL'
+              value: googlePlayRtdnServiceAccountEmail
+            }
+            {
+              name: 'APPLE_ROOT_CERTIFICATES_BASE64'
+              secretRef: 'apple-root-certificates-base64'
+            }
+            {
+              name: 'APPLE_APP_ID'
+              value: appleAppId
+            }
+            {
+              name: 'METRICS_AUTH_TOKEN'
+              secretRef: 'metrics-auth-token'
+            }
+            {
+              name: 'RETENTION_JOB_SECRET'
+              secretRef: 'retention-job-secret'
             }
           ]
         }

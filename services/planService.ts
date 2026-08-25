@@ -1,4 +1,3 @@
-import type { Prisma } from '@prisma/client';
 import type { InputJsonValue, JsonValue } from '@prisma/client/runtime/library';
 import { AI_CONFIG } from '../app/lib/aiConfig';
 import { prisma } from '../lib/prisma';
@@ -271,11 +270,9 @@ export async function getProPlan(): Promise<PlanRecord> {
 }
 
 export function isSubscriptionActive(status: string | null | undefined, expiresAt?: Date | string | null): boolean {
-  if (status === 'active') {
-    return true;
-  }
-
-  if (status === 'cancelled' && expiresAt) {
+  const normalizedStatus = String(status ?? '').toLowerCase();
+  if ((normalizedStatus === 'active' || normalizedStatus === 'trialing') && !expiresAt) return true;
+  if ((normalizedStatus === 'active' || normalizedStatus === 'trialing' || normalizedStatus === 'canceled' || normalizedStatus === 'cancelled') && expiresAt) {
     const expiration = typeof expiresAt === 'string' ? new Date(expiresAt) : expiresAt;
     return expiration instanceof Date && !Number.isNaN(expiration.getTime()) && expiration > new Date();
   }

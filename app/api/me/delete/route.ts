@@ -5,6 +5,8 @@ import logger from '../../../../lib/logger';
 import { getUserFromRequest, verifyPassword, getSensitiveActionRequirements, recordSecurityEvent } from '../../../lib/auth';
 import { resolveDeletionCredential } from '../../../lib/accountDeletion';
 import { revokeAllUserSessions } from '../../../../lib/authSession';
+import { cancelPaddleSubscriptionForAccountDeletion } from '../../../../services/paddleService';
+import { cancelGooglePlaySubscriptionsForAccountDeletion } from '../../../../services/nativeStoreService';
 
 function buildDeletionResponse() {
   const response = NextResponse.json({ success: true, deleted: true });
@@ -50,8 +52,18 @@ export async function POST(req: Request) {
 
     const actionRequirements = getSensitiveActionRequirements(user);
     if (actionRequirements.requiresRecentOAuthReauth) {
-      return NextResponse.json({ error: 'Please re-authenticate with Google recently before deleting your account.' }, { status: 403 });
+      const providerName = user.authProvider === 'apple' ? 'Apple' : 'Google';
+      return NextResponse.json({ error: `Please sign in with ${providerName} again before deleting your account.` }, { status: 403 });
     }
+
+    const billingWallet = await prisma.userWallet.findUnique({
+      where: { userId: user.id },
+      select: { paddleSubscriptionId: true },
+    });
+    if (billingWallet?.paddleSubscriptionId) {
+      await cancelPaddleSubscriptionForAccountDeletion(billingWallet.paddleSubscriptionId);
+    }
+    await cancelGooglePlaySubscriptionsForAccountDeletion(user.id);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const targetUser = await tx.user.findUnique({ where: { id: user.id } });
@@ -140,10 +152,10 @@ export async function POST(req: Request) {
       if (/incorrect password/i.test(message)) {
         return NextResponse.json({ error: message }, { status: 401 });
       }
-      if (/password confirmation|type "delete my account" to confirm|google re-authentication failed|google re-authentication is only supported|google re-authentication token does not match/i.test(message)) {
+      if (/password confirmation|type "delete my account" to confirm|google re-authentication failed|google re-authentication is only supported|google re-authentication token does not match|oauth-linked accounts require/i.test(message)) {
         return NextResponse.json({ error: message }, { status: 400 });
       }
-      if (/please re-authenticate with google recently|google-linked accounts require a recent google re-authentication/i.test(message)) {
+      if (/please re-authenticate with google recently|google-linked accounts require a recent google re-authentication|please sign in with apple again/i.test(message)) {
         return NextResponse.json({ error: message }, { status: 403 });
       }
     }

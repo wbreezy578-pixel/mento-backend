@@ -72,7 +72,7 @@ export async function generateLiveTutorSpeech(text: string): Promise<LiveTutorTt
     });
 
     const audioPart = response.candidates?.[0]?.content?.parts?.find(
-      (part: any) => part.inlineData?.data || part.inlineData?.mimeType === 'audio/pcm'
+      (part) => part.inlineData?.data || part.inlineData?.mimeType === 'audio/pcm'
     );
     const audioData = audioPart?.inlineData?.data;
 

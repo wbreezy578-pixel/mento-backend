@@ -4,10 +4,11 @@ This phase deploys the existing custom Node server to Azure Container Apps with 
 
 ## Build
 
-Build the image from the workspace root. The Next.js development Simli test page imports the checked-in mobile Simli bundle during the build:
+Build the self-contained backend image from the backend repository:
 
 ```text
-docker build -f mento/Dockerfile -t YOUR_REGISTRY/mento:TAG .
+cd mento
+docker build -t YOUR_REGISTRY/mento:TAG .
 docker push YOUR_REGISTRY/mento:TAG
 ```
 
@@ -24,6 +25,20 @@ npm run migrate:deploy
 ```
 
 Application startup intentionally does not run migrations. This prevents ordinary restarts or replica startup from competing for schema changes.
+
+## Production billing configuration
+
+Android launch requires these Azure values in addition to the core database, Redis, Gemini, Supabase, and Simli settings:
+
+- `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`: the complete JSON for the Play Console-linked service account; store as a Container App secret.
+- `GOOGLE_PLAY_RTDN_AUDIENCE`: the exact public RTDN endpoint URL, ending in `/api/payments/mobile/google-rtdn`.
+- `GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT_EMAIL`: the service identity configured on the Pub/Sub push subscription.
+
+The Play products must use the exact IDs `mento_pro_monthly`, `mento_live_tutor_50`, and `mento_live_tutor_100`.
+
+Before an iOS launch, also set `APPLE_ROOT_CERTIFICATES_BASE64` and the numeric `APPLE_APP_ID`, then configure App Store Server Notifications to `/api/payments/mobile/apple-notifications`.
+
+Paddle is only the web checkout path. Its server API key, webhook secret, three price IDs, environment, and Vercel checkout URL remain Azure settings; the public Paddle client token belongs only on Vercel.
 
 ## Current scope
 

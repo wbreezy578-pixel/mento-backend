@@ -3,7 +3,14 @@ import { rateLimitAllowed, rateLimitDenied, rateLimitHits } from './metrics';
 import { getRedisUrl } from './env';
 
 const REDIS_URL = getRedisUrl();
+const REQUIRE_DISTRIBUTED_RATE_LIMIT = process.env.REQUIRE_RATE_LIMIT_REDIS === 'true'
+  || (process.env.NODE_ENV === 'production' && Boolean(REDIS_URL));
 let redis: Redis | null = null;
+
+function distributedLimiterUnavailable(type: 'cooldown' | 'sliding' | 'daily') {
+  rateLimitDenied.inc({ type });
+  rateLimitHits.inc({ type });
+}
 
 if (REDIS_URL) {
   try {
@@ -61,8 +68,16 @@ export async function ensureCooldown(userId: string, cooldownMs: number): Promis
       return { ok: false, retryAfterSec: Math.ceil(Math.max(ttl, 0) / 1000) };
     } catch (error) {
       console.error('Redis cooldown rate limiter failed:', error);
-      redis = null;
+      if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+        distributedLimiterUnavailable('cooldown');
+        return { ok: false, retryAfterSec: 5 };
+      }
     }
+  }
+
+  if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+    distributedLimiterUnavailable('cooldown');
+    return { ok: false, retryAfterSec: 5 };
   }
 
   // In-memory fallback
@@ -139,10 +154,16 @@ export async function ensureSlidingWindow(
         error
       );
 
-      // Fail open so a Redis problem does not turn the request
-      // into a 500 error.
-      return { ok: true };
+      if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+        distributedLimiterUnavailable('sliding');
+        return { ok: false, retryAfterSec: 5 };
+      }
     }
+  }
+
+  if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+    distributedLimiterUnavailable('sliding');
+    return { ok: false, retryAfterSec: 5 };
   }
 
   // In-memory fallback
@@ -213,8 +234,16 @@ export async function ensureDailyQuota(userId: string, limitPerDay: number): Pro
       return { ok: true, remaining: limitPerDay - val };
     } catch (error) {
       console.error('Redis daily quota limiter failed:', error);
-      redis = null;
+      if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+        distributedLimiterUnavailable('daily');
+        return { ok: false, remaining: 0 };
+      }
     }
+  }
+
+  if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+    distributedLimiterUnavailable('daily');
+    return { ok: false, remaining: 0 };
   }
 
   // In-memory fallback

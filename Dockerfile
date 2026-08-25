@@ -6,13 +6,10 @@ RUN apt-get update \
 	&& apt-get install -y --no-install-recommends openssl \
 	&& rm -rf /var/lib/apt/lists/*
 
-COPY mento/package.json mento/package-lock.json ./
+COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
 
-COPY mento/ .
-COPY mento-mobile/src/components/live/simliClientBundle.generated.ts /workspace/mento-mobile/src/components/live/simliClientBundle.generated.ts
-RUN cp /workspace/mento-mobile/src/components/live/simliClientBundle.generated.ts ./app/dev/simli-test/simliClientBundle.generated.ts \
-	&& sed -i "s#../../../../mento-mobile/src/components/live/simliClientBundle.generated#./simliClientBundle.generated#" ./app/dev/simli-test/page.tsx
+COPY . .
 RUN npx prisma generate
 RUN DATABASE_URL=postgresql://build:build@localhost:5432/build \
 	DIRECT_URL=postgresql://build:build@localhost:5432/build \

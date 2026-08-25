@@ -24,6 +24,13 @@ export function isAllowedOrigin(origin: string | null | undefined) {
 export function buildContentSecurityPolicy(pathname: string, environment = process.env.NODE_ENV ?? 'development') {
   const basePolicy = DEFAULT_CONTENT_SECURITY_POLICY;
 
+  if (pathname === '/billing/checkout') {
+    return basePolicy
+      .replace("script-src 'self'", "script-src 'self' https://cdn.paddle.com")
+      .replace("connect-src 'self' https:", "connect-src 'self' https: https://*.paddle.com")
+      .replace("object-src 'none'", "frame-src https://*.paddle.com; object-src 'none'");
+  }
+
   if (environment !== 'production' && pathname === '/dev/simli-test') {
     return basePolicy.replace("connect-src 'self' https:", "connect-src 'self' https: wss://api.simli.ai wss://*.livekit.cloud");
   }

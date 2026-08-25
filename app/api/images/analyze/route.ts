@@ -2,9 +2,6 @@ import { NextResponse } from 'next/server';
 import { analyzeImage } from '../../../../services/geminiService';
 import saveChatToDatabase from '../../../../services/chatService';
 import logger from '../../../../lib/logger';
-import fs from 'fs/promises';
-import os from 'os';
-import path from 'path';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -47,6 +44,7 @@ export async function POST(req: Request) {
 
     let buffer: Buffer | null = null;
     let mimeType: string | null = null;
+    let prompt: string | null = null;
     const contentType = req.headers.get('content-type') || '';
 
     const requestId = buildAIRequestId('image-analyze');
@@ -64,6 +62,7 @@ export async function POST(req: Request) {
     } else {
       const json = await req.json().catch(() => null);
       const img = json?.image;
+      prompt = typeof json?.prompt === 'string' ? json.prompt : null;
       if (!img) return buildErrorResponse('No image provided', 400, 'validation_error', undefined);
       if (typeof img === 'string' && img.startsWith('data:')) {
         const match = img.match(/^data:([^;]+);base64,(.+)$/);
@@ -98,21 +97,12 @@ export async function POST(req: Request) {
       return buildErrorResponse(errMsg, 400, 'file_upload_error');
     }
 
-    let prompt: string | null = null;
     if (contentType.includes('multipart/form-data')) {
       const maybePrompt = formVar?.get('prompt');
       if (typeof maybePrompt === 'string') prompt = maybePrompt;
-    } else {
-      const json = await req.json().catch(() => null);
-      prompt = typeof json?.prompt === 'string' ? json.prompt : null;
     }
 
-    const tmpDir = path.join(os.tmpdir(), 'mento-uploads');
-    await fs.mkdir(tmpDir, { recursive: true }).catch(() => undefined);
-    const tmpPath = path.join(tmpDir, `${requestId}.${mimeType.split('/')[1] || 'bin'}`);
-    try {
-      await fs.writeFile(tmpPath, buffer);
-      const { result: analysisText, billingDecision } = await executeAIRequest({
+    const { result: analysisText, billingDecision } = await executeAIRequest({
         user,
         clientIp,
         feature: 'image',
@@ -120,7 +110,7 @@ export async function POST(req: Request) {
         amount: 1,
         requestId,
         metadata: {
-          promptPreview: prompt?.slice(0, 200),
+          promptLength: prompt?.length ?? 0,
           mimeType,
           imageSize: buffer.length,
         },
@@ -129,22 +119,15 @@ export async function POST(req: Request) {
         callback: async () => {
           return await analyzeImage(buffer, mimeType, prompt ?? undefined);
         },
-      });
+    });
 
-      try {
-        await saveChatToDatabase(user.id, 'Image uploaded for analysis', analysisText);
-      } catch (err) {
-        logger.warn('Failed to persist image analysis to conversation', { error: String(err) });
-      }
-
-      return NextResponse.json({ analysis: analysisText, billing: billingDecision });
-    } finally {
-      try {
-        await fs.unlink(tmpPath).catch(() => undefined);
-      } catch {
-        // ignore
-      }
+    try {
+      await saveChatToDatabase(user.id, 'Image uploaded for analysis', analysisText);
+    } catch (err) {
+      logger.warn('Failed to persist image analysis to conversation', { error: String(err) });
     }
+
+    return NextResponse.json({ analysis: analysisText, billing: billingDecision });
   } catch (error: unknown) {
     if (error instanceof AIRequestGatewayError) {
       return NextResponse.json(error.body, { status: error.status });

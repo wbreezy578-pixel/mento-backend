@@ -264,18 +264,20 @@ export async function verifyPassword(password: string, passwordHash: string | nu
     }
   }
 
-  // Legacy compatibility: some older or migrated accounts may have stored passwords in plain text.
-  // Only accept raw matches for non-bcrypt strings to avoid degrading bcrypt-based security.
-  return password === trimmedHash;
+  logger.warn('Rejected account with unsupported legacy password format', {
+    hashLength: trimmedHash.length,
+    category: 'legacy_password_rejected',
+  });
+  return false;
 }
 
 export function getSensitiveActionRequirements(user: { authProvider?: string | null; lastOAuthReauthAt?: Date | string | null }, now = new Date()): SensitiveActionRequirements {
   const lastOAuthReauthAt = user.lastOAuthReauthAt ? new Date(user.lastOAuthReauthAt) : null;
-  const isGoogleUser = user.authProvider === 'google' || user.authProvider === 'mixed';
+  const isOAuthUser = user.authProvider === 'google' || user.authProvider === 'apple' || user.authProvider === 'mixed';
   const recentOAuthReauth = lastOAuthReauthAt ? now.getTime() - lastOAuthReauthAt.getTime() <= RECENT_OAUTH_REAUTH_MS : false;
   return {
     requiresPasswordConfirmation: true,
-    requiresRecentOAuthReauth: isGoogleUser && !recentOAuthReauth,
+    requiresRecentOAuthReauth: isOAuthUser && !recentOAuthReauth,
     recentOAuthReauthWindowMs: RECENT_OAUTH_REAUTH_MS,
   };
 }

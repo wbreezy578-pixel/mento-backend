@@ -174,7 +174,7 @@ class LiveTutorOrchestrator implements LiveTutorController {
   private async handleUserText(text: string): Promise<string> {
     const perfStart = Date.now();
     const trimmed = text.trim();
-    logger.info('[LiveTutorPerf] user message received', { textPreview: trimmed.slice(0,160), ts: perfStart });
+    logger.info('[LiveTutorPerf] user message received', { textLength: trimmed.length, ts: perfStart });
     if (!trimmed) {
       return '';
     }
@@ -255,7 +255,7 @@ class LiveTutorOrchestrator implements LiveTutorController {
       }
 
       const ttsStart = Date.now();
-      logger.info('[LiveTutorPerf] TTS request (orchestrator) started', { textPreview: text.slice(0,160), ts: ttsStart });
+      logger.info('[LiveTutorPerf] TTS request (orchestrator) started', { textLength: text.length, ts: ttsStart });
       const result = await this.ttsService.generateSpeech(text);
       const audioBytesLen = typeof result.audioBase64 === 'string' ? Buffer.byteLength(result.audioBase64, 'base64') : 0;
       logger.info('[LiveTutorPerf] TTS response (orchestrator) received', { audioBytesLen, ts: Date.now(), elapsedMs: Date.now() - ttsStart });

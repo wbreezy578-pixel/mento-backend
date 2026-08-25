@@ -18,6 +18,15 @@ test('accepts recent Google re-authentication when no password is present', asyn
   assert.deepEqual(result, { mode: 'google', value: 'google-token' });
 });
 
+test('accepts a freshly reissued Mento session after Google re-authentication', async () => {
+  const result = await resolveDeletionCredential({ password: '', googleAccessToken: '' }, {
+    authProvider: 'google',
+    email: 'user@example.com',
+    lastOAuthReauthAt: new Date(Date.now() - 5 * 60 * 1000),
+  });
+  assert.deepEqual(result, { mode: 'google', value: '' });
+});
+
 test('requires recent Google re-authentication for Google-linked accounts', async () => {
   await assert.rejects(
     () => resolveDeletionCredential({ password: '', googleAccessToken: '' }, {
@@ -32,7 +41,7 @@ test('requires recent Google re-authentication for Google-linked accounts', asyn
 test('rejects password credentials for Google-linked accounts', async () => {
   await assert.rejects(
     () => resolveDeletionCredential({ password: 'StrongPassword123!' }, { authProvider: 'google' }),
-    /Google-linked accounts require a recent Google re-authentication/i
+    /OAuth-linked accounts require a recent provider re-authentication/i
   );
 });
 test('requires recent Google re-authentication for stale OAuth sessions', async () => {

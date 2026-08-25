@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildGeminiHealthCheckResult, classifyGeminiError, getModelCandidatesForKind, isGeminiResponseSuccessful } from './geminiService';
+import { buildGeminiHealthCheckResult, classifyGeminiError, getModelCandidatesForKind, isGeminiResponseSuccessful, shouldTryNextGeminiModel } from './geminiService';
 
 test('getModelCandidatesForKind uses a supported fallback chain', () => {
   const candidates = getModelCandidatesForKind('chat', 'gemini-3.5-flash');
@@ -22,6 +22,13 @@ test('classifyGeminiError distinguishes invalid key and model missing cases', ()
 
   assert.equal(invalidKey.category, 'invalid_api_key');
   assert.equal(modelMissing.category, 'model_not_found');
+});
+
+test('tries another configured model for quota and provider-capacity failures only', () => {
+  assert.equal(shouldTryNextGeminiModel({ status: 404, message: 'Model not found' }), true);
+  assert.equal(shouldTryNextGeminiModel({ status: 429, message: 'Quota exceeded' }), true);
+  assert.equal(shouldTryNextGeminiModel({ status: 503, message: 'Model overloaded' }), true);
+  assert.equal(shouldTryNextGeminiModel({ status: 401, message: 'Invalid API key' }), false);
 });
 
 test('isGeminiResponseSuccessful treats a populated response object as healthy even without text', () => {

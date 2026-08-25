@@ -11,6 +11,13 @@ import {
 import logger from '../../../lib/logger';
 
 export async function POST(req: Request) {
+  if (process.env.NODE_ENV === 'production') {
+    return NextResponse.json(
+      { error: 'This legacy Live Tutor endpoint has been retired. Use /api/live-tutor/session.' },
+      { status: 410, headers: { Deprecation: 'true', Sunset: 'Wed, 30 Sep 2026 00:00:00 GMT' } },
+    );
+  }
+
   try {
     const user = await authenticateAIRequest(req);
     const clientIp = getClientIp(req);

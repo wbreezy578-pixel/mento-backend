@@ -53,7 +53,7 @@ export async function POST(req: Request) {
         provider: 'ImageGen',
         amount,
         requestId,
-        metadata: { promptPreview: prompt.slice(0, 200) },
+        metadata: { promptLength: prompt.length },
         pending: true,
         securityInput: prompt,
         callback: async () => await generateImage(prompt, amount),

@@ -8,7 +8,6 @@ import {
   getClientIp,
   buildAIRequestId,
 } from '../../../../lib/aiSecurityGateway';
-import { isDevLiveTutorFreeEnabled } from '../../../../lib/env';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import logger from '../../../../lib/logger';
 
@@ -82,34 +81,6 @@ export async function POST(req: Request) {
       requestId,
       category: 'live_tutor_message_start',
     });
-
-    const devLiveTutorFree = isDevLiveTutorFreeEnabled();
-    if (devLiveTutorFree) {
-      const devBillingDecision = {
-        allowed: true,
-        reason: '[DEV] Live tutor free mode enabled.',
-        remainingUsage: null,
-        resetTime: null,
-        upgradeAvailable: false,
-        usage: {
-          feature: 'live_tutor',
-          scope: 'day',
-          used: 0,
-          limit: null,
-          remaining: null,
-          resetAt: null,
-        },
-      };
-
-      logger.info('Live Tutor dev free-mode consume bypass', {
-        userId: user.id,
-        streamId: streamId ?? 'no-stream',
-        requestId,
-        category: 'live_tutor_message_dev_bypass',
-      });
-
-      return NextResponse.json({ remaining: 0, billing: devBillingDecision }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
-    }
 
     const { result, billingDecision } = await executeAIRequest({
       user,

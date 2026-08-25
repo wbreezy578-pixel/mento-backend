@@ -3,14 +3,13 @@ import {
   createGeminiLiveSession,
   sendTextAndStreamAudio,
   closeGeminiLiveSession,
-  getGeminiLiveSessionForUser,
   GeminiLiveSession,
 } from './liveTutorGeminiLiveService';
 import { LiveTutorAudioBridge } from './liveTutorAudioBridge';
 
 /**
  * Coordinates Gemini Live streaming TTS with audio resampling.
- * Maintains persistent session per user and streams audio chunks immediately.
+ * Uses an isolated Gemini session and streams audio chunks immediately.
  */
 export class LiveTutorStreamingTtsService {
   private geminiSession: GeminiLiveSession | null = null;
@@ -23,7 +22,7 @@ export class LiveTutorStreamingTtsService {
   }
 
   /**
-   * Initialize or reuse existing Gemini Live session.
+   * Initialize an isolated Gemini Live session.
    */
   async initialize(): Promise<void> {
     const initStartMs = Date.now();
@@ -36,36 +35,19 @@ export class LiveTutorStreamingTtsService {
     });
 
     try {
-      // Check for existing session first
-      const existing = this.userId
-        ? getGeminiLiveSessionForUser(this.userId)
-        : null;
+      this.geminiSession = await createGeminiLiveSession({
+        userId: this.userId,
+        streamId: this.streamId,
+      });
 
-      if (existing && existing.status === 'active') {
-        this.geminiSession = existing;
-        logger.info('[StreamingTts] Reusing existing Gemini Live session', {
-          sessionId: existing.sessionId,
-          userId: this.userId,
-          streamId: this.streamId,
-          ts: Date.now(),
-          category: 'streaming_tts_session_reuse',
-        });
-      } else {
-        // Create new session
-        this.geminiSession = await createGeminiLiveSession({
-          userId: this.userId,
-          streamId: this.streamId,
-        });
-
-        logger.info('[StreamingTts] Created new Gemini Live session', {
-          sessionId: this.geminiSession.sessionId,
-          userId: this.userId,
-          streamId: this.streamId,
-          ts: Date.now(),
-          setupLatencyMs: Date.now() - initStartMs,
-          category: 'streaming_tts_session_created',
-        });
-      }
+      logger.info('[StreamingTts] Created isolated Gemini Live session', {
+        sessionId: this.geminiSession.sessionId,
+        userId: this.userId,
+        streamId: this.streamId,
+        ts: Date.now(),
+        setupLatencyMs: Date.now() - initStartMs,
+        category: 'streaming_tts_session_created',
+      });
 
       logger.info('[StreamingTts] Initialization complete', {
         sessionId: this.geminiSession.sessionId,

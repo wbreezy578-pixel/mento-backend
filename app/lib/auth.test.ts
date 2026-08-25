@@ -78,13 +78,13 @@ test('isBcryptHash detects valid bcrypt hashes', () => {
   assert.equal(auth.isBcryptHash('not-a-bcrypt-hash'), false);
 });
 
-test('verifyPassword supports bcrypt and legacy raw passwords', async () => {
+test('verifyPassword supports bcrypt and rejects legacy raw passwords', async () => {
   const rawPassword = 'TestPassword123!';
   const bcryptHash = await auth.hashPassword(rawPassword);
 
   assert.equal(await auth.verifyPassword(rawPassword, bcryptHash), true);
   assert.equal(await auth.verifyPassword('wrong-password', bcryptHash), false);
-  assert.equal(await auth.verifyPassword(rawPassword, rawPassword), true);
+  assert.equal(await auth.verifyPassword(rawPassword, rawPassword), false);
   assert.equal(await auth.verifyPassword('wrong-password', rawPassword), false);
 });
 

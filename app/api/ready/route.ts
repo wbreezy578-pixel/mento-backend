@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import fs from 'fs';
 import os from 'os';
 import { prisma } from '../../../lib/prisma';
-import { getActiveSimliSession } from '../../../services/simliService';
+import { getActiveSimliSessionCount } from '../../../services/simliService';
 import { getCircuitBreaker } from '../../../lib/resilience';
 import { isReadinessHealthy } from './healthStatus';
 import { checkRealtimeRedisHealth } from '../../../lib/realtimeRedis';
@@ -53,20 +53,20 @@ export async function GET() {
   }
 
   checks.gemini = {
-    status: geminiBreaker.isOpen() ? 'fail' : 'ok',
+    status: geminiBreaker.isOpen() ? 'circuit_open' : 'not_probed',
     circuitState: geminiBreaker.getState(),
   };
 
   checks.simli = {
-    status: simliBreaker.isOpen() ? 'fail' : 'ok',
+    status: simliBreaker.isOpen() ? 'circuit_open' : 'not_probed',
     circuitState: simliBreaker.getState(),
-    activeSessions: getActiveSimliSession('') ? 1 : 0,
+    activeSessions: getActiveSimliSessionCount(),
   };
 
   checks.redis = { status: await checkRealtimeRedisHealth() };
   checks.paymentProviders = {
-    mpesa: { status: mpesaBreaker.isOpen() ? 'fail' : 'ok', circuitState: mpesaBreaker.getState() },
-    paddle: { status: paddleBreaker.isOpen() ? 'fail' : 'ok', circuitState: paddleBreaker.getState() },
+    mpesa: { status: mpesaBreaker.isOpen() ? 'circuit_open' : 'not_probed', circuitState: mpesaBreaker.getState() },
+    paddle: { status: paddleBreaker.isOpen() ? 'circuit_open' : 'not_probed', circuitState: paddleBreaker.getState() },
   };
   checks.disk = getDiskHealth();
   checks.memory = getMemoryHealth();

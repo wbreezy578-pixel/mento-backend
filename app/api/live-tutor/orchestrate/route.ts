@@ -12,7 +12,7 @@ const CORS_METHODS = 'POST, OPTIONS';
 
 // In-memory orchestrator instances per user
 // TODO: Move to Redis/session cache for production
-const orchestratorInstances = new Map<string, any>();
+const orchestratorInstances = new Map<string, ReturnType<typeof createLiveTutorOrchestrator>>();
 
 export async function OPTIONS(req: Request) {
   return new NextResponse(null, {

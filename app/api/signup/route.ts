@@ -4,10 +4,14 @@ import { signToken, normalizeEmail, validatePasswordStrength, buildUserSummary, 
 import { createSessionRecord, generateSecureToken } from '../../../lib/authSession';
 import { createNotification } from '../../services/notificationService';
 import { createEmailAccount, InvalidAccountInputError } from '../../../services/userAccountService';
+import { CURRENT_LEGAL_VERSIONS } from '../../../lib/legalVersions';
+import { prisma } from '../../../lib/prisma';
+import { randomUUID } from 'crypto';
+import { validateLegalAcceptance } from '../../../lib/legalConsent';
 
 export async function POST(req: Request) {
   try {
-    const { email, password, confirmPassword, name } = await req.json();
+    const { email, password, confirmPassword, name, ageConfirmed, legalVersions } = await req.json();
     const normalizedEmail = normalizeEmail(email);
     if (!normalizedEmail || typeof password !== 'string' || !password.trim()) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400 });
@@ -15,6 +19,8 @@ export async function POST(req: Request) {
     if (typeof confirmPassword !== 'string' || confirmPassword !== password) {
       return NextResponse.json({ error: 'Password confirmation must match.' }, { status: 400 });
     }
+    const legalError = validateLegalAcceptance({ ageConfirmed, legalVersions });
+    if (legalError) return NextResponse.json({ error: legalError }, { status: legalError.includes('18') ? 400 : 409 });
 
     const passwordPolicy = validatePasswordStrength(password);
     if (!passwordPolicy.isValid) {
@@ -51,6 +57,11 @@ export async function POST(req: Request) {
     }
 
     const user = accountResult.user;
+    await prisma.$executeRaw`
+      INSERT INTO "ConsentRecord" ("id", "userId", "privacyVersion", "termsVersion", "aiNoticeVersion", "source", "acceptedAt", "revokedAt")
+      VALUES (${randomUUID()}, ${user.id}, ${CURRENT_LEGAL_VERSIONS.privacy}, ${CURRENT_LEGAL_VERSIONS.terms}, ${CURRENT_LEGAL_VERSIONS.aiNotice}, 'android-signup', ${new Date()}, NULL)
+      ON CONFLICT ("userId", "privacyVersion", "termsVersion", "aiNoticeVersion") DO NOTHING
+    `;
     const accessToken = signToken(user.id, normalizedEmail, { expiresInSeconds: 15 * 60 });
     const refreshTokenValue = generateSecureToken();
     const sessionExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);

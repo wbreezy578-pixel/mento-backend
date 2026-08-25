@@ -233,6 +233,9 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
                 message: error instanceof Error ? error.message : String(error),
                 category: 'live_tutor_realtime_redis',
               });
+              if (socket.readyState === WebSocket.OPEN) {
+                reject(socket, 'voice_session_lease_unavailable');
+              }
             });
           }, 10_000);
           clearTimeout(authTimer);

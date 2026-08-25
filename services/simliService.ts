@@ -8,7 +8,7 @@ import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE, type LiveTutorVoiceProfile } from './
 import '../lib/metrics';
 
 export interface SimliStreamingSession {
-  token: any;
+  token: string;
   sessionToken: string;
   streamId: string;
   sessionId?: string;
@@ -439,6 +439,23 @@ export async function markSessionActivity(streamId: string, userId: string, repo
   };
   activeSessions.set(streamId, nextSession);
   return true;
+}
+
+export function getActiveSimliSessionCount(): number {
+  return activeSessions.size;
+}
+
+export async function getOwnedActiveLiveTutorSession(userId: string, streamId: string) {
+  if (!userId || !streamId) return null;
+  return prisma.liveTutorSession.findFirst({
+    where: {
+      userId,
+      streamId,
+      status: { in: ['active', 'reconnecting'] },
+      billingFinalized: false,
+      OR: [{ expiresAt: null }, { expiresAt: { gt: new Date() } }],
+    },
+  });
 }
 
 export async function sendRealtimeText(_streamId: string, _text: string): Promise<string> {

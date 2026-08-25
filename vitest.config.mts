@@ -7,6 +7,8 @@ export default defineConfig({
       "app/lib/notificationNavigator.test.ts",
       "app/lib/aiSafety.test.ts",
       "lib/supportReport.test.ts",
+      "lib/sanitize.test.ts",
+      "lib/imageValidator.test.ts",
       "app/api/payments/paymentSecurity.test.ts",
       "lib/authSession.test.ts",
       "services/liveTutorGeminiLiveService.test.ts",

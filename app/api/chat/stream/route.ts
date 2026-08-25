@@ -88,17 +88,6 @@ export async function POST(req: Request) {
     if (conversationId && !(await validateConversationOwnership(conversationId, userId))) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
-
-    if (!conversationId) {
-      const conv = await createConversation(userId);
-      conversationId = conv.id;
-      createdForRequest = true;
-    }
-    logger.info('Chat stream conversation selected', { userId, conversationId });
-
-    const historyStartedAt = Date.now();
-    const historyForAI = await getConversationHistoryForAI(conversationId);
-    observeMonitoringLatency('database', Date.now() - historyStartedAt, { route: 'chat-stream', operation: 'history' });
     const userText = message || (imagePayload ? 'Please analyze the attached image and explain it clearly as a tutor.' : '');
 
     // Validate image if provided
@@ -128,6 +117,17 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: `Invalid image: ${errMsg}` }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
       }
     }
+
+    if (!conversationId) {
+      const conv = await createConversation(userId);
+      conversationId = conv.id;
+      createdForRequest = true;
+    }
+    logger.info('Chat stream conversation selected', { userId, conversationId });
+
+    const historyStartedAt = Date.now();
+    const historyForAI = await getConversationHistoryForAI(conversationId);
+    observeMonitoringLatency('database', Date.now() - historyStartedAt, { route: 'chat-stream', operation: 'history' });
 
     const stream = new ReadableStream({
       async start(controller) {

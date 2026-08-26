@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../../../lib/prisma';
-import { askGeminiStream, GeminiImageContent, GeminiMessage } from '../../../../../services/geminiService';
+import { askGeminiStream, GeminiMessage } from '../../../../../services/geminiService';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -93,7 +93,7 @@ export async function POST(req: Request) {
       ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
       : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
     const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${regeneratePrompt.trim()}${modeInstruction}` }] };
-    const contents: Array<GeminiMessage | GeminiImageContent> = [...historyForAI, userEntry];
+    const contents: GeminiMessage[] = [...historyForAI, userEntry];
 
     const encoder = new TextEncoder();
     await prisma.conversationMessage.update({

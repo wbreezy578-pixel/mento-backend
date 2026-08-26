@@ -10,7 +10,7 @@ export const RECENT_MESSAGE_WINDOW = AI_HISTORY_MESSAGE_LIMIT;
  * This prevents session injection and history tampering.
  */
 
-export async function createConversation(userId: string, title?: string | null, source = 'chat') {
+export async function createConversation(userId: string, title: string | null, source: string) {
   return await prisma.conversation.create({
     data: {
       userId,
@@ -47,14 +47,6 @@ export async function createConversationWithInitialMessage(
     });
     return conversation;
   });
-}
-
-export async function getOrCreateLatestConversation(userId: string) {
-  let conversation = await prisma.conversation.findFirst({ where: { userId }, orderBy: { updatedAt: 'desc' } });
-  if (!conversation) {
-    conversation = await createConversation(userId);
-  }
-  return conversation;
 }
 
 export async function getConversation(conversationId: string) {
@@ -347,7 +339,6 @@ export default {
   validateConversationOwnership,
   addMessageToConversation,
   getConversationHistoryForAI,
-  getOrCreateLatestConversation,
   deleteConversation,
   updateConversationTitle,
   getUserConversations,

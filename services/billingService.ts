@@ -580,7 +580,7 @@ async function createUsageLedgerEntry(
     });
     return record;
   } catch (error) {
-    console.error('[billingService] createUsageLedgerEntry failed', { userId: input.userId, requestId: input.requestId, provider, allowed, error });
+    logger.error('Billing usage ledger entry failed', { userId: input.userId, requestId: input.requestId, provider, allowed, error });
     if (
       input.requestId &&
       error instanceof PrismaClientKnownRequestError &&

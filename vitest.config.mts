@@ -12,6 +12,7 @@ export default defineConfig({
       "app/api/payments/paymentSecurity.test.ts",
       "lib/authSession.test.ts",
       "services/liveTutorGeminiLiveService.test.ts",
+      "services/geminiService.test.ts",
       "services/liveTutorAudioProtocol.test.ts",
       "services/liveTutorVoiceFoundation.test.ts",
       "services/liveTutorVoiceGateway.test.ts",

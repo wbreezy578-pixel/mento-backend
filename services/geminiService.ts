@@ -27,17 +27,10 @@ const client = new GoogleGenAI({
 
 export type GeminiMessage = {
   role: 'user' | 'model' | 'system' | string;
-  parts: Array<{ text?: string; image?: { mimeType: string; data: string } }>;
+  parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }>;
 };
 
-export type GeminiImageContent = {
-  type: 'image';
-  data: string;
-  mime_type: string;
-  uri?: string;
-};
-
-export type GeminiContent = GeminiMessage | GeminiImageContent;
+export type GeminiContent = GeminiMessage;
 
 type GeminiModelKind = 'chat' | 'image' | 'live-tutor';
 
@@ -234,9 +227,9 @@ function compactParts(parts: GeminiMessage['parts']): GeminiMessage['parts'] {
       continue;
     }
 
-    if (part.image) {
+    if (part.inlineData) {
       flushText();
-      compacted.push({ image: part.image });
+      compacted.push({ inlineData: part.inlineData });
     }
   }
 
@@ -598,6 +591,12 @@ export async function askGeminiStream(
 ): Promise<string> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
   assertFeatureEnabled(AI_FEATURES.STREAMING, 'Streaming is currently disabled.');
+  const requestKind: GeminiModelKind = Array.isArray(input) && input.some(
+    (message) => message.parts.some((part) => Boolean(part.inlineData)),
+  ) ? 'image' : 'chat';
+  if (requestKind === 'image') {
+    assertFeatureEnabled(AI_FEATURES.IMAGE_UNDERSTANDING, 'Image understanding is currently disabled.');
+  }
 
   if (!geminiApiKey) {
     throw new Error('Gemini API key is missing');
@@ -608,9 +607,9 @@ export async function askGeminiStream(
   }
 
   await runSecurityCheck(input);
-  const payload = buildGeminiRequestPayload(input, 'chat');
+  const payload = buildGeminiRequestPayload(input, requestKind);
   const requestStartedAt = Date.now();
-  const candidates = getModelCandidatesForKind('chat', modelOverride);
+  const candidates = getModelCandidatesForKind(requestKind, modelOverride);
 
   logger.info('Gemini stream request started', {
     inputKind: typeof input === 'string' ? 'text' : 'conversation-array',
@@ -644,7 +643,7 @@ export async function askGeminiStream(
   try {
     for (const model of candidates) {
       if (abortSignal?.aborted) {
-        logger.info('Gemini stream aborted before provider request', { provider: 'gemini', kind: 'chat', model });
+        logger.info('Gemini stream aborted before provider request', { provider: 'gemini', kind: requestKind, model });
         return '';
       }
 
@@ -652,7 +651,7 @@ export async function askGeminiStream(
         currentStream = await retryGeminiCall(async () => {
           logger.info('Calling Gemini streaming provider', {
             model,
-            kind: 'chat',
+            kind: requestKind,
             promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
           });
           return await client.models.generateContentStream({
@@ -693,7 +692,7 @@ export async function askGeminiStream(
         }
 
         if (abortSignal?.aborted) {
-          logger.info('Gemini stream aborted while receiving content', { provider: 'gemini', kind: 'chat', model });
+          logger.info('Gemini stream aborted while receiving content', { provider: 'gemini', kind: requestKind, model });
           return completionText.trim();
         }
 
@@ -703,10 +702,10 @@ export async function askGeminiStream(
         }
 
         geminiBreaker.recordSuccess();
-        observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'chat' });
+        observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: requestKind });
         logger.info('Gemini stream completed', {
           provider: 'gemini',
-          kind: 'chat',
+          kind: requestKind,
           model,
           latencyMs: Date.now() - requestStartedAt,
           responseSizeBytes: Buffer.byteLength(completionText, 'utf8'),
@@ -714,7 +713,7 @@ export async function askGeminiStream(
         return completionText.trim();
       } catch (error: unknown) {
         if (abortSignal?.aborted) {
-          logger.info('Gemini stream aborted during provider attempt', { provider: 'gemini', kind: 'chat', model, error: String(error) });
+          logger.info('Gemini stream aborted during provider attempt', { provider: 'gemini', kind: requestKind, model, error: String(error) });
           return ''; // Return partial text if available but do not escalate as provider error.
         }
 
@@ -722,7 +721,7 @@ export async function askGeminiStream(
         const classification = classifyGeminiError(error);
         logger.warn('Gemini stream attempt failed', {
           provider: 'gemini',
-          kind: 'chat',
+          kind: requestKind,
           model,
           classification,
           latencyMs: Date.now() - requestStartedAt,
@@ -768,7 +767,7 @@ export async function analyzeImage(
   if (contents[0]) {
     contents[0] = {
       ...contents[0],
-      parts: [...contents[0].parts, { image: { mimeType, data: base64 } }],
+      parts: [...contents[0].parts, { inlineData: { mimeType, data: base64 } }],
     };
   }
 

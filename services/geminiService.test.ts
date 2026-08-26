@@ -1,6 +1,6 @@
-import test from 'node:test';
+import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { buildGeminiHealthCheckResult, classifyGeminiError, getModelCandidatesForKind, isGeminiResponseSuccessful, shouldTryNextGeminiModel } from './geminiService';
+import { buildGeminiHealthCheckResult, buildGeminiRequestPayload, classifyGeminiError, getModelCandidatesForKind, isGeminiResponseSuccessful, shouldTryNextGeminiModel } from './geminiService';
 
 test('getModelCandidatesForKind uses a supported fallback chain', () => {
   const candidates = getModelCandidatesForKind('chat', 'gemini-3.5-flash');
@@ -38,4 +38,21 @@ test('isGeminiResponseSuccessful treats a populated response object as healthy e
   });
 
   assert.equal(result, true);
+});
+
+test('buildGeminiRequestPayload preserves image bytes as Gemini inlineData', () => {
+  const payload = buildGeminiRequestPayload([
+    {
+      role: 'user',
+      parts: [
+        { text: 'What is shown here?' },
+        { inlineData: { mimeType: 'image/jpeg', data: '/9j/4AAQ' } },
+      ],
+    },
+  ], 'image');
+
+  assert.deepEqual(payload.contents[0].parts[1], {
+    inlineData: { mimeType: 'image/jpeg', data: '/9j/4AAQ' },
+  });
+  assert.match(payload.systemInstruction, /When analyzing images/);
 });

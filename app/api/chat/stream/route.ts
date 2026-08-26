@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../../lib/prisma';
-import { askGeminiStream, GeminiImageContent, GeminiMessage } from '../../../../services/geminiService';
+import { askGeminiStream, GeminiMessage } from '../../../../services/geminiService';
 import {
   getConversationHistoryForAI,
   validateConversationOwnership,
-  createConversation,
+  createConversationWithInitialMessage,
   deleteConversation,
   addMessageToConversation,
   setConversationTitleIfMissing,
@@ -118,8 +118,9 @@ export async function POST(req: Request) {
       }
     }
 
+    const savedUserText = message || (validatedImage ? 'Image attached' : '');
     if (!conversationId) {
-      const conv = await createConversation(userId);
+      const conv = await createConversationWithInitialMessage(userId, savedUserText, { requestId });
       conversationId = conv.id;
       createdForRequest = true;
     }
@@ -138,16 +139,17 @@ export async function POST(req: Request) {
         let promptHash = '';
 
         try {
-          const savedUserText = message || (validatedImage ? 'Image attached' : '');
           promptHash = createHash('sha256').update(savedUserText.trim().toLowerCase()).digest('hex');
-          const repeatedPrompt = Boolean(savedUserText.trim()) && Boolean(await prisma.conversationMessage.findFirst({
+          const repeatedPrompt = !createdForRequest && Boolean(savedUserText.trim()) && Boolean(await prisma.conversationMessage.findFirst({
             where: { conversationId, role: 'user', content: savedUserText, status: { not: 'failed' } },
             select: { id: true },
           }));
           if (message) {
             await setConversationTitleIfMissing(conversationId, message);
           }
-          await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
+          if (!createdForRequest) {
+            await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
+          }
           if (repeatedPrompt) {
             await prisma.chatAnalyticsEvent.create({
               data: { userId, conversationId, eventType: 'repeated_prompt', promptHash, metadata: { requestId } },
@@ -158,6 +160,7 @@ export async function POST(req: Request) {
           if (assistantPlaceholder?.id) {
             assistantMessageId = assistantPlaceholder.id;
           }
+          enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'conversation', conversationId })}\n\n`));
         } catch (dbErr) {
           logger.error('Failed to save initial conversation state before streaming', { error: String(dbErr) });
           if (createdForRequest) await deleteConversation(conversationId).catch(() => undefined);
@@ -172,7 +175,7 @@ export async function POST(req: Request) {
           const { result: aiResponse } = await executeAIRequest({
             user,
             clientIp,
-            feature: 'chat',
+            feature: validatedImage ? 'image' : 'chat',
             provider: 'Gemini',
             amount: 1,
             requestId,
@@ -185,16 +188,15 @@ export async function POST(req: Request) {
               const modeInstruction = answerMode === 'short'
                 ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
                 : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
-              const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${sanitizedText}${modeInstruction}` }] };
-              const contents: Array<GeminiMessage | GeminiImageContent> = [...historyForAI, userEntry];
-              if (validatedImage) {
-                contents.push({
-                  type: 'image',
-                  data: validatedImage.data,
-                  mime_type: validatedImage.mimeType,
-                  uri: validatedImage.uri ?? undefined,
-                });
-              }
+              const userEntry: GeminiMessage = {
+                role: 'user',
+                parts: [
+                  { text: `${sanitizedText}${modeInstruction}` },
+                  ...(validatedImage ? [{ inlineData: { mimeType: validatedImage.mimeType, data: validatedImage.data } }] : []),
+                ],
+              };
+              const priorHistory = createdForRequest ? historyForAI.slice(0, -1) : historyForAI;
+              const contents: GeminiMessage[] = [...priorHistory, userEntry];
 
               const modelToUse = billingDecision.modelUsed ?? undefined;
               assistantText = '';

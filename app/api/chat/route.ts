@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server';
-import { askGemini, GeminiImageContent, GeminiMessage } from '../../../services/geminiService';
+import { askGemini, GeminiMessage } from '../../../services/geminiService';
 import {
   getConversationHistoryForAI,
   validateConversationOwnership,
-  getOrCreateLatestConversation,
+  createConversationWithInitialMessage,
   addMessageToConversation,
   setConversationTitleIfMissing,
   updateConversationSummary,
@@ -79,17 +79,11 @@ export async function POST(req: Request) {
       : null;
 
     let conversationId = typeof body?.conversationId === 'string' ? body.conversationId : undefined;
+    let createdForRequest = false;
     if (conversationId && !(await validateConversationOwnership(conversationId, userId))) {
       return buildErrorResponse('Forbidden', 403, 'authorization_failed', req.headers.get('origin'), requestId);
     }
 
-    if (!conversationId) {
-      const conv = await getOrCreateLatestConversation(userId);
-      conversationId = conv.id;
-    }
-    logger.info('Chat conversation selected', { userId, conversationId });
-
-    const historyForAI = await getConversationHistoryForAI(conversationId);
     const userText = message || (imagePayload ? 'Please analyze the attached image and explain it clearly as a tutor.' : '');
 
     // Validate image if provided
@@ -112,10 +106,20 @@ export async function POST(req: Request) {
       }
     }
 
+    const savedUserText = message || (validatedImage ? 'Image attached' : '');
+    if (!conversationId) {
+      const conv = await createConversationWithInitialMessage(userId, savedUserText, { requestId });
+      conversationId = conv.id;
+      createdForRequest = true;
+    }
+    logger.info('Chat conversation selected', { userId, conversationId });
+
+    const historyForAI = await getConversationHistoryForAI(conversationId);
+
     const result = await executeAIRequest({
       user,
       clientIp,
-      feature: 'chat',
+      feature: validatedImage ? 'image' : 'chat',
       provider: 'Gemini',
       amount: 1,
       requestId,
@@ -128,17 +132,15 @@ export async function POST(req: Request) {
         const modeInstruction = answerMode === 'short'
           ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
           : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
-        const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${sanitizedText}${modeInstruction}` }] };
-        const contents: Array<GeminiMessage | GeminiImageContent> = [...historyForAI, userEntry];
-
-        if (validatedImage) {
-          contents.push({
-            type: 'image',
-            data: validatedImage.data,
-            mime_type: validatedImage.mimeType,
-            uri: validatedImage.uri ?? undefined,
-          });
-        }
+        const userEntry: GeminiMessage = {
+          role: 'user',
+          parts: [
+            { text: `${sanitizedText}${modeInstruction}` },
+            ...(validatedImage ? [{ inlineData: { mimeType: validatedImage.mimeType, data: validatedImage.data } }] : []),
+          ],
+        };
+        const priorHistory = createdForRequest ? historyForAI.slice(0, -1) : historyForAI;
+        const contents: GeminiMessage[] = [...priorHistory, userEntry];
 
         const modelToUse = billingDecision.modelUsed ?? undefined;
         return askGemini(contents, modelToUse);
@@ -146,12 +148,13 @@ export async function POST(req: Request) {
     });
 
     try {
-      const savedUserText = message || (imagePayload ? 'Image attached' : '');
       if (message) {
         await setConversationTitleIfMissing(conversationId, message);
       }
       const assistantText = typeof result.result === 'string' ? result.result : String(result.result ?? '');
-      await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
+      if (!createdForRequest) {
+        await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
+      }
       await addMessageToConversation(conversationId, 'assistant', assistantText, userId, { requestId });
       await updateConversationSummary(conversationId);
     } catch (dbErr) {

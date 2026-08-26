@@ -2,7 +2,6 @@ import { fetchWithTimeout } from './resilience';
 import logger from './logger';
 import {
   createConversation,
-  getOrCreateLatestConversation,
   addMessageToConversation,
   getConversationHistoryForAI,
   setConversationTitleIfMissing,
@@ -42,7 +41,7 @@ export class RemoteLiveTutorGeminiService implements LiveTutorGeminiService {
     }
 
     try {
-      const conv = await createConversation(this.userId);
+      const conv = await createConversation(this.userId, null, 'live_tutor');
       logger.info('[LiveTutorGemini] startConversation completed', { conversationId: conv.id });
       return conv.id;
     } catch (err) {
@@ -83,7 +82,7 @@ export class RemoteLiveTutorGeminiService implements LiveTutorGeminiService {
     }
 
     try {
-      const resolvedConversationId = activeConversationId ?? await createConversation(this.userId).then((conv) => conv.id);
+      const resolvedConversationId = activeConversationId ?? await createConversation(this.userId, null, 'live_tutor').then((conv) => conv.id);
       if (!resolvedConversationId || !resolvedConversationId.trim()) {
         throw new Error('Live Tutor conversation ID is missing after lazy creation');
       }

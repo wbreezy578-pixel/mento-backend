@@ -3,10 +3,11 @@ import { prisma } from '../lib/prisma';
 const email = process.env.MENTO_TEST_ACCOUNT_EMAIL?.trim().toLowerCase();
 const confirmation = process.env.MENTO_TEST_GRANT_CONFIRM;
 const minutes = 200;
+const explicitlyApprovedTestAccount = process.env.MENTO_APPROVED_TEST_ACCOUNT?.trim().toLowerCase();
 
 async function main() {
-  if (!email || (!email.includes('+livetutor') && !email.includes('test'))) {
-    throw new Error('MENTO_TEST_ACCOUNT_EMAIL must identify a dedicated test account (include "+livetutor" or "test").');
+  if (!email || (!email.includes('+livetutor') && !email.includes('test') && explicitlyApprovedTestAccount !== email)) {
+    throw new Error('MENTO_TEST_ACCOUNT_EMAIL must identify an explicitly approved dedicated test account.');
   }
   if (confirmation !== 'GRANT_PRO_TEST_ACCESS') {
     throw new Error('Set MENTO_TEST_GRANT_CONFIRM=GRANT_PRO_TEST_ACCESS to confirm this auditable test grant.');

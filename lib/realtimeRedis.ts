@@ -19,11 +19,11 @@ if (redisUrl) {
 }
 
 function leaseKey(streamId: string): string {
-  return `voice_owner:${streamId}`;
+  return `voice:{${streamId}}:owner`;
 }
 
 function sessionKey(streamId: string): string {
-  return `voice_session:${streamId}`;
+  return `voice:{${streamId}}:session`;
 }
 
 function assertRedisAvailable(): MentoRedisClient | null {

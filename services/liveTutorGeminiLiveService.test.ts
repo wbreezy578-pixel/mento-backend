@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const logger = await import('../lib/logger');
 const sendRealtimeInput = vi.fn();
 let geminiCallbacks: any;
+let geminiConnectOptions: any;
 
 vi.mock('../lib/env', () => ({
   getGeminiApiKey: () => 'test-key',
@@ -19,6 +20,7 @@ vi.mock('@google/genai', () => ({
   GoogleGenAI: class {
     live = {
       connect: vi.fn(async (options: any) => {
+        geminiConnectOptions = options;
         geminiCallbacks = options.callbacks;
         return {
         sendRealtimeInput,
@@ -30,15 +32,16 @@ vi.mock('@google/genai', () => ({
   Modality: { AUDIO: 'AUDIO' },
 }));
 
-it('includes the phase-4 response-mode rules in the live tutor system prompt', async () => {
+it('uses a concise, natural live tutor system prompt', async () => {
   const { buildLiveTutorSystemInstruction, classifyLiveTutorResponseMode } = await import('./liveTutorGeminiLiveService');
 
   const prompt = buildLiveTutorSystemInstruction();
 
-  expect(prompt).toContain('Fast direct response');
-  expect(prompt).toContain('Short acknowledgment');
-  expect(prompt).toContain('Thinking/processing bridge');
-  expect(prompt).toContain('newest completed user turn is always the active conversational focus');
+  expect(prompt).toContain('Answer simple questions directly and briefly');
+  expect(prompt).toContain('Do not force filler');
+  expect(prompt).toContain('Focus on the newest completed user turn');
+  expect(prompt).toContain('Stop immediately when interrupted');
+  expect(prompt).not.toContain('150 words per minute');
   expect(classifyLiveTutorResponseMode('What is gravity?')).toBe('fast_direct');
   expect(classifyLiveTutorResponseMode('Wait, explain that again')).toBe('short_acknowledgment');
   expect(classifyLiveTutorResponseMode('Solve this equation carefully and step by step')).toBe('thinking_bridge');
@@ -51,6 +54,16 @@ describe('Gemini Live PCM lifecycle', () => {
     vi.mocked(logger.default.warn).mockClear();
     vi.mocked(logger.default.error).mockClear();
     geminiCallbacks = undefined;
+    geminiConnectOptions = undefined;
+  });
+
+  it('waits through a natural pause before ending the learner turn', async () => {
+    const { closeGeminiLiveSession, createGeminiLiveSession } = await import('./liveTutorGeminiLiveService');
+    const session = await createGeminiLiveSession({ streamId: 'stream-vad' });
+
+    expect(geminiConnectOptions.config.realtimeInputConfig.automaticActivityDetection.silenceDurationMs).toBe(700);
+
+    await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });
 
   it('forwards successful provider audio chunks to the callback without blocking the session', async () => {

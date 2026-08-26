@@ -11,6 +11,7 @@ export default defineConfig({
       "lib/imageValidator.test.ts",
       "app/api/payments/paymentSecurity.test.ts",
       "lib/authSession.test.ts",
+      "lib/realtimeRedis.test.ts",
       "services/liveTutorGeminiLiveService.test.ts",
       "services/geminiService.test.ts",
       "services/liveTutorAudioProtocol.test.ts",

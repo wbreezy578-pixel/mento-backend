@@ -1,4 +1,5 @@
 import logger from '../lib/logger';
+import { observeLiveTutorVoiceLatency } from '../lib/metrics';
 
 export const LIVE_TUTOR_VOICE_EVENTS = [
   'USER_SPEECH_STARTED',
@@ -79,8 +80,26 @@ export function recordLiveTutorVoiceEvent(
     metrics: metrics(timeline),
     category: 'live_tutor_voice_latency',
   });
+  const currentMetrics = metrics(timeline);
+  if (event === 'GEMINI_FIRST_AUDIO_RECEIVED' && currentMetrics.userSpeechEndToGeminiFirstAudioMs !== null) {
+    observeLiveTutorVoiceLatency('speech_end_to_gemini_audio', currentMetrics.userSpeechEndToGeminiFirstAudioMs);
+  }
+  if (event === 'BACKEND_FIRST_PCM_16K_SENT' && currentMetrics.geminiAudioToBackendPcmSentMs !== null) {
+    observeLiveTutorVoiceLatency('gemini_audio_to_backend_pcm', currentMetrics.geminiAudioToBackendPcmSentMs);
+  }
+  if (event === 'FRONTEND_FIRST_PCM_RECEIVED' && currentMetrics.backendPcmSentToFrontendReceivedMs !== null) {
+    observeLiveTutorVoiceLatency('backend_pcm_to_frontend', currentMetrics.backendPcmSentToFrontendReceivedMs);
+  }
+  if (event === 'SIMLI_FIRST_AUDIO_PLAYED') {
+    if (currentMetrics.frontendReceivedToSimliPlayedMs !== null) {
+      observeLiveTutorVoiceLatency('frontend_pcm_to_simli_playback', currentMetrics.frontendReceivedToSimliPlayedMs);
+    }
+    if (currentMetrics.totalSpeechEndToFirstAudibleResponseMs !== null) {
+      observeLiveTutorVoiceLatency('speech_end_to_first_audible', currentMetrics.totalSpeechEndToFirstAudibleResponseMs);
+    }
+  }
   if (event === 'AVATAR_AUDIO_PLAYBACK_COMPLETE') {
-    const totalLatency = metrics(timeline).totalSpeechEndToFirstAudibleResponseMs;
+    const totalLatency = currentMetrics.totalSpeechEndToFirstAudibleResponseMs;
     const samples = totalLatencySamplesBySession.get(identity.sessionId) ?? [];
     if (typeof totalLatency === 'number') samples.push(totalLatency);
     totalLatencySamplesBySession.set(identity.sessionId, samples);
@@ -93,7 +112,7 @@ export function recordLiveTutorVoiceEvent(
       : sortedSamples[middle];
     logger.info('live_tutor_latency_summary', {
       ...identity,
-      metrics: metrics(timeline),
+      metrics: currentMetrics,
       medianTotalSpeechEndToFirstAudibleResponseMs: medianTotalLatencyMs,
       completedTurnSampleCount: sortedSamples.length,
       category: 'live_tutor_voice_latency',

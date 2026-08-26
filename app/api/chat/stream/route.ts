@@ -161,6 +161,9 @@ export async function POST(req: Request) {
             assistantMessageId = assistantPlaceholder.id;
           }
           enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'conversation', conversationId })}\n\n`));
+          if (validatedImage) {
+            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'image', accepted: true, mimeType: validatedImage.mimeType })}\n\n`));
+          }
         } catch (dbErr) {
           logger.error('Failed to save initial conversation state before streaming', { error: String(dbErr) });
           if (createdForRequest) await deleteConversation(conversationId).catch(() => undefined);
@@ -185,13 +188,16 @@ export async function POST(req: Request) {
             securityContext: { conversationId, hasImage: Boolean(validatedImage) },
             callback: async ({ billingDecision, sanitizedInput }) => {
               const sanitizedText = sanitizedInput ?? userText;
+              const imageInstruction = validatedImage
+                ? '\nAn image is attached and available to you. Base the answer on visible details in that image, explicitly identify the relevant visual evidence, and say when any detail is uncertain. Do not give a generic answer that ignores the image.'
+                : '';
               const modeInstruction = answerMode === 'short'
                 ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
                 : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
               const userEntry: GeminiMessage = {
                 role: 'user',
                 parts: [
-                  { text: `${sanitizedText}${modeInstruction}` },
+                  { text: `${sanitizedText}${imageInstruction}${modeInstruction}` },
                   ...(validatedImage ? [{ inlineData: { mimeType: validatedImage.mimeType, data: validatedImage.data } }] : []),
                 ],
               };

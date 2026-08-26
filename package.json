@@ -10,7 +10,8 @@
     "start": "tsx server.ts",
     "lint": "eslint",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test-account:grant-live-tutor": "tsx scripts/grantLiveTutorTestAccess.ts"
   },
   "dependencies": {
     "@apple/app-store-server-library": "^3.1.0",

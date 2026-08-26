@@ -8,6 +8,7 @@ import type { UsageScope, UsageFeature, UsageSnapshot } from './usageService';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
 import logger from '../lib/logger';
 import '../lib/metrics';
+import { canStartLiveTutorSession } from './liveTutorBillingPolicy';
 
 // LiveTutorWallet.minutesBalance is stored in minutes; live_tutor amounts are always passed in seconds.
 const SECONDS_PER_MINUTE = 60;
@@ -268,10 +269,12 @@ async function getBillingDecision(input: BillingReservationInput): Promise<Billi
     const liveTutorWallet = await prisma.liveTutorWallet.findUnique({ where: { userId: validatedInput.userId } });
     const availableSeconds = (liveTutorWallet?.minutesBalance ?? 0) * SECONDS_PER_MINUTE;
     
-    const allowed = availableSeconds >= validatedInput.amount;
-    const reason = allowed
-      ? 'Live tutor seconds available.'
-      : 'Live tutor balance is exhausted.';
+    const allowed = canStartLiveTutorSession({ planEnabled: plan.liveTutorEnabled, availableSeconds, requestedSeconds: validatedInput.amount });
+    const reason = !plan.liveTutorEnabled
+      ? 'Live Tutor requires an active Pro plan.'
+      : allowed
+        ? 'Live tutor seconds available.'
+        : 'Live tutor balance is exhausted.';
     
     const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, 0, null);
 
@@ -714,10 +717,12 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         });
 
         const availableSeconds = liveTutorWallet.minutesBalance * SECONDS_PER_MINUTE;
-        const allowed = availableSeconds >= validatedInput.amount;
+        const allowed = canStartLiveTutorSession({ planEnabled: effectivePlan.liveTutorEnabled, availableSeconds, requestedSeconds: validatedInput.amount });
         const pendingReservation = validatedInput.pending === true;
         const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
-        const reason = pendingReservation
+        const reason = !effectivePlan.liveTutorEnabled
+          ? 'Live Tutor requires an active Pro plan.'
+          : pendingReservation
           ? 'Live tutor reservation pending.'
           : effectiveAllowed
             ? 'Live tutor minutes available.'

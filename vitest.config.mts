@@ -20,6 +20,7 @@ export default defineConfig({
       "services/dataRetentionService.test.ts",
       "lib/legalConsent.test.ts",
       "lib/liveTutorLimits.test.ts",
+      "services/liveTutorBillingPolicy.test.ts",
     ],
     exclude: [
       "node_modules/**",

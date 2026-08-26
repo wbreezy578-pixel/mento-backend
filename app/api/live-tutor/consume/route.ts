@@ -37,7 +37,7 @@ export async function POST(req: Request) {
     const reason = typeof body?.reason === 'string' && body.reason.trim() ? body.reason.trim() : undefined;
     const requestId = buildAIRequestId('live-tutor-consume');
 
-    // Track activity for 2-minute inactivity guardrail
+    // Track activity for the 90-second inactivity guardrail.
     if (streamId) {
       const activityAccepted = await markSessionActivity(streamId, user.id, seconds);
       if (!activityAccepted && !status) {

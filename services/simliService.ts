@@ -6,6 +6,7 @@ import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/mon
 import { prisma } from '../lib/prisma';
 import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE, type LiveTutorVoiceProfile } from './liveTutorVoiceProfiles';
 import '../lib/metrics';
+import { clampLiveTutorExpiry, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from '../lib/liveTutorLimits';
 
 export interface SimliStreamingSession {
   token: string;
@@ -36,10 +37,9 @@ const simliProviderOptions = getProviderRetryOptions('simli');
 const activeSessions = new Map<string, SessionRecord>();
 const LIVE_TUTOR_PROCESS_ID = `live-tutor-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-const INACTIVITY_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
-const MAX_SESSION_SECONDS = 10 * 60;
+const INACTIVITY_TIMEOUT_MS = LIVE_TUTOR_INACTIVITY_TIMEOUT_MS;
+const MAX_SESSION_SECONDS = LIVE_TUTOR_MAX_SESSION_SECONDS;
 const MIN_HEARTBEAT_INTERVAL_MS = 5 * 1000;
-export const LIVE_TUTOR_INACTIVITY_TIMEOUT_MS = INACTIVITY_TIMEOUT_MS;
 const GENUINELY_ACTIVE_STATUS = 'active';
 const RECOVERABLE_STATUSES = ['creating', 'active', 'reconnecting', 'finalizing', 'recovery_required'] as const;
 const TERMINAL_STATUSES = ['completed', 'failed', 'disconnected', 'ended'] as const;
@@ -85,7 +85,7 @@ function isStaleSession(session: SessionRecord): boolean {
 
 /**
  * Checks if a session has exceeded the inactivity timeout.
- * A session is considered inactive if there has been no activity (consume/heartbeat) for 2 minutes.
+ * A session is considered inactive if there has been no activity for 90 seconds.
  */
 function isSessionInactive(session: SessionRecord): boolean {
   const now = Date.now();
@@ -324,9 +324,13 @@ export async function createSimliStreamingAvatarSession(options: {
       provider: 'simli',
     });
 
-    const sessionInfo = extractSessionInfo(response);
-    logger.info('Simli session token created', { provider: 'simli', streamId: sessionInfo.streamId });
+    const providerSessionInfo = extractSessionInfo(response);
     const now = new Date().toISOString();
+    const sessionInfo = {
+      ...providerSessionInfo,
+      expiresAt: clampLiveTutorExpiry(providerSessionInfo.expiresAt, Date.parse(now)),
+    };
+    logger.info('Simli session token created', { provider: 'simli', streamId: sessionInfo.streamId });
     saveSession({
       ...sessionInfo,
       billingRequestId: options.requestId,
@@ -339,7 +343,7 @@ export async function createSimliStreamingAvatarSession(options: {
     });
     await prisma.liveTutorSession.update({
       where: { userId: options.userId },
-      data: { streamId: sessionInfo.streamId, avatarVoiceProfile: options.avatarVoiceProfile ?? DEFAULT_LIVE_TUTOR_VOICE_PROFILE, status: 'active', ownerProcessId: LIVE_TUTOR_PROCESS_ID, finalizationStartedAt: null, lastActivityAt: new Date(now), expiresAt: sessionInfo.expiresAt ? new Date(sessionInfo.expiresAt) : new Date(Date.parse(now) + MAX_SESSION_SECONDS * 1000) },
+      data: { streamId: sessionInfo.streamId, avatarVoiceProfile: options.avatarVoiceProfile ?? DEFAULT_LIVE_TUTOR_VOICE_PROFILE, status: 'active', ownerProcessId: LIVE_TUTOR_PROCESS_ID, finalizationStartedAt: null, lastActivityAt: new Date(now), expiresAt: new Date(sessionInfo.expiresAt) },
     });
     logStatusTransition({ streamId: sessionInfo.streamId, userId: options.userId ?? 'unknown', previousStatus: 'creating', resultingStatus: 'active', reason: 'simli_session_created' });
     simliBreaker.recordSuccess();
@@ -420,7 +424,7 @@ export async function reconnectSimliSession(streamId: string): Promise<SimliStre
 /**
  * Updates the last activity timestamp for a session.
  * This is called whenever the client sends a consume/heartbeat request.
- * Used for the 2-minute inactivity guardrail.
+ * Used for the 90-second inactivity guardrail.
  */
 export async function markSessionActivity(streamId: string, userId: string, reportedSeconds?: number): Promise<boolean> {
   const session = getSession(streamId);
@@ -439,6 +443,22 @@ export async function markSessionActivity(streamId: string, userId: string, repo
   };
   activeSessions.set(streamId, nextSession);
   return true;
+}
+
+export async function constrainLiveTutorSessionDuration(streamId: string, userId: string, availableSeconds: number): Promise<string | undefined> {
+  const durationSeconds = Math.max(1, Math.min(MAX_SESSION_SECONDS, Math.floor(availableSeconds)));
+  const nextExpiry = new Date(Date.now() + durationSeconds * 1000);
+  const session = getSession(streamId);
+  if (session && session.userId === userId) {
+    const currentExpiryMs = session.expiresAt ? Date.parse(session.expiresAt) : Number.POSITIVE_INFINITY;
+    session.expiresAt = new Date(Math.min(currentExpiryMs, nextExpiry.getTime())).toISOString();
+    saveSession(session);
+  }
+  const durable = await prisma.liveTutorSession.findUnique({ where: { streamId }, select: { userId: true, expiresAt: true } });
+  if (!durable || durable.userId !== userId) return session?.expiresAt;
+  const durableExpiry = durable.expiresAt && durable.expiresAt < nextExpiry ? durable.expiresAt : nextExpiry;
+  await prisma.liveTutorSession.update({ where: { streamId }, data: { expiresAt: durableExpiry } });
+  return durableExpiry.toISOString();
 }
 
 export function getActiveSimliSessionCount(): number {
@@ -759,14 +779,14 @@ const sessionCleanupTimer = setInterval(async () => {
       continue;
     }
 
-    // Fix 4: Check for inactivity (no activity for 2 minutes) and close the session
+    // Close sessions with no activity for 90 seconds.
     if (isSessionInactive(session)) {
       try {
-        logger.warn('Live tutor session terminated due to 2-minute inactivity', { streamId: session.streamId, userId: session.userId });
+        logger.warn('Live tutor session terminated due to inactivity', { streamId: session.streamId, userId: session.userId });
         await completeSimliSessionLifecycle(session.streamId, {
           status: 'disconnected',
           secondsUsed: session.secondsConsumed ?? 0,
-          reason: '2-minute inactivity timeout',
+          reason: '90-second inactivity timeout',
         });
       } catch {
         // ignore cleanup failures to keep interval alive

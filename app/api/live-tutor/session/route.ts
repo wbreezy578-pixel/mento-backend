@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 // Match your exact original exports from simliService
-import { claimLiveTutorSession, completeSimliSessionLifecycle, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
+import { claimLiveTutorSession, completeSimliSessionLifecycle, constrainLiveTutorSessionDuration, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
 import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE } from '../../../../services/liveTutorVoiceProfiles';
 import { resolveLiveTutorVoiceProfile } from '../../../../services/liveTutorVoiceProfiles';
 import {
@@ -14,6 +14,7 @@ import {
 import logger from '../../../../lib/logger';
 import { attachLiveTutorConversation, createLiveTutorConversation } from '../../../../services/liveTutorConversationService';
 import type { BillingDecision } from '../../../../services/billingService';
+import { LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from '../../../../lib/liveTutorLimits';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -84,6 +85,11 @@ export async function GET(req: Request) {
     const session: SimliStreamingSession = result.result;
     const billingDecision: BillingDecision = result.billingDecision;
     cleanupStreamId = session.streamId;
+    const availableSessionSeconds = Math.min(
+      LIVE_TUTOR_MAX_SESSION_SECONDS,
+      60 + Math.max(0, billingDecision.remainingUsage ?? 0),
+    );
+    session.expiresAt = await constrainLiveTutorSessionDuration(session.streamId, user.id, availableSessionSeconds) ?? session.expiresAt;
 
     logger.info('Live Tutor session created successfully', {
       userId: user.id,
@@ -131,6 +137,10 @@ export async function GET(req: Request) {
       avatarVoiceProfile,
       conversationId,
       billing: billingDecision,
+      limits: {
+        maxSessionSeconds: LIVE_TUTOR_MAX_SESSION_SECONDS,
+        inactivityTimeoutSeconds: Math.floor(LIVE_TUTOR_INACTIVITY_TIMEOUT_MS / 1000),
+      },
     });
   } catch (error: unknown) {
     const errorRequestId = claimedRequestId;

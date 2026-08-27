@@ -41,8 +41,10 @@ it('uses a concise, natural live tutor system prompt', async () => {
   expect(prompt).toContain('Never read a long list');
   expect(prompt).toContain('Focus on the newest completed user turn');
   expect(prompt).toContain('Stop immediately when interrupted');
-  expect(prompt).toContain('brief, genuine conversational bridge');
-  expect(prompt).toContain('never tease or insult');
+  expect(prompt).toContain('one short conversational bridge');
+  expect(prompt).toContain('Do not repeatedly say “um”');
+  expect(prompt).toContain('never claim you are checking a source or tool unless you actually are');
+  expect(prompt).toContain('never tease, insult');
   expect(prompt).not.toContain('150 words per minute');
   expect(classifyLiveTutorResponseMode('What is gravity?')).toBe('fast_direct');
   expect(classifyLiveTutorResponseMode('Wait, explain that again')).toBe('short_acknowledgment');

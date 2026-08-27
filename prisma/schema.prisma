@@ -17,6 +17,10 @@ model User {
   authProvider           String                  @default("email")
   lastOAuthReauthAt      DateTime?
   emailVerified          Boolean                 @default(false)
+  supabaseUserId         String?                 @unique
+  accountStatus          String                  @default("ACTIVE")
+  credentialsChangedAt   DateTime                @default(now())
+  pendingEmail           String?
   updatedAt              DateTime                @updatedAt
   failedLoginAttempts    Int                     @default(0)
   lastFailedLoginAt      DateTime?
@@ -29,6 +33,7 @@ model User {
   notifications          Notification[]
   notificationPreference NotificationPreference?
   passwordResetTokens    PasswordResetToken[]
+  emailActionTokens      EmailActionToken[]
   paymentLedgerEntries   PaymentLedgerEntry[]
   paymentReceipts        PaymentReceipt[]
   paymentTransactions    PaymentTransaction[]
@@ -204,6 +209,22 @@ model PasswordResetToken {
   @@index([expiresAt])
 }
 
+model EmailActionToken {
+  id          String    @id @default(cuid())
+  userId      String
+  tokenHash   String    @unique
+  purpose     String
+  targetEmail String?
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+  usedAt      DateTime?
+  revokedAt   DateTime?
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+}
+
 model Session {
   id                  String    @id @default(cuid())
   userId              String
@@ -216,9 +237,13 @@ model Session {
   expiresAt           DateTime
   revokedAt           DateTime?
   replacedBySessionId String?
+  familyId             String
+  parentSessionId      String?
+  absoluteExpiresAt    DateTime
   user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, revokedAt])
+  @@index([familyId, revokedAt])
   @@index([expiresAt])
 }
 

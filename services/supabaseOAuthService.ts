@@ -34,7 +34,7 @@ export async function exchangeSupabaseOAuth(req: Request, provider: OAuthProvide
     });
     if (!response.ok) return NextResponse.json({ error: 'Invalid Supabase access token' }, { status: 401, headers: headers(req) });
     const profile = await response.json() as {
-      id?: unknown; email?: unknown; app_metadata?: { provider?: unknown; providers?: unknown };
+      id?: unknown; email?: unknown; email_confirmed_at?: unknown; app_metadata?: { provider?: unknown; providers?: unknown };
       identities?: Array<{ provider?: unknown }>;
       user_metadata?: { full_name?: unknown; name?: unknown };
     };
@@ -44,21 +44,21 @@ export async function exchangeSupabaseOAuth(req: Request, provider: OAuthProvide
     profile.identities?.forEach((identity) => typeof identity.provider === 'string' && providers.add(identity.provider));
     if (!providers.has(provider)) return NextResponse.json({ error: `The Supabase token is not authenticated with ${provider}.` }, { status: 401, headers: headers(req) });
     const email = normalizeEmail(typeof profile.email === 'string' ? profile.email : '');
-    if (typeof profile.id !== 'string' || !email) return NextResponse.json({ error: 'OAuth provider did not return a verified email.' }, { status: 400, headers: headers(req) });
+    if (typeof profile.id !== 'string' || !email || typeof profile.email_confirmed_at !== 'string') return NextResponse.json({ error: 'OAuth provider did not return a verified email.' }, { status: 400, headers: headers(req) });
     const metadataName = typeof profile.user_metadata?.full_name === 'string' ? profile.user_metadata.full_name : typeof profile.user_metadata?.name === 'string' ? profile.user_metadata.name : '';
     const account = provider === 'apple'
-      ? await createAppleAccount({ email, name: metadataName || email.split('@')[0] })
-      : await createGoogleOAuthAccount({ email, name: metadataName || email.split('@')[0] });
+      ? await createAppleAccount({ email, name: metadataName || email.split('@')[0], externalUserId: profile.id })
+      : await createGoogleOAuthAccount({ email, name: metadataName || email.split('@')[0], externalUserId: profile.id });
     const user = account.user;
     await prisma.$executeRaw`
       INSERT INTO "ConsentRecord" ("id", "userId", "privacyVersion", "termsVersion", "aiNoticeVersion", "source", "acceptedAt", "revokedAt")
       VALUES (${randomUUID()}, ${user.id}, ${CURRENT_LEGAL_VERSIONS.privacy}, ${CURRENT_LEGAL_VERSIONS.terms}, ${CURRENT_LEGAL_VERSIONS.aiNotice}, ${`${provider}-android`}, ${new Date()}, NULL)
       ON CONFLICT ("userId", "privacyVersion", "termsVersion", "aiNoticeVersion") DO NOTHING
     `;
-    const accessToken = signToken(user.id, email, { expiresInSeconds: 15 * 60 });
     const refreshToken = generateSecureToken();
     const sessionExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    await createSessionRecord({ userId: user.id, token: refreshToken, userAgent: req.headers.get('user-agent'), ipAddress: req.headers.get('x-forwarded-for'), expiresAt: sessionExpiresAt });
+    const session = await createSessionRecord({ userId: user.id, token: refreshToken, userAgent: req.headers.get('user-agent'), ipAddress: req.headers.get('x-forwarded-for'), expiresAt: sessionExpiresAt });
+    const accessToken = signToken(user.id, email, { sessionId: session.id, expiresInSeconds: 15 * 60 });
     await recordSecurityEvent(user.id, 'oauth_login_success', { provider });
     const result = NextResponse.json({ token: accessToken, refreshToken, sessionExpiresAt: sessionExpiresAt.toISOString(), user: buildUserSummary(user) }, { headers: headers(req) });
     applyAuthCookies(result, { accessToken, refreshToken, isProduction: process.env.NODE_ENV === 'production' });

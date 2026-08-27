@@ -10,7 +10,7 @@
     "start": "tsx server.ts",
     "lint": "eslint",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "vitest run",
+    "test": "vitest run && node --import tsx --test app/lib/auth.test.ts app/lib/accountDeletion.test.ts",
     "test-account:grant-live-tutor": "tsx scripts/grantLiveTutorTestAccess.ts"
   },
   "dependencies": {

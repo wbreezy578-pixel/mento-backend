@@ -235,6 +235,7 @@ export function loadAndValidateEnvironment(): void {
 
   validateUrl('DATABASE_URL', resolveEnvValue('DATABASE_URL'), 'postgresql://');
   validateNonEmpty('JWT_SECRET', getJwtSecret());
+  if ((getJwtSecret()?.length ?? 0) < 32) throw new Error('Environment variable "JWT_SECRET" must be at least 32 characters long.');
   validateNonEmpty('GEMINI_API_KEY', resolveEnvValue('GEMINI_API_KEY'));
   validateUrl('SUPABASE_URL', resolveEnvValue('SUPABASE_URL'), 'https://');
   validateNonEmpty('SUPABASE_SERVICE_ROLE_KEY', resolveEnvValue('SUPABASE_SERVICE_ROLE_KEY'));

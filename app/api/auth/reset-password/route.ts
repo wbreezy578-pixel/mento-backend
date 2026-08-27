@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
-import { consumePasswordResetToken } from '../../../../lib/authSession';
+import { hashToken } from '../../../../lib/authSession';
 import { hashPassword, normalizeEmail, recordSecurityEvent, validatePasswordStrength } from '../../../lib/auth';
 import logger from '../../../../lib/logger';
 
@@ -33,25 +33,32 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: passwordPolicy.reasons.join(' ') }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    const resetRecord = await consumePasswordResetToken(token);
-    if (!resetRecord?.user) {
-      return NextResponse.json({ error: 'Invalid or expired reset token.' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
-    }
-
     const { prisma } = await import('../../../../lib/prisma');
     const hashedPassword = await hashPassword(password);
-    await prisma.$transaction(async (tx) => {
+    const resetUser = await prisma.$transaction(async (tx) => {
+      const resetRecord = await tx.passwordResetToken.findFirst({
+        where: { tokenHash: hashToken(token), usedAt: null, revokedAt: null, expiresAt: { gt: new Date() } },
+        include: { user: true },
+      });
+      if (!resetRecord) return null;
+      const claimed = await tx.passwordResetToken.updateMany({
+        where: { id: resetRecord.id, usedAt: null, revokedAt: null, expiresAt: { gt: new Date() } },
+        data: { usedAt: new Date(), revokedAt: new Date() },
+      });
+      if (claimed.count !== 1) return null;
       await tx.user.update({
         where: { id: resetRecord.user.id },
-        data: { password: hashedPassword, email: normalizeEmail(resetRecord.user.email) },
+        data: { password: hashedPassword, email: normalizeEmail(resetRecord.user.email), credentialsChangedAt: new Date(), accountStatus: 'ACTIVE' },
       });
       await tx.session.updateMany({
         where: { userId: resetRecord.user.id, revokedAt: null },
         data: { revokedAt: new Date() },
       });
+      return { id: resetRecord.user.id, email: resetRecord.user.email };
     });
+    if (!resetUser) return NextResponse.json({ error: 'Invalid or expired reset token.' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
 
-    await recordSecurityEvent(resetRecord.user.id, 'password_reset_completed', { email: resetRecord.user.email });
+    await recordSecurityEvent(resetUser.id, 'password_reset_completed');
 
     return NextResponse.json({ ok: true }, { status: 200, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   } catch (error) {

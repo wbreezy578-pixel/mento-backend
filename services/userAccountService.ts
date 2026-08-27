@@ -10,6 +10,7 @@ export interface CreateUserAccountInput {
   name?: string | null;
   authProvider?: SupportedAuthProvider;
   emailVerified?: boolean;
+  externalUserId?: string;
 }
 
 export interface CreateUserAccountResult {
@@ -173,6 +174,8 @@ async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateU
         authProvider,
         lastOAuthReauthAt,
         emailVerified,
+        supabaseUserId: input.externalUserId ?? null,
+        accountStatus: emailVerified ? 'ACTIVE' : 'UNVERIFIED',
       },
     });
 
@@ -204,64 +207,50 @@ export async function createEmailAccount(input: CreateUserAccountInput): Promise
 }
 
 export async function createGoogleOAuthAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
-  return prisma.$transaction(
-    async (tx) => {
-      const normalizedEmail = normalizeEmail(input.email);
-      if (!normalizedEmail) {
-        throw new InvalidAccountInputError('Email is required');
-      }
-
-      const existingUser = await tx.user.findFirst({
-        where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
-      });
-
-      if (existingUser) {
-        const updateData: { name?: string | null; lastOAuthReauthAt?: Date; emailVerified?: boolean; authProvider?: string } = {};
-        const displayName = sanitizeDisplayName(input.name);
-        if (!existingUser.name && displayName) {
-          updateData.name = displayName;
-        }
-        updateData.lastOAuthReauthAt = new Date();
-        updateData.emailVerified = true;
-        updateData.authProvider = existingUser.password?.trim() ? 'mixed' : 'google';
-        const updatedUser = await tx.user.update({
-          where: { id: existingUser.id },
-          data: updateData,
-        });
-        return buildAccountResult(updatedUser, false, {
-          existingUserId: updatedUser.id,
-        });
-      }
-
-      return createNewUserAccount(tx, { ...input, authProvider: 'google', emailVerified: true, password: '' });
-    },
-    { maxWait: 10000, timeout: 15000 }
-  );
+  return createOAuthAccount(input, 'google');
 }
 
 export async function createAppleAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
-  return prisma.$transaction(
-    async (tx) => {
-      const normalizedEmail = normalizeEmail(input.email);
-      if (!normalizedEmail) throw new InvalidAccountInputError('Email is required');
-      const existingUser = await tx.user.findFirst({ where: { email: { equals: normalizedEmail, mode: 'insensitive' } } });
-      if (existingUser) {
-        const displayName = sanitizeDisplayName(input.name);
-        const updatedUser = await tx.user.update({
-          where: { id: existingUser.id },
-          data: {
-            name: existingUser.name || displayName,
-            lastOAuthReauthAt: new Date(),
-            emailVerified: true,
-            authProvider: existingUser.password?.trim() ? 'mixed' : 'apple',
-          },
-        });
-        return buildAccountResult(updatedUser, false, { existingUserId: updatedUser.id });
-      }
-      return createNewUserAccount(tx, { ...input, authProvider: 'apple', emailVerified: true, password: '' });
-    },
-    { maxWait: 10000, timeout: 30000 }
-  );
+  return createOAuthAccount(input, 'apple');
+}
+
+async function createOAuthAccount(input: CreateUserAccountInput, provider: 'google' | 'apple') {
+  if (!input.externalUserId?.trim()) throw new InvalidAccountInputError('OAuth identity is required');
+  return prisma.$transaction(async (tx) => {
+    const normalizedEmail = normalizeEmail(input.email);
+    if (!normalizedEmail) throw new InvalidAccountInputError('Email is required');
+
+    const byIdentity = await tx.user.findUnique({ where: { supabaseUserId: input.externalUserId } });
+    if (byIdentity && normalizeEmail(byIdentity.email) !== normalizedEmail) {
+      throw new InvalidAccountInputError('OAuth identity does not match this account.');
+    }
+    const existingUser = byIdentity ?? await tx.user.findFirst({ where: { email: { equals: normalizedEmail, mode: 'insensitive' } } });
+    if (!existingUser) {
+      return createNewUserAccount(tx, { ...input, authProvider: provider, emailVerified: true, password: '' });
+    }
+    if (existingUser.supabaseUserId && existingUser.supabaseUserId !== input.externalUserId) {
+      throw new InvalidAccountInputError('This email is already linked to another identity.');
+    }
+
+    const wasUnverifiedPasswordAccount = !existingUser.emailVerified && Boolean(existingUser.password?.trim());
+    if (wasUnverifiedPasswordAccount) {
+      await tx.session.updateMany({ where: { userId: existingUser.id, revokedAt: null }, data: { revokedAt: new Date() } });
+    }
+    const updatedUser = await tx.user.update({
+      where: { id: existingUser.id },
+      data: {
+        name: existingUser.name || sanitizeDisplayName(input.name),
+        lastOAuthReauthAt: new Date(),
+        emailVerified: true,
+        accountStatus: 'ACTIVE',
+        supabaseUserId: input.externalUserId,
+        password: wasUnverifiedPasswordAccount ? '' : existingUser.password,
+        authProvider: wasUnverifiedPasswordAccount || !existingUser.password?.trim() ? provider : 'mixed',
+        credentialsChangedAt: wasUnverifiedPasswordAccount ? new Date() : existingUser.credentialsChangedAt,
+      },
+    });
+    return buildAccountResult(updatedUser, false);
+  }, { maxWait: 10000, timeout: 30000 });
 }
 
 export async function createAdminUserAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {

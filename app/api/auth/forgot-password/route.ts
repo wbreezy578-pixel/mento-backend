@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import { createPasswordResetToken } from '../../../../lib/authSession';
-import { getClientIp, normalizeEmail, recordSecurityEvent } from '../../../lib/auth';
+import { authRateLimitSubject, getClientIp, normalizeEmail, recordSecurityEvent } from '../../../lib/auth';
 import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
 import logger from '../../../../lib/logger';
+import { sendPasswordResetEmail } from '../../../../services/transactionalEmailService';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
@@ -25,7 +26,7 @@ export async function POST(req: Request) {
     }
 
     const clientIp = getClientIp(req);
-    const rateLimit = await ensureSlidingWindow(`forgot-password:${clientIp}:${normalizedEmail}`, 5, 15 * 60);
+    const rateLimit = await ensureSlidingWindow(`forgot-password:${clientIp}:${authRateLimitSubject(normalizedEmail)}`, 5, 15 * 60);
     if (!rateLimit.ok) {
       return NextResponse.json({ error: 'Too many password reset requests. Please try again later.' }, { status: 429, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
@@ -39,14 +40,15 @@ export async function POST(req: Request) {
     if (user) {
       const acceptsReset = user.authProvider === 'email' || user.authProvider === 'mixed';
       if (acceptsReset) {
-        await createPasswordResetToken(user.id);
+        const token = await createPasswordResetToken(user.id);
+        await sendPasswordResetEmail(user.email, token);
       }
       await recordSecurityEvent(user.id, 'password_reset_requested', { email: normalizedEmail, ipAddress: clientIp, acceptsReset });
     } else {
       await recordSecurityEvent(null, 'password_reset_requested', { email: normalizedEmail, ipAddress: clientIp, userFound: false });
     }
 
-    return NextResponse.json({ ok: true, message: 'If an account exists for that email, a password reset link has been created.' }, {
+    return NextResponse.json({ ok: true, message: 'If an account exists for that email, a password reset link has been sent.' }, {
       status: 200,
       headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS },
     });

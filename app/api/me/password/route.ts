@@ -43,7 +43,7 @@ export async function POST(req: Request) {
     const normalizedEmail = normalizeEmail(user.email);
     const hashed = await hashPassword(newPassword);
     await prisma.$transaction(async (tx) => {
-      const updateData: Record<string, unknown> = { password: hashed, email: normalizedEmail };
+      const updateData: Record<string, unknown> = { password: hashed, email: normalizedEmail, credentialsChangedAt: new Date() };
       // If this user previously signed in with Google only and had no password,
       // adding a password should mark the account as supporting both methods.
       if (user.authProvider === 'google' && !alreadyHasPassword) {

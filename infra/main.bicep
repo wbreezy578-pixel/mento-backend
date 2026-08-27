@@ -47,6 +47,10 @@ param appleAppId string = ''
 param metricsAuthToken string = ''
 @secure()
 param retentionJobSecret string = ''
+@secure()
+param resendApiKey string = ''
+param authEmailFrom string = ''
+param mobileAppScheme string = 'mentomobile'
 
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: '${containerAppEnvironmentName}-logs'
@@ -148,6 +152,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'retention-job-secret'
           value: retentionJobSecret
+        }
+        {
+          name: 'resend-api-key'
+          value: resendApiKey
         }
       ]
       registries: empty(containerRegistryServer) ? [] : [
@@ -330,6 +338,18 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'RETENTION_JOB_SECRET'
               secretRef: 'retention-job-secret'
+            }
+            {
+              name: 'RESEND_API_KEY'
+              secretRef: 'resend-api-key'
+            }
+            {
+              name: 'AUTH_EMAIL_FROM'
+              value: authEmailFrom
+            }
+            {
+              name: 'MOBILE_APP_SCHEME'
+              value: mobileAppScheme
             }
           ]
         }

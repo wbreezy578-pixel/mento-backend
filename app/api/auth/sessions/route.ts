@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getUserFromRequest } from '../../../lib/auth';
+import { getActiveSessionId, getUserFromRequest } from '../../../lib/auth';
 import { prisma } from '../../../../lib/prisma';
 
 export async function GET(req: Request) {
@@ -22,7 +22,8 @@ export async function GET(req: Request) {
     },
   });
 
-  return NextResponse.json({ sessions });
+  const activeSessionId = getActiveSessionId();
+  return NextResponse.json({ sessions: sessions.map((session) => ({ ...session, current: session.id === activeSessionId })) });
 }
 
 export async function DELETE(req: Request) {

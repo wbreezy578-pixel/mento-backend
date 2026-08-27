@@ -7,6 +7,7 @@ import { resolveDeletionCredential } from '../../../lib/accountDeletion';
 import { revokeAllUserSessions } from '../../../../lib/authSession';
 import { cancelPaddleSubscriptionForAccountDeletion } from '../../../../services/paddleService';
 import { cancelGooglePlaySubscriptionsForAccountDeletion } from '../../../../services/nativeStoreService';
+import { deleteSupabaseAuthUser } from '../../../../services/supabaseAdminService';
 
 function buildDeletionResponse() {
   const response = NextResponse.json({ success: true, deleted: true });
@@ -64,6 +65,7 @@ export async function POST(req: Request) {
       await cancelPaddleSubscriptionForAccountDeletion(billingWallet.paddleSubscriptionId);
     }
     await cancelGooglePlaySubscriptionsForAccountDeletion(user.id);
+    if (user.supabaseUserId) await deleteSupabaseAuthUser(user.supabaseUserId);
 
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const targetUser = await tx.user.findUnique({ where: { id: user.id } });

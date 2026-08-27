@@ -12,8 +12,6 @@ import type { ResponseCookies } from 'next/dist/server/web/spec-extension/cookie
 loadAndValidateEnvironment();
 const JWT_SECRET = getConfiguredJwtSecret();
 const resolvedJwtSecret = JWT_SECRET;
-const MAX_FAILED_LOGIN_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000;
 
 function getJwtSecret(): string | undefined {
   return resolvedJwtSecret;
@@ -34,11 +32,12 @@ function ensureJwtSecret(): string {
 const JWT_ALGORITHM = 'HS256';
 const JWT_ISSUER = process.env.JWT_ISSUER ?? 'mento';
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE ?? 'mento';
-const PASSWORD_MIN_LENGTH = 12;
+const PASSWORD_MIN_LENGTH = 15;
+const PASSWORD_MAX_BYTES = 72;
 const RECENT_OAUTH_REAUTH_MS = 15 * 60 * 1000;
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
 const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
-const userContext = new AsyncLocalStorage<string | null>();
+const userContext = new AsyncLocalStorage<{ userId: string; sessionId: string } | null>();
 
 export interface JwtPayload {
   sub: string;
@@ -46,6 +45,7 @@ export interface JwtPayload {
   iat: number;
   exp: number;
   type?: 'access' | 'refresh' | string;
+  sid: string;
 }
 
 export interface PasswordValidationResult {
@@ -154,7 +154,7 @@ export async function getUserFromRequest(req: Request) {
       tokenExpiresInSeconds: typeof decodedExp === 'number' ? decodedExp - Math.floor(Date.now() / 1000) : null,
     });
 
-    if (typeof payload !== 'object' || payload === null || typeof (payload as Partial<JwtPayload>).sub !== 'string' || typeof (payload as Partial<JwtPayload>).email !== 'string') {
+    if (typeof payload !== 'object' || payload === null || typeof (payload as Partial<JwtPayload>).sub !== 'string' || typeof (payload as Partial<JwtPayload>).email !== 'string' || typeof (payload as Partial<JwtPayload>).sid !== 'string') {
       logger.warn('Auth rejected: invalid JWT payload');
       userContext.enterWith(null);
       return null;
@@ -168,19 +168,27 @@ export async function getUserFromRequest(req: Request) {
 
     const userId = (payload as JwtPayload).sub;
     const email = (payload as JwtPayload).email;
+    const sessionId = (payload as JwtPayload).sid;
     logger.info('JWT payload extracted', { userId, email });
 
-    const user = await prisma.user.findUnique({ where: { id: userId } });
+    const [user, session] = await Promise.all([
+      prisma.user.findUnique({ where: { id: userId } }),
+      prisma.session.findFirst({ where: { id: sessionId, userId, revokedAt: null, expiresAt: { gt: new Date() }, absoluteExpiresAt: { gt: new Date() } } }),
+    ]);
 
     const userFound = Boolean(user);
     logger.info('User lookup result', { userFound, userId, userEmail: user?.email ?? null });
-    if (!userFound || !user) {
+    const issuedAt = typeof payload.iat === 'number' ? payload.iat * 1000 : 0;
+    if (!userFound || !user || !session || user.accountStatus !== 'ACTIVE' || issuedAt < user.credentialsChangedAt.getTime() - 1000) {
       logger.warn('Auth rejected: user lookup failed');
       userContext.enterWith(null);
       return null;
     }
 
-    userContext.enterWith(user.id);
+    userContext.enterWith({ userId: user.id, sessionId });
+    if (!session.lastUsedAt || Date.now() - session.lastUsedAt.getTime() > 5 * 60 * 1000) {
+      void prisma.session.update({ where: { id: sessionId }, data: { lastUsedAt: new Date() } }).catch(() => undefined);
+    }
     return user;
   } catch (error: unknown) {
     const errorName = error instanceof Error ? error.name : 'UnknownError';
@@ -227,18 +235,7 @@ export function validatePasswordStrength(password: string): PasswordValidationRe
   if (password.length < PASSWORD_MIN_LENGTH) {
     reasons.push(`Password must be at least ${PASSWORD_MIN_LENGTH} characters long.`);
   }
-  if (!/[A-Z]/.test(password)) {
-    reasons.push('Password must contain an uppercase letter.');
-  }
-  if (!/[a-z]/.test(password)) {
-    reasons.push('Password must contain a lowercase letter.');
-  }
-  if (!/\d/.test(password)) {
-    reasons.push('Password must contain a number.');
-  }
-  if (!/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(password)) {
-    reasons.push('Password must contain a symbol.');
-  }
+  if (Buffer.byteLength(password, 'utf8') > PASSWORD_MAX_BYTES) reasons.push(`Password must be at most ${PASSWORD_MAX_BYTES} bytes long.`);
   return { isValid: reasons.length === 0, reasons };
 }
 
@@ -271,6 +268,10 @@ export async function verifyPassword(password: string, passwordHash: string | nu
   return false;
 }
 
+export function authRateLimitSubject(value: string) {
+  return createHash('sha256').update(value.trim().toLowerCase()).digest('hex').slice(0, 32);
+}
+
 export function getSensitiveActionRequirements(user: { authProvider?: string | null; lastOAuthReauthAt?: Date | string | null }, now = new Date()): SensitiveActionRequirements {
   const lastOAuthReauthAt = user.lastOAuthReauthAt ? new Date(user.lastOAuthReauthAt) : null;
   const isOAuthUser = user.authProvider === 'google' || user.authProvider === 'apple' || user.authProvider === 'mixed';
@@ -294,7 +295,7 @@ export function buildUserSummary(user: { id: string; email: string; name?: strin
   return { id: user.id, email: user.email, name: user.name ?? null };
 }
 
-export function signToken(userId: string, email: string, options?: { expiresInSeconds?: number }) {
+export function signToken(userId: string, email: string, options: { sessionId: string; expiresInSeconds?: number }) {
   const jwtSecret = ensureJwtSecret();
   const jwtSecretFingerprint = getJwtSecretFingerprint(jwtSecret);
   const expiresInSeconds = options?.expiresInSeconds ?? ACCESS_TOKEN_TTL_SECONDS;
@@ -308,7 +309,7 @@ export function signToken(userId: string, email: string, options?: { expiresInSe
     expiresInSeconds,
   });
 
-  return jwt.sign({ sub: userId, email, type: 'access' }, jwtSecret, {
+  return jwt.sign({ sub: userId, email, sid: options.sessionId, type: 'access' }, jwtSecret, {
     expiresIn: expiresInSeconds,
     algorithm: JWT_ALGORITHM,
     issuer: JWT_ISSUER,
@@ -368,22 +369,14 @@ export async function recordSecurityEvent(userId: string | null, eventType: stri
 }
 
 export async function incrementFailedLoginAttempts(userId: string) {
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user) return null;
-
-  const failedLoginAttempts = user.failedLoginAttempts + 1;
-  const shouldLockout = failedLoginAttempts >= MAX_FAILED_LOGIN_ATTEMPTS;
-  const nextLockedAt = shouldLockout ? new Date(Date.now() + LOCKOUT_DURATION_MS) : user.lockedAt;
-  const updated = await prisma.user.update({
+  return prisma.user.update({
     where: { id: userId },
     data: {
-      failedLoginAttempts,
+      failedLoginAttempts: { increment: 1 },
       lastFailedLoginAt: new Date(),
-      lockedAt: nextLockedAt,
+      lockedAt: null,
     },
   });
-
-  return updated;
 }
 
 export async function resetFailedLoginAttempts(userId: string) {
@@ -398,7 +391,11 @@ export async function resetFailedLoginAttempts(userId: string) {
 }
 
 export function getActiveUserId() {
-  return userContext.getStore() ?? null;
+  return userContext.getStore()?.userId ?? null;
+}
+
+export function getActiveSessionId() {
+  return userContext.getStore()?.sessionId ?? null;
 }
 
 export function getUserContextForPrisma() {

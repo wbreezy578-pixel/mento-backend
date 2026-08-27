@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../../lib/prisma';
 import logger from '../../../../lib/logger';
-import { getUserFromRequest, normalizeEmail, verifyPassword, buildUserSummary, getSensitiveActionRequirements } from '../../../lib/auth';
+import { getUserFromRequest, normalizeEmail, verifyPassword, getSensitiveActionRequirements, recordSecurityEvent } from '../../../lib/auth';
+import { createEmailActionToken } from '../../../../lib/authSession';
+import { sendEmailChangeConfirmation } from '../../../../services/transactionalEmailService';
 
 export async function POST(req: Request) {
   try {
@@ -36,12 +38,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Email already in use.' }, { status: 409 });
     }
 
-    const updated = await prisma.user.update({
+    await prisma.user.update({
       where: { id: user.id },
-      data: { email: normalizedEmail },
+      data: { pendingEmail: normalizedEmail },
     });
-
-    return NextResponse.json({ user: buildUserSummary(updated) });
+    const token = await createEmailActionToken({ userId: user.id, purpose: 'CHANGE_EMAIL', targetEmail: normalizedEmail, expiresInMinutes: 30 });
+    await sendEmailChangeConfirmation(normalizedEmail, token);
+    await recordSecurityEvent(user.id, 'email_change_requested');
+    return NextResponse.json({ ok: true, message: 'Check the new address to confirm this change.' });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Email change failed.';
     logger.error('Email change failed', { error });

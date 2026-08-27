@@ -1,12 +1,14 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../lib/prisma';
 import logger from '../../../lib/logger';
-import { signToken, normalizeEmail, verifyPassword, buildUserSummary, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, getLoginPolicyState } from '../../lib/auth';
+import { signToken, normalizeEmail, verifyPassword, buildUserSummary, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, authRateLimitSubject } from '../../lib/auth';
 import { createNotification } from '../../services/notificationService';
 import { createSessionRecord, generateSecureToken } from '../../../lib/authSession';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
+import { ensureSlidingWindow } from '../../../lib/rateLimiter';
 
 const CORS_METHODS = 'POST, OPTIONS';
+const LOGIN_FAILURE_MESSAGE = 'Unable to sign in. Check your credentials and email verification status.';
 
 export async function OPTIONS(req: Request) {
   logger.info('Login OPTIONS preflight', {
@@ -33,19 +35,25 @@ export async function POST(req: Request) {
     if (!normalizedEmail || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
+    const clientIp = getClientIp(req);
+    const [ipLimit, accountLimit] = await Promise.all([
+      ensureSlidingWindow(`login:ip:${clientIp}`, 30, 15 * 60),
+      ensureSlidingWindow(`login:account:${authRateLimitSubject(normalizedEmail)}`, 10, 15 * 60),
+    ]);
+    if (!ipLimit.ok || !accountLimit.ok) return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
 
     const user = await prisma.user.findFirst({
       where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
     });
     if (!user) {
+      await verifyPassword(String(password), '$2b$12$C6UzMDM.H6dfI/f/IKcEe.8jO4KQWv6q6Qp2kCB2Q9d8qQ0N9cF8K');
       logger.info('Login lookup result', { found: false });
       await recordSecurityEvent(null, 'login_failed', { email: normalizedEmail, reason: 'user_not_found' });
-      return NextResponse.json({ error: 'Invalid credentials' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    const policyState = getLoginPolicyState(user);
-    if (!policyState.allowed) {
-      return NextResponse.json({ error: 'Account temporarily locked. Please try again later.' }, { status: 423, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    if (!user.emailVerified || user.accountStatus !== 'ACTIVE') {
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     logger.info('Login lookup result', { found: true, userId: user.id });
@@ -54,7 +62,7 @@ export async function POST(req: Request) {
 
     if (!passwordFieldExists) {
       return NextResponse.json(
-        { error: 'This account was created with Google. Please continue with Google or set a password.' },
+        { error: LOGIN_FAILURE_MESSAGE },
         { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } }
       );
     }
@@ -65,21 +73,20 @@ export async function POST(req: Request) {
       await incrementFailedLoginAttempts(user.id);
       const clientIp = getClientIp(req);
       await recordSecurityEvent(user.id, 'login_failed', { email: normalizedEmail, reason: 'invalid_password', ipAddress: clientIp });
-      return NextResponse.json({ error: 'Invalid credentials' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     await resetFailedLoginAttempts(user.id);
-    const clientIp = getClientIp(req);
-    const accessToken = signToken(user.id, normalizedEmail, { expiresInSeconds: 15 * 60 });
     const refreshTokenValue = generateSecureToken();
     const sessionExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    await createSessionRecord({
+    const session = await createSessionRecord({
       userId: user.id,
       token: refreshTokenValue,
       userAgent: req.headers.get('user-agent') ?? null,
       ipAddress: req.headers.get('x-forwarded-for') ?? null,
       expiresAt: sessionExpiresAt,
     });
+    const accessToken = signToken(user.id, normalizedEmail, { sessionId: session.id, expiresInSeconds: 15 * 60 });
     await recordSecurityEvent(user.id, 'login_success', { email: normalizedEmail, ipAddress: clientIp });
 
     // best-effort security notification on successful login

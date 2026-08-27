@@ -13,7 +13,7 @@ COPY . .
 RUN npx prisma generate
 RUN DATABASE_URL=postgresql://build:build@localhost:5432/build \
 	DIRECT_URL=postgresql://build:build@localhost:5432/build \
-	JWT_SECRET=build-only-placeholder \
+	JWT_SECRET=build-only-placeholder-not-a-runtime-secret \
 	GEMINI_API_KEY=build-only-placeholder \
 	SUPABASE_URL=https://build-only.invalid \
 	SUPABASE_SERVICE_ROLE_KEY=build-only-placeholder \

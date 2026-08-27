@@ -100,6 +100,7 @@ export async function GET(req: Request) {
       maxSessionSeconds,
       60 + Math.max(0, billingDecision.remainingUsage ?? 0),
     );
+    const availableBalanceSeconds = 60 + Math.max(0, billingDecision.remainingUsage ?? 0);
     session.expiresAt = await constrainLiveTutorSessionDuration(session.streamId, user.id, availableSessionSeconds) ?? session.expiresAt;
 
     logger.info('Live Tutor session created successfully', {
@@ -152,6 +153,8 @@ export async function GET(req: Request) {
       billing: billingDecision,
       limits: {
         maxSessionSeconds,
+        authorizedSessionSeconds: availableSessionSeconds,
+        availableBalanceSeconds,
         inactivityTimeoutSeconds: Math.floor(LIVE_TUTOR_INACTIVITY_TIMEOUT_MS / 1000),
       },
     });

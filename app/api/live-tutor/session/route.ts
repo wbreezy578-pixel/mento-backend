@@ -12,9 +12,9 @@ import {
   buildAIRequestId,
 } from '../../../../lib/aiSecurityGateway';
 import logger from '../../../../lib/logger';
-import { attachLiveTutorConversation, createLiveTutorConversation } from '../../../../services/liveTutorConversationService';
+import { attachLiveTutorConversation, createLiveTutorConversation, getOwnedLiveTutorConversation } from '../../../../services/liveTutorConversationService';
 import type { BillingDecision } from '../../../../services/billingService';
-import { LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from '../../../../lib/liveTutorLimits';
+import { getLiveTutorMaxSessionSecondsForUser, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS } from '../../../../lib/liveTutorLimits';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -41,12 +41,22 @@ export async function GET(req: Request) {
     claimedUserId = user.id;
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
-    const requestedVoiceProfile = new URL(req.url).searchParams.get('avatarVoiceProfile');
+    const requestUrl = new URL(req.url);
+    const requestedVoiceProfile = requestUrl.searchParams.get('avatarVoiceProfile');
+    const requestedConversationId = requestUrl.searchParams.get('conversationId')?.trim() || null;
     const avatarVoiceProfile = requestedVoiceProfile === null
       ? DEFAULT_LIVE_TUTOR_VOICE_PROFILE
       : resolveLiveTutorVoiceProfile(requestedVoiceProfile);
     if (!avatarVoiceProfile) {
       return NextResponse.json({ error: 'Invalid Live Tutor avatar voice profile.' }, { status: 400 });
+    }
+    let continuedConversationId: string | null = null;
+    if (requestedConversationId) {
+      const ownedConversation = await getOwnedLiveTutorConversation(requestedConversationId, user.id);
+      if (!ownedConversation) {
+        return NextResponse.json({ error: 'Live Tutor conversation not found.' }, { status: 404 });
+      }
+      continuedConversationId = ownedConversation.id;
     }
 
     logger.info('Live Tutor session request received', {
@@ -85,8 +95,9 @@ export async function GET(req: Request) {
     const session: SimliStreamingSession = result.result;
     const billingDecision: BillingDecision = result.billingDecision;
     cleanupStreamId = session.streamId;
+    const maxSessionSeconds = getLiveTutorMaxSessionSecondsForUser(user.email);
     const availableSessionSeconds = Math.min(
-      LIVE_TUTOR_MAX_SESSION_SECONDS,
+      maxSessionSeconds,
       60 + Math.max(0, billingDecision.remainingUsage ?? 0),
     );
     session.expiresAt = await constrainLiveTutorSessionDuration(session.streamId, user.id, availableSessionSeconds) ?? session.expiresAt;
@@ -117,7 +128,9 @@ export async function GET(req: Request) {
     const sessionToken = requireSessionToken(session);
     let conversationId: string | null = null;
     try {
-      const conversation = await createLiveTutorConversation(user.id);
+      const conversation = continuedConversationId
+        ? { id: continuedConversationId }
+        : await createLiveTutorConversation(user.id);
       conversationId = conversation.id;
       await attachLiveTutorConversation(session.streamId, user.id, conversation.id);
     } catch (error) {
@@ -138,7 +151,7 @@ export async function GET(req: Request) {
       conversationId,
       billing: billingDecision,
       limits: {
-        maxSessionSeconds: LIVE_TUTOR_MAX_SESSION_SECONDS,
+        maxSessionSeconds,
         inactivityTimeoutSeconds: Math.floor(LIVE_TUTOR_INACTIVITY_TIMEOUT_MS / 1000),
       },
     });

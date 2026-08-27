@@ -34,7 +34,9 @@ export async function POST(req: Request) {
     const seconds = typeof body?.seconds === 'number' && Number.isFinite(body.seconds) && body.seconds >= 0 ? Math.floor(body.seconds) : 0;
     const streamId = typeof body?.streamId === 'string' && body.streamId.trim() ? body.streamId.trim() : undefined;
     const status = typeof body?.status === 'string' ? body.status : undefined;
-    const reason = typeof body?.reason === 'string' && body.reason.trim() ? body.reason.trim() : undefined;
+    const reason = typeof body?.reason === 'string' && body.reason.trim()
+      ? body.reason.trim().replace(/[\r\n\t]+/g, ' ').slice(0, 200)
+      : undefined;
     const requestId = buildAIRequestId('live-tutor-consume');
 
     // Track activity for the 90-second inactivity guardrail.
@@ -128,8 +130,8 @@ export async function POST(req: Request) {
       });
       return NextResponse.json(err.body, { status: err.status, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
-    const message = err instanceof Error ? err.message : 'Internal Server Error';
+    const message = err instanceof Error ? err.message : 'Unknown error';
     logger.error('Live tutor consume failed', { error: message, category: 'live_tutor_consume_error' });
-    return NextResponse.json({ error: message }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    return NextResponse.json({ error: 'Unable to update the Live Tutor session.' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

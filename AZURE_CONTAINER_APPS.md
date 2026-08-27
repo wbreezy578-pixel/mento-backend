@@ -49,3 +49,5 @@ Paddle is only the web checkout path. Its server API key, webhook secret, three 
 - Exactly one replica for the voice server. Gemini Live connections are process-local and cannot be safely load-balanced between replicas.
 
 Redis-backed lease coordination is supported, but it does not make the live Gemini connection portable between processes. Multi-replica voice hosting requires a dedicated realtime worker/session service and is not enabled by this deployment.
+
+For a controlled countdown test, set `LIVE_TUTOR_TEST_MAX_SESSION_SECONDS=120` together with `LIVE_TUTOR_TEST_USER_EMAILS` containing only the exact test account emails. Other users keep the normal production limit. Remove both values after the countdown and ledger test passes.

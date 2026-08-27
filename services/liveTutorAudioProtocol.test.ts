@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizePcmForSimli } from './liveTutorAudioProtocol';
+import { normalizePcmForSimli, SIMLI_PCM_FRAME_BYTES, splitPcmIntoSimliFrames } from './liveTutorAudioProtocol';
 
 describe('normalizePcmForSimli', () => {
   it('resamples Gemini TTS 24 kHz PCM to Simli 16 kHz PCM', () => {
@@ -26,5 +26,19 @@ describe('normalizePcmForSimli', () => {
     const source = new Uint8Array(2400 * 2);
     const output = normalizePcmForSimli(source, 'audio/L16;codec=pcm;rate=24000');
     expect(output.byteLength).toBe(1600 * 2);
+  });
+});
+
+describe('splitPcmIntoSimliFrames', () => {
+  it('splits provider bursts into Simli-preferred frames with only a short final frame', () => {
+    const pcm = new Uint8Array(SIMLI_PCM_FRAME_BYTES * 3 + 320);
+    const frames = splitPcmIntoSimliFrames(pcm);
+
+    expect(frames.map((frame) => frame.byteLength)).toEqual([
+      SIMLI_PCM_FRAME_BYTES,
+      SIMLI_PCM_FRAME_BYTES,
+      SIMLI_PCM_FRAME_BYTES,
+      320,
+    ]);
   });
 });

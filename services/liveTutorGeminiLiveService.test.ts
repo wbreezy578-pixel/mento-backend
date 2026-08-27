@@ -37,8 +37,8 @@ it('uses a concise, natural live tutor system prompt', async () => {
 
   const prompt = buildLiveTutorSystemInstruction();
 
-  expect(prompt).toContain('Answer simple questions directly and briefly');
-  expect(prompt).toContain('Do not force filler');
+  expect(prompt).toContain('one to three short sentences');
+  expect(prompt).toContain('Never read a long list');
   expect(prompt).toContain('Focus on the newest completed user turn');
   expect(prompt).toContain('Stop immediately when interrupted');
   expect(prompt).not.toContain('150 words per minute');
@@ -61,7 +61,7 @@ describe('Gemini Live PCM lifecycle', () => {
     const { closeGeminiLiveSession, createGeminiLiveSession } = await import('./liveTutorGeminiLiveService');
     const session = await createGeminiLiveSession({ streamId: 'stream-vad' });
 
-    expect(geminiConnectOptions.config.realtimeInputConfig.automaticActivityDetection.silenceDurationMs).toBe(700);
+    expect(geminiConnectOptions.config.realtimeInputConfig.automaticActivityDetection.silenceDurationMs).toBe(520);
 
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });

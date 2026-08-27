@@ -1,5 +1,32 @@
-import { describe, expect, it } from 'vitest';
-import { clampLiveTutorExpiry, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from './liveTutorLimits';
+import { afterEach, describe, expect, it } from 'vitest';
+import { clampLiveTutorExpiry, getLiveTutorMaxSessionSecondsForUser, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from './liveTutorLimits';
+
+const originalSeconds = process.env.LIVE_TUTOR_TEST_MAX_SESSION_SECONDS;
+const originalEmails = process.env.LIVE_TUTOR_TEST_USER_EMAILS;
+
+afterEach(() => {
+  if (originalSeconds === undefined) delete process.env.LIVE_TUTOR_TEST_MAX_SESSION_SECONDS;
+  else process.env.LIVE_TUTOR_TEST_MAX_SESSION_SECONDS = originalSeconds;
+  if (originalEmails === undefined) delete process.env.LIVE_TUTOR_TEST_USER_EMAILS;
+  else process.env.LIVE_TUTOR_TEST_USER_EMAILS = originalEmails;
+});
+
+describe('getLiveTutorMaxSessionSecondsForUser', () => {
+  it('uses a short test limit only for an exact whitelisted account', () => {
+    process.env.LIVE_TUTOR_TEST_MAX_SESSION_SECONDS = '120';
+    process.env.LIVE_TUTOR_TEST_USER_EMAILS = 'tester@example.com';
+
+    expect(getLiveTutorMaxSessionSecondsForUser('Tester@example.com')).toBe(120);
+    expect(getLiveTutorMaxSessionSecondsForUser('another@example.com')).toBe(LIVE_TUTOR_MAX_SESSION_SECONDS);
+  });
+
+  it('keeps the production limit when test configuration is incomplete', () => {
+    delete process.env.LIVE_TUTOR_TEST_USER_EMAILS;
+    process.env.LIVE_TUTOR_TEST_MAX_SESSION_SECONDS = '120';
+
+    expect(getLiveTutorMaxSessionSecondsForUser('tester@example.com')).toBe(LIVE_TUTOR_MAX_SESSION_SECONDS);
+  });
+});
 
 describe('Live Tutor limits', () => {
   it('limits sessions to twenty minutes with a ninety-second inactivity window', () => {

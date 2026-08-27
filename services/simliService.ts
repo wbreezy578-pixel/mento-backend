@@ -434,12 +434,19 @@ export async function markSessionActivity(streamId: string, userId: string, repo
   if (durable.expiresAt && durable.expiresAt <= now) return false;
   if (now.getTime() - durable.lastActivityAt.getTime() < MIN_HEARTBEAT_INTERVAL_MS) return false;
   if (reportedSeconds !== undefined && (!Number.isFinite(reportedSeconds) || reportedSeconds < 0 || reportedSeconds > 90)) return false;
-  await prisma.liveTutorSession.updateMany({ where: { streamId, userId, status: 'active', billingFinalized: false }, data: { lastActivityAt: now } });
+  const expiryMs = durable.expiresAt?.getTime() ?? now.getTime();
+  const authoritativeElapsedSeconds = Math.max(0, Math.floor((Math.min(now.getTime(), expiryMs) - durable.createdAt.getTime()) / 1000));
+  const secondsConsumed = Math.min(durable.secondsReserved, Math.max(durable.secondsConsumed, authoritativeElapsedSeconds));
+  await prisma.liveTutorSession.updateMany({
+    where: { streamId, userId, status: 'active', billingFinalized: false },
+    data: { lastActivityAt: now, secondsConsumed },
+  });
   if (!session) return true;
 
   const nextSession: SessionRecord = {
     ...session,
     lastActivityAt: new Date().toISOString(),
+    secondsConsumed,
   };
   activeSessions.set(streamId, nextSession);
   return true;
@@ -454,10 +461,15 @@ export async function constrainLiveTutorSessionDuration(streamId: string, userId
     session.expiresAt = new Date(Math.min(currentExpiryMs, nextExpiry.getTime())).toISOString();
     saveSession(session);
   }
-  const durable = await prisma.liveTutorSession.findUnique({ where: { streamId }, select: { userId: true, expiresAt: true } });
+  const durable = await prisma.liveTutorSession.findUnique({ where: { streamId }, select: { userId: true, createdAt: true, expiresAt: true } });
   if (!durable || durable.userId !== userId) return session?.expiresAt;
   const durableExpiry = durable.expiresAt && durable.expiresAt < nextExpiry ? durable.expiresAt : nextExpiry;
-  await prisma.liveTutorSession.update({ where: { streamId }, data: { expiresAt: durableExpiry } });
+  const authorizedSeconds = Math.max(1, Math.min(durationSeconds, Math.ceil((durableExpiry.getTime() - durable.createdAt.getTime()) / 1000)));
+  await prisma.liveTutorSession.update({ where: { streamId }, data: { expiresAt: durableExpiry, secondsReserved: authorizedSeconds } });
+  if (session && session.userId === userId) {
+    session.secondsReserved = authorizedSeconds;
+    saveSession(session);
+  }
   return durableExpiry.toISOString();
 }
 
@@ -568,11 +580,12 @@ export async function completeSimliSessionLifecycle(streamId: string, options: {
 
   const billableEnd = durable.expiresAt ? Math.min(Date.now(), durable.expiresAt.getTime()) : Date.now();
   const elapsedSeconds = Math.max(0, Math.floor((billableEnd - durable.createdAt.getTime()) / 1000));
-  const requestedSeconds = Number.isFinite(options.secondsUsed)
+  const clientReportedSeconds = Number.isFinite(options.secondsUsed)
     ? Math.max(0, Math.floor(options.secondsUsed ?? 0))
-    : Math.min(MAX_SESSION_SECONDS, elapsedSeconds);
-  const secondsUsed = Math.min(durable.secondsReserved || 60, requestedSeconds);
-  const billableSeconds = secondsUsed > 0 ? secondsUsed : durable.secondsReserved || 60;
+    : 0;
+  const authoritativeSeconds = Math.max(durable.secondsConsumed, elapsedSeconds, clientReportedSeconds);
+  const secondsUsed = Math.min(durable.secondsReserved || 60, authoritativeSeconds);
+  const billableSeconds = Math.max(1, secondsUsed);
   
   logger.info('Simli session lifecycle event', {
     provider: 'simli',

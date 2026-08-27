@@ -90,7 +90,13 @@ export async function GET(req: Request) {
       metadata: { streamType: 'avatar-session' },
       pending: true,
       finalize: false,
-      callback: async () => await createSimliStreamingAvatarSession({ requestId, userId: user.id, secondsReserved: 60, avatarVoiceProfile }),
+      callback: async ({ billingDecision }) => {
+        const authorizedSeconds = Math.min(
+          getLiveTutorMaxSessionSecondsForUser(user.email),
+          60 + Math.max(0, billingDecision.remainingUsage ?? 0),
+        );
+        return createSimliStreamingAvatarSession({ requestId, userId: user.id, secondsReserved: authorizedSeconds, maxSessionSeconds: authorizedSeconds, avatarVoiceProfile });
+      },
     });
     const session: SimliStreamingSession = result.result;
     const billingDecision: BillingDecision = result.billingDecision;

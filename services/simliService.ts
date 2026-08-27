@@ -27,6 +27,7 @@ interface SessionRecord extends SimliStreamingSession {
   billingRequestId?: string;
   userId?: string;
   secondsReserved?: number;
+  maxSessionSeconds?: number;
   secondsConsumed?: number;
   billingFinalized?: boolean;
 }
@@ -254,6 +255,7 @@ export async function createSimliStreamingAvatarSession(options: {
   requestId?: string;
   userId?: string;
   secondsReserved?: number;
+  maxSessionSeconds?: number;
   avatarVoiceProfile?: LiveTutorVoiceProfile;
 } = {}): Promise<SimliStreamingSession> {
   const existing = findSessionByUser(options.userId);
@@ -295,7 +297,7 @@ export async function createSimliStreamingAvatarSession(options: {
         body: JSON.stringify({
           faceId: avatarId,
           handleSilence: true,
-          maxSessionLength: 600,
+          maxSessionLength: Math.max(1, Math.min(MAX_SESSION_SECONDS, options.maxSessionSeconds ?? MAX_SESSION_SECONDS)),
           maxIdleTime: 180,
         }),
       });
@@ -328,7 +330,7 @@ export async function createSimliStreamingAvatarSession(options: {
     const now = new Date().toISOString();
     const sessionInfo = {
       ...providerSessionInfo,
-      expiresAt: clampLiveTutorExpiry(providerSessionInfo.expiresAt, Date.parse(now)),
+      expiresAt: clampLiveTutorExpiry(providerSessionInfo.expiresAt, Date.parse(now), options.maxSessionSeconds),
     };
     logger.info('Simli session token created', { provider: 'simli', streamId: sessionInfo.streamId });
     saveSession({
@@ -578,7 +580,11 @@ export async function completeSimliSessionLifecycle(streamId: string, options: {
   logStatusTransition({ streamId, sessionId: durable.id, userId: durable.userId, previousStatus: durable.status, resultingStatus: 'finalizing', reason: options.reason ?? 'session_ended' });
   logger.info('[LiveTutorLifecycle] terminal_finalize_started', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'session_ended', previousStatus: durable.status, resultingStatus: 'finalizing', category: 'live_tutor_lifecycle' });
 
-  const billableEnd = durable.expiresAt ? Math.min(Date.now(), durable.expiresAt.getTime()) : Date.now();
+  const recoveredAfterInactivity = /heartbeat expired|stale session|reconciliation timeout/i.test(options.reason ?? '');
+  // A disconnected app gets a 90-second recovery window, but that grace period is
+  // not paid tutor time. Charge only through its last accepted heartbeat.
+  const terminalTime = recoveredAfterInactivity ? durable.lastActivityAt.getTime() : Date.now();
+  const billableEnd = durable.expiresAt ? Math.min(terminalTime, durable.expiresAt.getTime()) : terminalTime;
   const elapsedSeconds = Math.max(0, Math.floor((billableEnd - durable.createdAt.getTime()) / 1000));
   const clientReportedSeconds = Number.isFinite(options.secondsUsed)
     ? Math.max(0, Math.floor(options.secondsUsed ?? 0))

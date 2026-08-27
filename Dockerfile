@@ -36,7 +36,9 @@ RUN apt-get update \
 
 COPY --from=build /workspace/mento/package.json ./package.json
 COPY --from=build /workspace/mento/package-lock.json ./package-lock.json
-RUN npm ci --omit=dev --ignore-scripts
+RUN npm ci --omit=dev --ignore-scripts \
+	&& npm cache clean --force \
+	&& rm -rf /root/.npm
 
 COPY --from=build /workspace/mento/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /workspace/mento/node_modules/@prisma/client ./node_modules/@prisma/client

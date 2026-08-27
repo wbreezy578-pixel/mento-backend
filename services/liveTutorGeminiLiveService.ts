@@ -1,4 +1,4 @@
-import { GoogleGenAI, Modality, type Session } from '@google/genai';
+import { EndSensitivity, GoogleGenAI, Modality, StartSensitivity, type Session } from '@google/genai';
 import { getGeminiApiKey, loadAndValidateEnvironment } from '../lib/env';
 import logger from '../lib/logger';
 import { recordLiveTutorVoiceEvent } from './liveTutorVoiceTelemetry';
@@ -301,9 +301,13 @@ export async function createGeminiLiveSession(options: {
         outputAudioTranscription: {},
         realtimeInputConfig: {
           automaticActivityDetection: {
-              // Preserve a learner's turn across ordinary thinking pauses in a
-              // long spoken question while keeping response latency natural.
-              silenceDurationMs: 950,
+              disabled: false,
+              startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+              endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
+              prefixPaddingMs: 20,
+              // Google's recommended 500–800 ms range keeps normal thinking
+              // pauses intact without making a live reply feel unresponsive.
+              silenceDurationMs: 600,
           },
         },
       },

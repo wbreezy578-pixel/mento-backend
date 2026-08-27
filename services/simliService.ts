@@ -36,6 +36,7 @@ const simliBreaker = getCircuitBreaker('simli', 3, 30000);
 const simliProviderOptions = getProviderRetryOptions('simli');
 
 const activeSessions = new Map<string, SessionRecord>();
+const terminalFinalizations = new Map<string, Promise<void>>();
 const LIVE_TUTOR_PROCESS_ID = `live-tutor-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 const INACTIVITY_TIMEOUT_MS = LIVE_TUTOR_INACTIVITY_TIMEOUT_MS;
@@ -259,7 +260,7 @@ export async function createSimliStreamingAvatarSession(options: {
   avatarVoiceProfile?: LiveTutorVoiceProfile;
 } = {}): Promise<SimliStreamingSession> {
   const existing = findSessionByUser(options.userId);
-  if (existing) {
+  if (existing && existing.billingRequestId === options.requestId) {
     saveSession({
       ...existing,
       lastHeartbeatAt: new Date().toISOString(),
@@ -275,6 +276,17 @@ export async function createSimliStreamingAvatarSession(options: {
       status: existing.status,
       avatarVoiceProfile: existing.avatarVoiceProfile,
     };
+  }
+  if (existing) {
+    // A successful durable claim means no previous session is genuinely active.
+    // Never let a stale process-local Simli token override that new claim.
+    removeSession(existing.streamId);
+    logger.info('[LiveTutorLifecycle] stale_process_session_removed', {
+      streamId: existing.streamId,
+      userId: options.userId,
+      reason: 'new_billing_request_claimed',
+      category: 'live_tutor_lifecycle',
+    });
   }
 
   const { apiKey, avatarId } = requireSimliConfig();
@@ -502,11 +514,33 @@ export async function completeSimliSessionLifecycle(streamId: string, options: {
   reason?: string;
   finalizationClaimedAt?: Date;
 }, userId?: string): Promise<void> {
+  const existing = terminalFinalizations.get(streamId);
+  if (existing) {
+    await existing;
+    return;
+  }
+
+  const operation = completeSimliSessionLifecycleInternal(streamId, options, userId);
+  terminalFinalizations.set(streamId, operation);
+  try {
+    await operation;
+  } finally {
+    if (terminalFinalizations.get(streamId) === operation) terminalFinalizations.delete(streamId);
+  }
+}
+
+async function completeSimliSessionLifecycleInternal(streamId: string, options: {
+  status: 'completed' | 'failed' | 'disconnected';
+  secondsUsed?: number;
+  reason?: string;
+  finalizationClaimedAt?: Date;
+}, userId?: string): Promise<void> {
   const session = getSession(streamId);
   const durable = await prisma.liveTutorSession.findUnique({ where: { streamId } });
   if (!durable || (userId && durable.userId !== userId)) throw buildSimliError('Live Tutor session not found.', 404);
   if (durable.billingFinalized) {
     logger.info('[LiveTutorLifecycle] terminal_finalize_duplicate', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'already_finalized', previousStatus: durable.status, resultingStatus: durable.status, category: 'live_tutor_lifecycle' });
+    await closeRealtimeSession(streamId);
     return;
   }
   const terminalStatus = durable.terminalStatus ?? options.status;
@@ -533,6 +567,7 @@ export async function completeSimliSessionLifecycle(streamId: string, options: {
       terminalStatus: committed.terminalStatus,
       category: 'live_tutor_lifecycle',
     });
+    await closeRealtimeSession(streamId);
     return;
   }
   if (!session) logger.warn('Live Tutor session is not in this process; finalizing from durable ledger', { streamId, userId: durable.userId, category: 'live_tutor_durable_reconciliation' });
@@ -571,6 +606,7 @@ export async function completeSimliSessionLifecycle(streamId: string, options: {
         terminalStatus: committed.terminalStatus,
         category: 'live_tutor_lifecycle',
       });
+      await closeRealtimeSession(streamId);
       return;
     }
     logger.info('[LiveTutorLifecycle] terminal_finalize_duplicate', { streamId, sessionId: durable.id, userId: durable.userId, reason: 'finalization_in_progress_or_terminal', previousStatus: durable.status, resultingStatus: durable.status, category: 'live_tutor_lifecycle' });

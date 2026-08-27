@@ -59,11 +59,17 @@ describe('Gemini Live PCM lifecycle', () => {
     geminiConnectOptions = undefined;
   });
 
-  it('waits through a natural pause before ending the learner turn', async () => {
+  it('uses responsive VAD without cutting off ordinary learner pauses', async () => {
     const { closeGeminiLiveSession, createGeminiLiveSession } = await import('./liveTutorGeminiLiveService');
     const session = await createGeminiLiveSession({ streamId: 'stream-vad' });
 
-    expect(geminiConnectOptions.config.realtimeInputConfig.automaticActivityDetection.silenceDurationMs).toBe(950);
+    expect(geminiConnectOptions.config.realtimeInputConfig.automaticActivityDetection).toEqual({
+      disabled: false,
+      startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+      endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
+      prefixPaddingMs: 20,
+      silenceDurationMs: 600,
+    });
 
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });

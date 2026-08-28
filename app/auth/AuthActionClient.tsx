@@ -61,6 +61,8 @@ export default function AuthActionClient({ action, token, mobileScheme }: {
   const [message, setMessage] = useState(token ? '' : 'This link is incomplete. Request a new email from Mento.');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const appLink = useMemo(
     () => `${mobileScheme.replace(/:\/\/$/, '')}://auth/login?status=${encodeURIComponent(copy.appStatus)}`,
     [copy.appStatus, mobileScheme],
@@ -119,29 +121,51 @@ export default function AuthActionClient({ action, token, mobileScheme }: {
               <>
                 <label style={styles.label}>
                   New password
-                  <input
-                    type="password"
-                    minLength={15}
-                    maxLength={72}
-                    autoComplete="new-password"
-                    required
-                    value={password}
-                    onChange={(event) => setPassword(event.target.value)}
-                    style={styles.input}
-                  />
+                  <span style={styles.passwordField}>
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      minLength={15}
+                      maxLength={72}
+                      autoComplete="new-password"
+                      required
+                      value={password}
+                      onChange={(event) => setPassword(event.target.value)}
+                      style={styles.input}
+                    />
+                    <button
+                      type="button"
+                      aria-label={showPassword ? 'Hide new password' : 'Show new password'}
+                      aria-pressed={showPassword}
+                      onClick={() => setShowPassword((visible) => !visible)}
+                      style={styles.visibilityButton}
+                    >
+                      <EyeIcon hidden={showPassword} />
+                    </button>
+                  </span>
                 </label>
                 <label style={styles.label}>
                   Confirm new password
-                  <input
-                    type="password"
-                    minLength={15}
-                    maxLength={72}
-                    autoComplete="new-password"
-                    required
-                    value={confirmPassword}
-                    onChange={(event) => setConfirmPassword(event.target.value)}
-                    style={styles.input}
-                  />
+                  <span style={styles.passwordField}>
+                    <input
+                      type={showConfirmPassword ? 'text' : 'password'}
+                      minLength={15}
+                      maxLength={72}
+                      autoComplete="new-password"
+                      required
+                      value={confirmPassword}
+                      onChange={(event) => setConfirmPassword(event.target.value)}
+                      style={styles.input}
+                    />
+                    <button
+                      type="button"
+                      aria-label={showConfirmPassword ? 'Hide confirmation password' : 'Show confirmation password'}
+                      aria-pressed={showConfirmPassword}
+                      onClick={() => setShowConfirmPassword((visible) => !visible)}
+                      style={styles.visibilityButton}
+                    >
+                      <EyeIcon hidden={showConfirmPassword} />
+                    </button>
+                  </span>
                 </label>
               </>
             ) : null}
@@ -159,6 +183,16 @@ export default function AuthActionClient({ action, token, mobileScheme }: {
         <p style={styles.footnote}>Mento will never ask you to send this private link to another person.</p>
       </section>
     </main>
+  );
+}
+
+function EyeIcon({ hidden }: { hidden: boolean }) {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z" />
+      <circle cx="12" cy="12" r="2.7" />
+      {hidden ? <path d="m4 4 16 16" /> : null}
+    </svg>
   );
 }
 
@@ -200,7 +234,9 @@ const styles: Record<string, CSSProperties> = {
   description: { margin: '14px 0 26px', color: '#aeb9ca', fontSize: '16px', lineHeight: 1.6 },
   form: { display: 'grid', gap: '16px' },
   label: { display: 'grid', gap: '8px', color: '#dce4ef', fontSize: '14px', fontWeight: 600 },
-  input: { width: '100%', boxSizing: 'border-box', padding: '13px 14px', border: '1px solid #334159', borderRadius: '12px', outline: 'none', background: '#0d1420', color: '#f7f9fc', fontSize: '16px' },
+  passwordField: { position: 'relative', display: 'block' },
+  input: { width: '100%', boxSizing: 'border-box', padding: '13px 48px 13px 14px', border: '1px solid #334159', borderRadius: '12px', outline: 'none', background: '#0d1420', color: '#f7f9fc', fontSize: '16px' },
+  visibilityButton: { position: 'absolute', top: '50%', right: '8px', width: '36px', height: '36px', display: 'grid', placeItems: 'center', transform: 'translateY(-50%)', padding: 0, border: 0, borderRadius: '9px', background: 'transparent', color: '#aeb9ca', cursor: 'pointer' },
   primaryButton: { width: '100%', padding: '14px 18px', border: 0, borderRadius: '12px', background: '#36d4e7', color: '#071015', cursor: 'pointer', fontSize: '16px', fontWeight: 750 },
   primaryLink: { display: 'block', padding: '14px 18px', borderRadius: '12px', background: '#36d4e7', color: '#071015', textAlign: 'center', textDecoration: 'none', fontSize: '16px', fontWeight: 750 },
   error: { margin: '18px 0 0', padding: '12px 14px', border: '1px solid #6d3340', borderRadius: '10px', background: '#27151c', color: '#ffb8c3', fontSize: '14px', lineHeight: 1.45 },

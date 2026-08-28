@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { applyAuthCookies, authRateLimitSubject, buildUserSummary, getClientIp, getUserFromRequest, normalizeEmail, recordSecurityEvent, signToken } from '../app/lib/auth';
-import { createSessionRecord, generateSecureToken } from '../lib/authSession';
+import { applyAuthCookies, authRateLimitSubject, buildUserSummary, getClientIp, getSessionClientIp, getUserFromRequest, normalizeEmail, recordSecurityEvent, signToken } from '../app/lib/auth';
+import { createSessionRecord, generateSecureToken, getRefreshSessionExpiry, REFRESH_SESSION_ABSOLUTE_TTL_MS } from '../lib/authSession';
 import { getSupabaseClientKey, getSupabaseUrl } from '../lib/env';
 import { buildCorsHeaders } from '../lib/securityHeaders';
 import { createAppleAccount, createGoogleOAuthAccount } from './userAccountService';
@@ -86,8 +86,9 @@ export async function exchangeSupabaseOAuth(req: Request, provider: OAuthProvide
       ON CONFLICT ("userId", "privacyVersion", "termsVersion", "aiNoticeVersion") DO NOTHING
     `;
     const refreshToken = generateSecureToken();
-    const sessionExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    const session = await createSessionRecord({ userId: user.id, token: refreshToken, userAgent: req.headers.get('user-agent'), ipAddress: req.headers.get('x-forwarded-for'), expiresAt: sessionExpiresAt });
+    const absoluteExpiresAt = new Date(Date.now() + REFRESH_SESSION_ABSOLUTE_TTL_MS);
+    const sessionExpiresAt = getRefreshSessionExpiry(absoluteExpiresAt);
+    const session = await createSessionRecord({ userId: user.id, token: refreshToken, userAgent: req.headers.get('user-agent'), ipAddress: getSessionClientIp(req), expiresAt: sessionExpiresAt, absoluteExpiresAt });
     const accessToken = signToken(user.id, profile.email, { sessionId: session.id, expiresInSeconds: 15 * 60 });
     await recordSecurityEvent(user.id, 'oauth_login_success', { provider });
     const result = NextResponse.json({ token: accessToken, refreshToken, sessionExpiresAt: sessionExpiresAt.toISOString(), user: buildUserSummary(user) }, { headers: headers(req) });

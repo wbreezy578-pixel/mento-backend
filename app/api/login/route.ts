@@ -1,9 +1,9 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../lib/prisma';
 import logger from '../../../lib/logger';
-import { signToken, normalizeEmail, verifyPassword, buildUserSummary, getLoginPolicyState, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, authRateLimitSubject } from '../../lib/auth';
+import { signToken, normalizeEmail, verifyPassword, buildUserSummary, getLoginPolicyState, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, getSessionClientIp, authRateLimitSubject } from '../../lib/auth';
 import { createNotification } from '../../services/notificationService';
-import { createSessionRecord, generateSecureToken } from '../../../lib/authSession';
+import { createSessionRecord, generateSecureToken, getRefreshSessionExpiry, REFRESH_SESSION_ABSOLUTE_TTL_MS } from '../../../lib/authSession';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
 import { ensureSlidingWindow } from '../../../lib/rateLimiter';
 
@@ -74,13 +74,15 @@ export async function POST(req: Request) {
 
     await resetFailedLoginAttempts(user.id);
     const refreshTokenValue = generateSecureToken();
-    const sessionExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+    const absoluteExpiresAt = new Date(Date.now() + REFRESH_SESSION_ABSOLUTE_TTL_MS);
+    const sessionExpiresAt = getRefreshSessionExpiry(absoluteExpiresAt);
     const session = await createSessionRecord({
       userId: user.id,
       token: refreshTokenValue,
       userAgent: req.headers.get('user-agent') ?? null,
-      ipAddress: req.headers.get('x-forwarded-for') ?? null,
+      ipAddress: getSessionClientIp(req),
       expiresAt: sessionExpiresAt,
+      absoluteExpiresAt,
     });
     const accessToken = signToken(user.id, normalizedEmail, { sessionId: session.id, expiresInSeconds: 15 * 60 });
     await recordSecurityEvent(user.id, 'login_success', { networkSubject: authRateLimitSubject(clientIp) });

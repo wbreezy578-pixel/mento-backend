@@ -11,6 +11,8 @@ export default defineConfig({
       "lib/imageValidator.test.ts",
       "app/api/payments/paymentSecurity.test.ts",
       "lib/authSession.test.ts",
+      "lib/requestMetadata.test.ts",
+      "lib/internalJobAuth.test.ts",
       "lib/realtimeRedis.test.ts",
       "services/liveTutorGeminiLiveService.test.ts",
       "services/geminiService.test.ts",
@@ -23,6 +25,8 @@ export default defineConfig({
       "lib/liveTutorLimits.test.ts",
       "services/liveTutorBillingPolicy.test.ts",
       "services/transactionalEmailService.test.ts",
+      "services/userAccountService.oauth.test.ts",
+      "services/supabaseOAuthService.test.ts",
     ],
     exclude: [
       "node_modules/**",

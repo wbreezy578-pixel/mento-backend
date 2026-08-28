@@ -356,6 +356,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
               name: 'MOBILE_APP_SCHEME'
               value: mobileAppScheme
             }
+            {
+              name: 'TRUSTED_PROXY_PROVIDER'
+              value: 'azure-container-apps'
+            }
           ]
         }
       ]

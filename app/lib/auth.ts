@@ -8,6 +8,7 @@ import { loadAndValidateEnvironment, getJwtSecret as getConfiguredJwtSecret } fr
 import logger from '../../lib/logger';
 import { NextResponse } from 'next/server';
 import type { ResponseCookies } from 'next/dist/server/web/spec-extension/cookies';
+import { getRateLimitClientKey, getTrustedClientIp } from '../../lib/requestMetadata';
 
 loadAndValidateEnvironment();
 const JWT_SECRET = getConfiguredJwtSecret();
@@ -31,7 +32,6 @@ const PASSWORD_MIN_LENGTH = 15;
 const PASSWORD_MAX_BYTES = 72;
 const RECENT_OAUTH_REAUTH_MS = 15 * 60 * 1000;
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
-const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const LOGIN_LOCKOUT_THRESHOLD = 5;
 const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
 const userContext = new AsyncLocalStorage<{ userId: string; sessionId: string } | null>();
@@ -63,9 +63,11 @@ export interface LoginPolicyState {
 }
 
 export function getClientIp(req: Request) {
-  const forwarded = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
-  if (forwarded) return forwarded;
-  return req.headers.get('x-real-ip')?.trim() || '';
+  return getRateLimitClientKey(req.headers);
+}
+
+export function getSessionClientIp(req: Request) {
+  return getTrustedClientIp(req.headers) || null;
 }
 
 export function getLoginPolicyState(user: { failedLoginAttempts?: number | null; lockedAt?: Date | string | null }) {
@@ -264,16 +266,6 @@ export function signToken(userId: string, email: string, options: { sessionId: s
 
   return jwt.sign({ sub: userId, email, sid: options.sessionId, type: 'access' }, jwtSecret, {
     expiresIn: expiresInSeconds,
-    algorithm: JWT_ALGORITHM,
-    issuer: JWT_ISSUER,
-    audience: JWT_AUDIENCE,
-  });
-}
-
-export function signRefreshToken(userId: string, email: string) {
-  const jwtSecret = ensureJwtSecret();
-  return jwt.sign({ sub: userId, email, type: 'refresh' }, jwtSecret, {
-    expiresIn: REFRESH_TOKEN_TTL_SECONDS,
     algorithm: JWT_ALGORITHM,
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,

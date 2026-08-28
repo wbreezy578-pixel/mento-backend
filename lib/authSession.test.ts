@@ -16,7 +16,25 @@ vi.mock('./logger', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { RefreshSessionAlreadyUsedError, rotateRefreshSession } from './authSession';
+import { getRefreshSessionExpiry, isRefreshSessionExpired, REFRESH_SESSION_IDLE_TTL_MS, RefreshSessionAlreadyUsedError, rotateRefreshSession } from './authSession';
+
+describe('refresh session lifetime', () => {
+  it('enforces the rolling idle deadline without exceeding the absolute deadline', () => {
+    const now = new Date('2026-08-28T12:00:00.000Z');
+    const laterAbsoluteDeadline = new Date(now.getTime() + REFRESH_SESSION_IDLE_TTL_MS * 2);
+    expect(getRefreshSessionExpiry(laterAbsoluteDeadline, now).getTime()).toBe(now.getTime() + REFRESH_SESSION_IDLE_TTL_MS);
+
+    const earlierAbsoluteDeadline = new Date(now.getTime() + 60_000);
+    expect(getRefreshSessionExpiry(earlierAbsoluteDeadline, now)).toEqual(earlierAbsoluteDeadline);
+  });
+
+  it('rejects either an idle-expired or absolutely-expired session', () => {
+    const now = new Date('2026-08-28T12:00:00.000Z');
+    expect(isRefreshSessionExpired({ expiresAt: new Date(now.getTime() - 1), absoluteExpiresAt: new Date(now.getTime() + 60_000) }, now)).toBe(true);
+    expect(isRefreshSessionExpired({ expiresAt: new Date(now.getTime() + 60_000), absoluteExpiresAt: new Date(now.getTime() - 1) }, now)).toBe(true);
+    expect(isRefreshSessionExpired({ expiresAt: new Date(now.getTime() + 60_000), absoluteExpiresAt: new Date(now.getTime() + 120_000) }, now)).toBe(false);
+  });
+});
 
 describe('rotateRefreshSession', () => {
   beforeEach(() => {
@@ -38,6 +56,8 @@ describe('rotateRefreshSession', () => {
       userId: 'user-1',
       rotatedToken: 'new-refresh-token',
       expiresAt: new Date(Date.now() + 60_000),
+      familyId: 'family-1',
+      absoluteExpiresAt: new Date(Date.now() + 120_000),
     };
     const results = await Promise.allSettled([
       rotateRefreshSession(input),

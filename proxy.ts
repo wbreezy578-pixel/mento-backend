@@ -2,15 +2,10 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { buildContentSecurityPolicy } from './lib/securityHeaders';
 import { observeMonitoringLatency } from './lib/monitoring';
+import { isHttpsRequestMetadata } from './lib/requestMetadata';
 
-function isHttps(req: NextRequest) {
-  const forwardedProto = req.headers.get('x-forwarded-proto');
-
-  if (forwardedProto) {
-    return forwardedProto.includes('https');
-  }
-
-  return req.nextUrl.protocol === 'https:';
+export function isHttps(req: NextRequest) {
+  return isHttpsRequestMetadata(req.headers.get('x-forwarded-proto'), req.nextUrl.protocol);
 }
 
 export default async function middleware(req: NextRequest) {

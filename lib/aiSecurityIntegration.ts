@@ -24,6 +24,7 @@ import { getAISecurityLayer, AIRequestSecurityContext, SecurityLayerConfig, Secu
 import { getRequestAuditor, SECURITY_EVENTS } from './requestAuditor';
 import { createSecureError, getHttpStatus, formatSecureErrorResponse } from './secureErrorHandler';
 import logger from './logger';
+import { getRateLimitClientKey } from './requestMetadata';
 
 export interface ChatSecurityCheckResult {
   allowed: boolean;
@@ -246,7 +247,7 @@ export async function createSecurityCheckMiddleware(
     // Extract context from request
     const userId = body?.userId || request.headers.get('x-user-id') || 'anonymous';
     const requestId = body?.requestId || `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const ip = request.headers.get('x-forwarded-for')?.split(',')[0] || request.headers.get('x-real-ip') || 'unknown';
+    const ip = getRateLimitClientKey(request.headers);
 
     const result = await assessAndSecureChatRequest(userInput, { userId, requestId, ip });
 

@@ -2,6 +2,20 @@ import crypto from 'node:crypto';
 import { prisma } from './prisma';
 import { createHash } from 'node:crypto';
 
+export const REFRESH_SESSION_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const REFRESH_SESSION_ABSOLUTE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+
+export function getRefreshSessionExpiry(absoluteExpiresAt: Date, now = new Date()): Date {
+  return new Date(Math.min(now.getTime() + REFRESH_SESSION_IDLE_TTL_MS, absoluteExpiresAt.getTime()));
+}
+
+export function isRefreshSessionExpired(
+  session: { expiresAt: Date; absoluteExpiresAt: Date },
+  now = new Date(),
+): boolean {
+  return session.expiresAt.getTime() <= now.getTime() || session.absoluteExpiresAt.getTime() <= now.getTime();
+}
+
 export function hashToken(token: string) {
   return createHash('sha256').update(token).digest('hex');
 }
@@ -17,7 +31,7 @@ export async function createSessionRecord(input: {
   absoluteExpiresAt?: Date;
 }) {
   const familyId = input.familyId ?? crypto.randomUUID();
-  const absoluteExpiresAt = input.absoluteExpiresAt ?? new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
+  const absoluteExpiresAt = input.absoluteExpiresAt ?? new Date(Date.now() + REFRESH_SESSION_ABSOLUTE_TTL_MS);
   return prisma.session.create({
     data: {
       userId: input.userId,

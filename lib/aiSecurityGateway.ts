@@ -5,6 +5,7 @@ import { BillingDecision, BillingReservationInput, finalizeUsage, rollbackUsage,
 import { consumeLiveTutorSeconds } from '../services/liveTutorBillingService';
 import logger from './logger';
 import { observeMonitoringLatency } from './monitoring';
+import { getRateLimitClientKey } from './requestMetadata';
 
 export class AIRequestGatewayError extends Error {
   status: number;
@@ -18,11 +19,7 @@ export class AIRequestGatewayError extends Error {
 }
 
 export function getClientIp(req: Request): string {
-  const forwarded = req.headers.get('x-forwarded-for');
-  if (forwarded) return forwarded.split(',')[0].trim();
-  const realIp = req.headers.get('x-real-ip');
-  if (realIp) return realIp;
-  return req.headers.get('host') || 'unknown';
+  return getRateLimitClientKey(req.headers);
 }
 
 export function buildAIRequestId(prefix = 'ai'): string {

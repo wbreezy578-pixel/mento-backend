@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { signToken, normalizeEmail, recordSecurityEvent, buildUserSummary, applyAuthCookies, getClientIp } from '../../../lib/auth';
-import { findSessionByToken, generateSecureToken, RefreshSessionAlreadyUsedError, revokeSessionFamily, rotateRefreshSession } from '../../../../lib/authSession';
+import { signToken, normalizeEmail, recordSecurityEvent, buildUserSummary, applyAuthCookies, getClientIp, getSessionClientIp } from '../../../lib/auth';
+import { findSessionByToken, generateSecureToken, getRefreshSessionExpiry, isRefreshSessionExpired, RefreshSessionAlreadyUsedError, revokeSessionFamily, rotateRefreshSession } from '../../../../lib/authSession';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
 
@@ -33,14 +33,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Session security check failed. Please sign in again.' }, { status: 401 });
     }
 
-    if (sessionRecord.expiresAt.getTime() <= Date.now() || sessionRecord.absoluteExpiresAt.getTime() <= Date.now()) {
+    if (isRefreshSessionExpired(sessionRecord)) {
       return NextResponse.json({ error: 'Refresh token expired' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     const user = sessionRecord.user;
     if (!user.emailVerified || user.accountStatus !== 'ACTIVE') return NextResponse.json({ error: 'Account is not active.' }, { status: 403 });
     const rotatedRefreshToken = generateSecureToken();
-    const rollingExpiry = new Date(Math.min(Date.now() + 30 * 24 * 60 * 60 * 1000, sessionRecord.absoluteExpiresAt.getTime()));
+    const rollingExpiry = getRefreshSessionExpiry(sessionRecord.absoluteExpiresAt);
 
     const newSession = await rotateRefreshSession({
       sessionId: sessionRecord.id,
@@ -48,7 +48,7 @@ export async function POST(req: Request) {
       rotatedToken: rotatedRefreshToken,
       expiresAt: rollingExpiry,
       userAgent: req.headers.get('user-agent') ?? null,
-      ipAddress: req.headers.get('x-forwarded-for') ?? null,
+      ipAddress: getSessionClientIp(req),
       familyId: sessionRecord.familyId,
       absoluteExpiresAt: sessionRecord.absoluteExpiresAt,
     });

@@ -32,6 +32,7 @@ const PASSWORD_MIN_LENGTH = 15;
 const PASSWORD_MAX_BYTES = 72;
 const RECENT_OAUTH_REAUTH_MS = 15 * 60 * 1000;
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
+const REFRESH_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 const LOGIN_LOCKOUT_THRESHOLD = 5;
 const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
 const userContext = new AsyncLocalStorage<{ userId: string; sessionId: string } | null>();
@@ -299,7 +300,7 @@ export function applyAuthCookies(
   }));
   response.cookies.set('mento_refresh_token', params.refreshToken, buildAuthCookieOptions({
     isProduction: params.isProduction,
-    maxAgeSeconds: params.refreshMaxAgeSeconds ?? REFRESH_TOKEN_TTL_SECONDS,
+    maxAgeSeconds: params.refreshMaxAgeSeconds ?? REFRESH_COOKIE_MAX_AGE_SECONDS,
     path: params.path,
   }));
   return response;

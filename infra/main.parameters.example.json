@@ -37,6 +37,7 @@
     "retentionJobSecret": { "value": "SET_AT_DEPLOYMENT_TIME" },
     "resendApiKey": { "value": "SET_AT_DEPLOYMENT_TIME" },
     "authEmailFrom": { "value": "Mento <auth@updates.yourdomain.com>" },
+    "authWebBaseUrl": { "value": "https://auth.yourdomain.com" },
     "mobileAppScheme": { "value": "mentomobile" }
   }
 }

@@ -9,7 +9,7 @@ import { loadEnvironmentFromDotEnv } from './env.ts';
 test('loadEnvironmentFromDotEnv merges values from .env when .env.local exists', () => {
   const originalCwd = process.cwd();
   const originalEnv: Record<string, string | undefined> = {};
-  const keys = ['DATABASE_URL', 'DIRECT_URL', 'JWT_SECRET', 'GEMINI_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY', 'PAYMENT_WEBHOOK_AUTH_SECRET'];
+  const keys = ['DATABASE_URL', 'DIRECT_URL', 'JWT_SECRET', 'GEMINI_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_ANON_KEY', 'PAYMENT_WEBHOOK_AUTH_SECRET', 'AUTH_WEB_BASE_URL'];
 
   for (const key of keys) {
     originalEnv[key] = process.env[key];
@@ -31,6 +31,7 @@ test('loadEnvironmentFromDotEnv merges values from .env when .env.local exists',
       'SUPABASE_SERVICE_ROLE_KEY=service-role-key',
       'SUPABASE_ANON_KEY=anon-key',
       'PAYMENT_WEBHOOK_AUTH_SECRET=webhook-secret',
+      'AUTH_WEB_BASE_URL=https://auth.example.com',
     ].join('\n'));
 
     process.chdir(tempDir);
@@ -40,6 +41,7 @@ test('loadEnvironmentFromDotEnv merges values from .env when .env.local exists',
     assert.equal(process.env.DIRECT_URL, 'postgresql://direct-user:direct-pass@localhost:5432/directdb');
     assert.equal(process.env.JWT_SECRET, 'local-secret');
     assert.equal(process.env.GEMINI_API_KEY, 'gemini-key');
+    assert.equal(process.env.AUTH_WEB_BASE_URL, 'https://auth.example.com');
   } finally {
     process.chdir(originalCwd);
     for (const key of keys) {

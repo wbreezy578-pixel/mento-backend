@@ -21,6 +21,7 @@ RUN DATABASE_URL=postgresql://build:build@localhost:5432/build \
 	PAYMENT_WEBHOOK_AUTH_SECRET=build-only-placeholder \
 	SIMLI_API_KEY=build-only-placeholder \
 	SIMLI_AVATAR_ID=build-only-placeholder \
+	AUTH_WEB_BASE_URL=https://build-only.invalid \
 	npm run build
 
 FROM node:22-bookworm-slim AS runtime

@@ -50,6 +50,7 @@ param retentionJobSecret string = ''
 @secure()
 param resendApiKey string = ''
 param authEmailFrom string = ''
+param authWebBaseUrl string = ''
 param mobileAppScheme string = 'mentomobile'
 
 resource logAnalyticsWorkspace 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
@@ -346,6 +347,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'AUTH_EMAIL_FROM'
               value: authEmailFrom
+            }
+            {
+              name: 'AUTH_WEB_BASE_URL'
+              value: authWebBaseUrl
             }
             {
               name: 'MOBILE_APP_SCHEME'

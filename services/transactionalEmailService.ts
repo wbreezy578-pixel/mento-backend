@@ -6,9 +6,12 @@ function required(name: string) {
   return value;
 }
 
-function mobileLink(path: string, token: string) {
-  const scheme = (process.env.MOBILE_APP_SCHEME?.trim() || 'mentomobile').replace(/:\/\/$/, '');
-  return `${scheme}://${path}?token=${encodeURIComponent(token)}`;
+export function buildAuthWebLink(path: 'verify-email' | 'reset-password' | 'confirm-email-change', token: string) {
+  const baseUrl = required('AUTH_WEB_BASE_URL');
+  const url = new URL(`/auth/${path}`, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+  if (url.protocol !== 'https:') throw new Error('AUTH_WEB_BASE_URL must use HTTPS.');
+  url.searchParams.set('token', token);
+  return url.toString();
 }
 
 async function sendEmail(input: { to: string; subject: string; html: string }) {
@@ -31,16 +34,16 @@ function layout(title: string, body: string, link: string, action: string) {
 }
 
 export async function sendVerificationEmail(email: string, token: string) {
-  const link = mobileLink('verify-email', token);
+  const link = buildAuthWebLink('verify-email', token);
   await sendEmail({ to: email, subject: 'Verify your Mento email', html: layout('Verify your email', 'Confirm this email address to finish creating your Mento account.', link, 'Verify email') });
 }
 
 export async function sendPasswordResetEmail(email: string, token: string) {
-  const link = mobileLink('reset-password', token);
+  const link = buildAuthWebLink('reset-password', token);
   await sendEmail({ to: email, subject: 'Reset your Mento password', html: layout('Reset your password', 'Use this secure link to choose a new Mento password.', link, 'Reset password') });
 }
 
 export async function sendEmailChangeConfirmation(email: string, token: string) {
-  const link = mobileLink('confirm-email-change', token);
+  const link = buildAuthWebLink('confirm-email-change', token);
   await sendEmail({ to: email, subject: 'Confirm your new Mento email', html: layout('Confirm your new email', 'Confirm this address before Mento changes the email on your account.', link, 'Confirm new email') });
 }

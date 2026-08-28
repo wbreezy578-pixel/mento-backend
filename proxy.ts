@@ -28,8 +28,12 @@ export default async function middleware(req: NextRequest) {
   response.headers.set('X-Content-Type-Options', 'nosniff');
   response.headers.set(
     'Referrer-Policy',
-    'strict-origin-when-cross-origin'
+    req.nextUrl.pathname.startsWith('/auth/') ? 'no-referrer' : 'strict-origin-when-cross-origin'
   );
+  if (req.nextUrl.pathname.startsWith('/auth/')) {
+    response.headers.set('Cache-Control', 'no-store, max-age=0');
+    response.headers.set('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  }
   response.headers.set('X-Frame-Options', 'DENY');
   response.headers.set(
     'Permissions-Policy',

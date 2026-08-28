@@ -22,10 +22,14 @@ export default defineConfig({
       "lib/legalConsent.test.ts",
       "lib/liveTutorLimits.test.ts",
       "services/liveTutorBillingPolicy.test.ts",
+      "services/transactionalEmailService.test.ts",
     ],
     exclude: [
       "node_modules/**",
       "scripts/**",
     ],
+    env: {
+      AUTH_WEB_BASE_URL: "https://auth.test.invalid",
+    },
   },
 });

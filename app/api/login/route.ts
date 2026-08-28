@@ -8,7 +8,7 @@ import { buildCorsHeaders } from '../../../lib/securityHeaders';
 import { ensureSlidingWindow } from '../../../lib/rateLimiter';
 
 const CORS_METHODS = 'POST, OPTIONS';
-const LOGIN_FAILURE_MESSAGE = 'Unable to sign in. Check your credentials and email verification status.';
+const LOGIN_FAILURE_MESSAGE = 'Unable to sign in. Check your email and password.';
 
 export async function OPTIONS(req: Request) {
   const corsHeaders = buildCorsHeaders(req.headers.get('origin'));
@@ -44,17 +44,6 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    if (!user.emailVerified || user.accountStatus !== 'ACTIVE') {
-      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
-    }
-
-    const loginPolicy = getLoginPolicyState(user);
-    if (!loginPolicy.allowed) {
-      await verifyPassword(String(password), user.password);
-      await recordSecurityEvent(user.id, 'login_blocked', { reason: loginPolicy.reason });
-      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
-    }
-
     const passwordFieldExists = typeof user.password === 'string' && user.password.trim().length > 0;
 
     if (!passwordFieldExists) {
@@ -62,6 +51,48 @@ export async function POST(req: Request) {
         { error: LOGIN_FAILURE_MESSAGE },
         { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } }
       );
+    }
+
+    if (!user.emailVerified) {
+      const passwordMatches = await verifyPassword(String(password), user.password);
+      if (passwordMatches && user.accountStatus === 'UNVERIFIED') {
+        await recordSecurityEvent(user.id, 'login_blocked', { reason: 'email_not_verified' });
+        return NextResponse.json(
+          { error: 'Verify your email before signing in.', code: 'email_not_verified' },
+          { status: 403, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } }
+        );
+      }
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }
+
+    if (user.accountStatus !== 'ACTIVE') {
+      await verifyPassword(String(password), user.password);
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }
+
+    const loginPolicy = getLoginPolicyState(user);
+    if (!loginPolicy.allowed) {
+      const passwordMatches = await verifyPassword(String(password), user.password);
+      await recordSecurityEvent(user.id, 'login_blocked', { reason: loginPolicy.reason });
+      if (passwordMatches) {
+        const retryAfterSeconds = Math.max(1, loginPolicy.lockoutRemainingSeconds);
+        return NextResponse.json(
+          {
+            error: `This account is temporarily locked. Try again in ${Math.ceil(retryAfterSeconds / 60)} minute${retryAfterSeconds > 60 ? 's' : ''}.`,
+            code: 'account_locked',
+            retryAfterSeconds,
+          },
+          {
+            status: 423,
+            headers: {
+              ...buildCorsHeaders(req.headers.get('origin')),
+              'Access-Control-Allow-Methods': CORS_METHODS,
+              'Retry-After': String(retryAfterSeconds),
+            },
+          }
+        );
+      }
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     const match = await verifyPassword(password, user.password);

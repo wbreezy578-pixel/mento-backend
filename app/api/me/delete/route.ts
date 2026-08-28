@@ -1,16 +1,12 @@
 import { NextResponse } from 'next/server';
-import type { Prisma } from '@prisma/client';
-import { prisma } from '../../../../lib/prisma';
 import logger from '../../../../lib/logger';
 import { getUserFromRequest, verifyPassword, getSensitiveActionRequirements, recordSecurityEvent } from '../../../lib/auth';
 import { resolveDeletionCredential } from '../../../lib/accountDeletion';
-import { revokeAllUserSessions } from '../../../../lib/authSession';
-import { cancelPaddleSubscriptionForAccountDeletion } from '../../../../services/paddleService';
-import { cancelGooglePlaySubscriptionsForAccountDeletion } from '../../../../services/nativeStoreService';
-import { deleteSupabaseAuthUser } from '../../../../services/supabaseAdminService';
+import { AccountDeletionPendingError, beginAccountDeletion, processAccountDeletionJob } from '../../../../services/accountDeletionService';
+import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
 
-function buildDeletionResponse() {
-  const response = NextResponse.json({ success: true, deleted: true });
+function buildDeletionResponse(input: { deleted: boolean; pending?: boolean; status?: number }) {
+  const response = NextResponse.json({ success: true, deleted: input.deleted, deletionPending: Boolean(input.pending) }, { status: input.status ?? 200 });
   response.cookies.set('mento_access_token', '', { path: '/', maxAge: 0, httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
   response.cookies.set('mento_refresh_token', '', { path: '/', maxAge: 0, httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production' });
   return response;
@@ -24,9 +20,8 @@ export async function POST(req: Request) {
     }
 
     const body = await req.json().catch(() => ({}));
-    const { password, googleAccessToken, confirmPassword, confirmationText } = body as {
+    const { password, confirmPassword, confirmationText } = body as {
       password?: string;
-      googleAccessToken?: string;
       confirmPassword?: string;
       confirmationText?: string;
     };
@@ -37,8 +32,8 @@ export async function POST(req: Request) {
     }
 
     const credential = await resolveDeletionCredential(
-      { password, googleAccessToken },
-      { authProvider: user.authProvider, email: user.email, lastOAuthReauthAt: user.lastOAuthReauthAt }
+      { password },
+      { authProvider: user.authProvider, oauthProvider: user.oauthProvider, email: user.email, lastOAuthReauthAt: user.lastOAuthReauthAt }
     );
 
     if (credential.mode === 'password') {
@@ -53,99 +48,24 @@ export async function POST(req: Request) {
 
     const actionRequirements = getSensitiveActionRequirements(user);
     if (actionRequirements.requiresRecentOAuthReauth) {
-      const providerName = user.authProvider === 'apple' ? 'Apple' : 'Google';
+      const providerName = user.oauthProvider === 'apple' ? 'Apple' : 'Google';
       return NextResponse.json({ error: `Please sign in with ${providerName} again before deleting your account.` }, { status: 403 });
     }
+    const limit = await ensureSlidingWindow(`account-delete:${user.id}`, 3, 60 * 60);
+    if (!limit.ok) return NextResponse.json({ error: 'Too many account deletion attempts. Please try again later.' }, { status: 429 });
 
-    const billingWallet = await prisma.userWallet.findUnique({
-      where: { userId: user.id },
-      select: { paddleSubscriptionId: true },
-    });
-    if (billingWallet?.paddleSubscriptionId) {
-      await cancelPaddleSubscriptionForAccountDeletion(billingWallet.paddleSubscriptionId);
+    const job = await beginAccountDeletion(user.id);
+    await recordSecurityEvent(user.id, 'account_deletion_requested', { deletionMode: credential.mode });
+    try {
+      await processAccountDeletionJob(job.id);
+      await recordSecurityEvent(null, 'account_deleted', { deletionJobId: job.id, deletionMode: credential.mode });
+      return buildDeletionResponse({ deleted: true });
+    } catch (error) {
+      if (error instanceof AccountDeletionPendingError) {
+        return buildDeletionResponse({ deleted: false, pending: true, status: 202 });
+      }
+      throw error;
     }
-    await cancelGooglePlaySubscriptionsForAccountDeletion(user.id);
-    if (user.supabaseUserId) await deleteSupabaseAuthUser(user.supabaseUserId);
-
-    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      const targetUser = await tx.user.findUnique({ where: { id: user.id } });
-      if (!targetUser) {
-        throw new Error('User not found');
-      }
-
-      await tx.session.updateMany({
-        where: { userId: user.id, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-
-      const succeededPayments = await tx.paymentTransaction.findMany({
-        where: { userId: user.id, status: 'SUCCEEDED' },
-        select: { id: true },
-      });
-      const preservedPaymentTransactionIds = succeededPayments.map(({ id }) => id);
-
-      if (preservedPaymentTransactionIds.length > 0) {
-        await tx.paymentTransaction.updateMany({
-          where: { id: { in: preservedPaymentTransactionIds } },
-          data: {
-            userId: null,
-            metadata: {} as Prisma.InputJsonValue,
-            providerPayload: {} as Prisma.InputJsonValue,
-          },
-        });
-
-        await tx.paymentReceipt.updateMany({
-          where: { transactionId: { in: preservedPaymentTransactionIds } },
-          data: {
-            userId: null,
-            payload: {} as Prisma.InputJsonValue,
-          },
-        });
-
-        await tx.paymentLedgerEntry.updateMany({
-          where: { transactionId: { in: preservedPaymentTransactionIds } },
-          data: {
-            userId: null,
-            metadata: {} as Prisma.InputJsonValue,
-          },
-        });
-      }
-
-      const conversationIds = await tx.conversation.findMany({
-        where: { userId: user.id },
-        select: { id: true },
-      });
-
-      const conversationIdList = conversationIds.map(({ id }: { id: string }) => id);
-      if (conversationIdList.length > 0) {
-        await tx.conversationMessage.deleteMany({ where: { conversationId: { in: conversationIdList } } });
-      }
-
-      await tx.notification.deleteMany({ where: { userId: user.id } });
-      await tx.notificationPreference.deleteMany({ where: { userId: user.id } });
-      await tx.userSetting.deleteMany({ where: { userId: user.id } });
-      await tx.conversation.deleteMany({ where: { userId: user.id } });
-      await tx.userWallet.deleteMany({ where: { userId: user.id } });
-      await tx.liveTutorWallet.deleteMany({ where: { userId: user.id } });
-      await tx.usageLog.deleteMany({ where: { userId: user.id } });
-      await tx.paymentLedgerEntry.deleteMany({ where: { userId: user.id } });
-      await tx.paymentReceipt.deleteMany({ where: { userId: user.id } });
-      await tx.paymentTransaction.deleteMany({ where: { userId: user.id } });
-      await tx.securityEvent.deleteMany({ where: { userId: user.id } });
-
-      await tx.user.delete({ where: { id: user.id } });
-    });
-
-    await revokeAllUserSessions(user.id);
-    await recordSecurityEvent(null, 'account_deleted', {
-      userId: user.id,
-      deletedAt: new Date().toISOString(),
-      deletionMode: credential.mode,
-      gdprStyleDeletion: true,
-      revokedSessions: true,
-    });
-
-    return buildDeletionResponse();
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Account deletion failed.';
     logger.error('Account deletion failed', { error });
@@ -154,7 +74,7 @@ export async function POST(req: Request) {
       if (/incorrect password/i.test(message)) {
         return NextResponse.json({ error: message }, { status: 401 });
       }
-      if (/password confirmation|type "delete my account" to confirm|google re-authentication failed|google re-authentication is only supported|google re-authentication token does not match|oauth-linked accounts require/i.test(message)) {
+      if (/password confirmation|type "delete my account" to confirm|oauth-linked accounts require/i.test(message)) {
         return NextResponse.json({ error: message }, { status: 400 });
       }
       if (/please re-authenticate with google recently|google-linked accounts require a recent google re-authentication|please sign in with apple again/i.test(message)) {
@@ -162,6 +82,6 @@ export async function POST(req: Request) {
       }
     }
 
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: 'Unable to begin account deletion right now.' }, { status: 500 });
   }
 }

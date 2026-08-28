@@ -118,7 +118,7 @@ async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateU
   });
 
   if (existingUser) {
-    const updateData: { name?: string | null; emailVerified?: boolean; lastOAuthReauthAt?: Date } = {};
+    const updateData: { name?: string | null; emailVerified?: boolean; lastOAuthReauthAt?: Date; oauthProvider?: string } = {};
     const userName = sanitizeDisplayName(input.name);
     if (!existingUser.name && userName) {
       updateData.name = userName;
@@ -133,6 +133,7 @@ async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateU
     if ((authProvider === 'google' || authProvider === 'apple' || authProvider === 'admin') && !existingUser.lastOAuthReauthAt) {
       updateData.lastOAuthReauthAt = new Date();
     }
+    if (authProvider === 'google' || authProvider === 'apple') updateData.oauthProvider = authProvider;
 
     let updatedUser = existingUser;
     if (Object.keys(updateData).length > 0) {
@@ -172,6 +173,7 @@ async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateU
         password: resolvedPassword,
         name: userName,
         authProvider,
+        oauthProvider: authProvider === 'google' || authProvider === 'apple' ? authProvider : null,
         lastOAuthReauthAt,
         emailVerified,
         supabaseUserId: input.externalUserId ?? null,
@@ -246,7 +248,11 @@ async function createOAuthAccount(input: CreateUserAccountInput, provider: 'goog
         supabaseUserId: input.externalUserId,
         password: wasUnverifiedPasswordAccount ? '' : existingUser.password,
         authProvider: wasUnverifiedPasswordAccount || !existingUser.password?.trim() ? provider : 'mixed',
+        oauthProvider: provider,
         credentialsChangedAt: wasUnverifiedPasswordAccount ? new Date() : existingUser.credentialsChangedAt,
+        failedLoginAttempts: 0,
+        lastFailedLoginAt: null,
+        lockedAt: null,
       },
     });
     return buildAccountResult(updatedUser, false);

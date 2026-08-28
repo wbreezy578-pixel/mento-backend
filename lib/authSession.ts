@@ -1,7 +1,6 @@
 import crypto from 'node:crypto';
 import { prisma } from './prisma';
 import { createHash } from 'node:crypto';
-import logger from './logger';
 
 export function hashToken(token: string) {
   return createHash('sha256').update(token).digest('hex');
@@ -79,19 +78,11 @@ export async function consumePasswordResetToken(token: string) {
 
 export async function findSessionByToken(token: string) {
   const tokenHash = hashToken(token);
-  const tokenFingerprint = tokenHash.slice(0, 12);
-  logger.info('findSessionByToken: lookup', { tokenFingerprint });
   const session = await prisma.session.findFirst({
     where: { tokenHash },
     include: { user: true },
   });
 
-  if (!session) {
-    logger.info('findSessionByToken: no match', { tokenFingerprint });
-    return null;
-  }
-
-  logger.info('findSessionByToken: matched', { sessionId: session.id, userId: session.userId, expiresAt: session.expiresAt?.toISOString(), replacedBySessionId: session.replacedBySessionId ?? null });
   return session;
 }
 

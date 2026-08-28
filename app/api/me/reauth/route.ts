@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '../../../../lib/prisma';
 import logger from '../../../../lib/logger';
-import { getUserFromRequest, normalizeEmail, verifyPassword, hashPassword } from '../../../lib/auth';
+import { getUserFromRequest, recordSecurityEvent, verifyPassword } from '../../../lib/auth';
+import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
 
 export async function POST(req: Request) {
   try {
@@ -9,6 +9,8 @@ export async function POST(req: Request) {
     if (!user) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
+    const limit = await ensureSlidingWindow(`password-reauth:${user.id}`, 5, 15 * 60);
+    if (!limit.ok) return NextResponse.json({ error: 'Too many confirmation attempts. Please try again later.' }, { status: 429 });
 
     const { password } = await req.json();
     if (typeof password !== 'string' || !password.trim()) {
@@ -17,20 +19,14 @@ export async function POST(req: Request) {
 
     const passwordMatches = await verifyPassword(password, user.password);
     if (!passwordMatches) {
+      await recordSecurityEvent(user.id, 'password_reauthentication_rejected');
       return NextResponse.json({ error: 'Incorrect password.' }, { status: 401 });
     }
 
-    const normalizedEmail = normalizeEmail(user.email);
-    const hashed = await hashPassword(password);
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { password: hashed, email: normalizedEmail, lastOAuthReauthAt: new Date() },
-    });
-
+    await recordSecurityEvent(user.id, 'password_reauthentication_completed');
     return NextResponse.json({ success: true });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'OAuth reauthentication failed.';
-    logger.error('OAuth reauth failed', { error });
-    return NextResponse.json({ error: message }, { status: 500 });
+    logger.error('Password reauthentication failed', { error });
+    return NextResponse.json({ error: 'Unable to confirm your password right now.' }, { status: 500 });
   }
 }

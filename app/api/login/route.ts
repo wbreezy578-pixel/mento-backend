@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../lib/prisma';
 import logger from '../../../lib/logger';
-import { signToken, normalizeEmail, verifyPassword, buildUserSummary, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, authRateLimitSubject } from '../../lib/auth';
+import { signToken, normalizeEmail, verifyPassword, buildUserSummary, getLoginPolicyState, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, authRateLimitSubject } from '../../lib/auth';
 import { createNotification } from '../../services/notificationService';
 import { createSessionRecord, generateSecureToken } from '../../../lib/authSession';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
@@ -11,9 +11,6 @@ const CORS_METHODS = 'POST, OPTIONS';
 const LOGIN_FAILURE_MESSAGE = 'Unable to sign in. Check your credentials and email verification status.';
 
 export async function OPTIONS(req: Request) {
-  logger.info('Login OPTIONS preflight', {
-    origin: req.headers.get('origin'),
-  });
   const corsHeaders = buildCorsHeaders(req.headers.get('origin'));
   return new NextResponse(null, {
     status: 204,
@@ -25,10 +22,6 @@ export async function OPTIONS(req: Request) {
 }
 
 export async function POST(req: Request) {
-  logger.info('Login POST received', {
-    origin: req.headers.get('origin'),
-  });
-
   try {
     const { email, password } = await req.json();
     const normalizedEmail = normalizeEmail(email);
@@ -47,8 +40,7 @@ export async function POST(req: Request) {
     });
     if (!user) {
       await verifyPassword(String(password), '$2b$12$C6UzMDM.H6dfI/f/IKcEe.8jO4KQWv6q6Qp2kCB2Q9d8qQ0N9cF8K');
-      logger.info('Login lookup result', { found: false });
-      await recordSecurityEvent(null, 'login_failed', { email: normalizedEmail, reason: 'user_not_found' });
+      await recordSecurityEvent(null, 'login_failed', { accountSubject: authRateLimitSubject(normalizedEmail), reason: 'user_not_found' });
       return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
@@ -56,9 +48,14 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    logger.info('Login lookup result', { found: true, userId: user.id });
+    const loginPolicy = getLoginPolicyState(user);
+    if (!loginPolicy.allowed) {
+      await verifyPassword(String(password), user.password);
+      await recordSecurityEvent(user.id, 'login_blocked', { reason: loginPolicy.reason });
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }
+
     const passwordFieldExists = typeof user.password === 'string' && user.password.trim().length > 0;
-    logger.info('Login password field status', { userId: user.id, passwordFieldExists });
 
     if (!passwordFieldExists) {
       return NextResponse.json(
@@ -68,11 +65,10 @@ export async function POST(req: Request) {
     }
 
     const match = await verifyPassword(password, user.password);
-    logger.info('Login password compare result', { userId: user.id, match });
     if (!match) {
       await incrementFailedLoginAttempts(user.id);
       const clientIp = getClientIp(req);
-      await recordSecurityEvent(user.id, 'login_failed', { email: normalizedEmail, reason: 'invalid_password', ipAddress: clientIp });
+      await recordSecurityEvent(user.id, 'login_failed', { reason: 'invalid_password', networkSubject: authRateLimitSubject(clientIp) });
       return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
@@ -87,7 +83,7 @@ export async function POST(req: Request) {
       expiresAt: sessionExpiresAt,
     });
     const accessToken = signToken(user.id, normalizedEmail, { sessionId: session.id, expiresInSeconds: 15 * 60 });
-    await recordSecurityEvent(user.id, 'login_success', { email: normalizedEmail, ipAddress: clientIp });
+    await recordSecurityEvent(user.id, 'login_success', { networkSubject: authRateLimitSubject(clientIp) });
 
     // best-effort security notification on successful login
     try {
@@ -96,7 +92,7 @@ export async function POST(req: Request) {
         body: `We detected a new sign-in to your account. If this wasn't you, change your password.`,
         type: 'security',
       });
-    } catch (e) {
+    } catch {
       // ignore
     }
 
@@ -113,8 +109,7 @@ export async function POST(req: Request) {
     });
     return response;
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Internal error';
     logger.error('Login error', { error: err });
-    return NextResponse.json({ error: message }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    return NextResponse.json({ error: 'Unable to sign in right now.' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

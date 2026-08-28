@@ -12,10 +12,11 @@ export async function GET(req: Request) {
       id: user.id,
       email: user.email,
       authProvider: user.authProvider,
+      oauthProvider: user.oauthProvider,
       hasPassword: typeof user.password === 'string' && user.password.trim().length > 0,
       emailVerified: Boolean(user.emailVerified),
     });
-  } catch (err) {
+  } catch {
     return NextResponse.json({ error: 'Unable to fetch profile' }, { status: 500 });
   }
 }

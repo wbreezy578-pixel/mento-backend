@@ -88,6 +88,12 @@ test('verifyPassword supports bcrypt and rejects legacy raw passwords', async ()
   assert.equal(await auth.verifyPassword('wrong-password', rawPassword), false);
 });
 
+test('validatePasswordStrength enforces passphrase length and bcrypt byte safety', () => {
+  assert.equal(auth.validatePasswordStrength('short-password').isValid, false);
+  assert.equal(auth.validatePasswordStrength('a secure phrase!').isValid, true);
+  assert.equal(auth.validatePasswordStrength('😀'.repeat(19)).isValid, false);
+});
+
 test('sanitizeForLogging redacts secrets embedded in strings and objects', () => {
   const payload = {
     authorization: 'Bearer super-secret-token',

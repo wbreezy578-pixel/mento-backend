@@ -15,6 +15,7 @@ model User {
   name                   String?
   createdAt              DateTime                @default(now())
   authProvider           String                  @default("email")
+  oauthProvider          String?
   lastOAuthReauthAt      DateTime?
   emailVerified          Boolean                 @default(false)
   supabaseUserId         String?                 @unique
@@ -255,6 +256,24 @@ model SecurityEvent {
   details   Json?
   createdAt DateTime @default(now())
   user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model AccountDeletionJob {
+  id                    String    @id @default(cuid())
+  userId                String    @unique
+  supabaseUserId        String?
+  paddleSubscriptionId  String?
+  status                String    @default("PENDING")
+  attempts              Int       @default(0)
+  lastError             String?
+  paddleCanceledAt      DateTime?
+  googlePlayCanceledAt  DateTime?
+  supabaseDeletedAt     DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+  completedAt           DateTime?
+
+  @@index([status, updatedAt])
 }
 
 model NotificationPreference {

@@ -17,11 +17,6 @@ function getJwtSecret(): string | undefined {
   return resolvedJwtSecret;
 }
 
-function getJwtSecretFingerprint(secret: string | undefined): string | null {
-  if (!secret) return null;
-  return createHash('sha256').update(secret).digest('hex');
-}
-
 function ensureJwtSecret(): string {
   if (!resolvedJwtSecret) {
     throw new Error('JWT_SECRET must be configured');
@@ -37,6 +32,8 @@ const PASSWORD_MAX_BYTES = 72;
 const RECENT_OAUTH_REAUTH_MS = 15 * 60 * 1000;
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
 const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+const LOGIN_LOCKOUT_THRESHOLD = 5;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
 const userContext = new AsyncLocalStorage<{ userId: string; sessionId: string } | null>();
 
 export interface JwtPayload {
@@ -105,29 +102,16 @@ function extractTokenFromRequest(req: Request): { token: string | null; source: 
 }
 
 export async function getUserFromRequest(req: Request) {
-  const authHeader = req.headers.get('authorization')?.trim() || '';
-  const authHeaderExists = authHeader.length > 0;
-  const authScheme = authHeaderExists ? authHeader.split(' ')[0] : 'none';
-  const { token, source: tokenSource } = extractTokenFromRequest(req);
+  const { token } = extractTokenFromRequest(req);
   const tokenPresent = Boolean(token);
-  logger.info('Auth header inspection', { authHeaderExists, authScheme, tokenPresent, tokenSource });
 
   if (!tokenPresent || !token) {
-    logger.warn('Auth rejected: missing token', { tokenSource });
     userContext.enterWith(null);
     return null;
   }
 
-  logger.info('JWT verification started');
   try {
     const jwtSecret = getJwtSecret();
-    logger.info('JWT verification configuration', {
-      jwtSecretConfigured: Boolean(jwtSecret),
-      jwtSecretFingerprint: getJwtSecretFingerprint(jwtSecret),
-      algorithm: JWT_ALGORITHM,
-      issuer: JWT_ISSUER,
-      audience: JWT_AUDIENCE,
-    });
     if (!jwtSecret) {
       logger.warn('JWT_SECRET not configured: auth verification is disabled');
       userContext.enterWith(null);
@@ -138,22 +122,6 @@ export async function getUserFromRequest(req: Request) {
       issuer: JWT_ISSUER,
       audience: JWT_AUDIENCE,
     }) as Partial<JwtPayload>;
-    const decodedUserId = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).sub ?? null : null;
-    const decodedEmail = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).email ?? null : null;
-    const decodedIat = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).iat ?? null : null;
-    const decodedExp = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).exp ?? null : null;
-    logger.info('JWT verification succeeded', {
-      decodedUserId,
-      decodedEmail,
-      decodedIat,
-      decodedExp,
-      algorithm: JWT_ALGORITHM,
-      secretConfigured: Boolean(jwtSecret),
-      nowUnixSeconds: Math.floor(Date.now() / 1000),
-      tokenAgeSeconds: typeof decodedIat === 'number' ? Math.floor(Date.now() / 1000) - decodedIat : null,
-      tokenExpiresInSeconds: typeof decodedExp === 'number' ? decodedExp - Math.floor(Date.now() / 1000) : null,
-    });
-
     if (typeof payload !== 'object' || payload === null || typeof (payload as Partial<JwtPayload>).sub !== 'string' || typeof (payload as Partial<JwtPayload>).email !== 'string' || typeof (payload as Partial<JwtPayload>).sid !== 'string') {
       logger.warn('Auth rejected: invalid JWT payload');
       userContext.enterWith(null);
@@ -167,9 +135,7 @@ export async function getUserFromRequest(req: Request) {
     }
 
     const userId = (payload as JwtPayload).sub;
-    const email = (payload as JwtPayload).email;
     const sessionId = (payload as JwtPayload).sid;
-    logger.info('JWT payload extracted', { userId, email });
 
     const [user, session] = await Promise.all([
       prisma.user.findUnique({ where: { id: userId } }),
@@ -177,7 +143,6 @@ export async function getUserFromRequest(req: Request) {
     ]);
 
     const userFound = Boolean(user);
-    logger.info('User lookup result', { userFound, userId, userEmail: user?.email ?? null });
     const issuedAt = typeof payload.iat === 'number' ? payload.iat * 1000 : 0;
     if (!userFound || !user || !session || user.accountStatus !== 'ACTIVE' || issuedAt < user.credentialsChangedAt.getTime() - 1000) {
       logger.warn('Auth rejected: user lookup failed');
@@ -192,11 +157,9 @@ export async function getUserFromRequest(req: Request) {
     return user;
   } catch (error: unknown) {
     const errorName = error instanceof Error ? error.name : 'UnknownError';
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     const tokenExpired = errorName === 'TokenExpiredError';
     logger.warn('JWT verification failed', {
       errorName,
-      errorMessage,
       tokenPresent,
       tokenExpired,
       algorithm: JWT_ALGORITHM,
@@ -297,17 +260,7 @@ export function buildUserSummary(user: { id: string; email: string; name?: strin
 
 export function signToken(userId: string, email: string, options: { sessionId: string; expiresInSeconds?: number }) {
   const jwtSecret = ensureJwtSecret();
-  const jwtSecretFingerprint = getJwtSecretFingerprint(jwtSecret);
   const expiresInSeconds = options?.expiresInSeconds ?? ACCESS_TOKEN_TTL_SECONDS;
-
-  logger.info('JWT signing configuration', {
-    jwtSecretConfigured: true,
-    jwtSecretFingerprint,
-    algorithm: JWT_ALGORITHM,
-    issuer: JWT_ISSUER,
-    audience: JWT_AUDIENCE,
-    expiresInSeconds,
-  });
 
   return jwt.sign({ sub: userId, email, sid: options.sessionId, type: 'access' }, jwtSecret, {
     expiresIn: expiresInSeconds,
@@ -369,14 +322,17 @@ export async function recordSecurityEvent(userId: string | null, eventType: stri
 }
 
 export async function incrementFailedLoginAttempts(userId: string) {
-  return prisma.user.update({
+  const updated = await prisma.user.update({
     where: { id: userId },
     data: {
       failedLoginAttempts: { increment: 1 },
       lastFailedLoginAt: new Date(),
-      lockedAt: null,
     },
   });
+  if (updated.failedLoginAttempts >= LOGIN_LOCKOUT_THRESHOLD) {
+    return prisma.user.update({ where: { id: userId }, data: { lockedAt: new Date(Date.now() + LOGIN_LOCKOUT_MS) } });
+  }
+  return updated;
 }
 
 export async function resetFailedLoginAttempts(userId: string) {

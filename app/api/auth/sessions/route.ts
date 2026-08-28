@@ -1,6 +1,16 @@
 import { NextResponse } from 'next/server';
 import { getActiveSessionId, getUserFromRequest } from '../../../lib/auth';
 import { prisma } from '../../../../lib/prisma';
+import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
+
+function maskNetworkAddress(value: string | null) {
+  if (!value) return null;
+  const first = value.split(',')[0]?.trim() ?? '';
+  const ipv4 = first.split('.');
+  if (ipv4.length === 4) return `${ipv4[0]}.${ipv4[1]}.*.*`;
+  const ipv6 = first.split(':').filter(Boolean);
+  return ipv6.length > 1 ? `${ipv6.slice(0, 2).join(':')}:…` : null;
+}
 
 export async function GET(req: Request) {
   const user = await getUserFromRequest(req);
@@ -11,6 +21,7 @@ export async function GET(req: Request) {
   const sessions = await prisma.session.findMany({
     where: { userId: user.id },
     orderBy: { createdAt: 'desc' },
+    take: 50,
     select: {
       id: true,
       userAgent: true,
@@ -23,7 +34,7 @@ export async function GET(req: Request) {
   });
 
   const activeSessionId = getActiveSessionId();
-  return NextResponse.json({ sessions: sessions.map((session) => ({ ...session, current: session.id === activeSessionId })) });
+  return NextResponse.json({ sessions: sessions.map((session) => ({ ...session, ipAddress: maskNetworkAddress(session.ipAddress), current: session.id === activeSessionId })) });
 }
 
 export async function DELETE(req: Request) {
@@ -31,11 +42,19 @@ export async function DELETE(req: Request) {
   if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
+  const limit = await ensureSlidingWindow(`sessions:revoke:${user.id}`, 20, 15 * 60);
+  if (!limit.ok) return NextResponse.json({ error: 'Too many session changes. Please try again later.' }, { status: 429 });
 
-  const { sessionId } = await req.json().catch(() => ({ sessionId: null }));
+  const { sessionId, allOther } = await req.json().catch(() => ({ sessionId: null, allOther: false }));
   if (sessionId) {
     await prisma.session.updateMany({
       where: { id: sessionId, userId: user.id },
+      data: { revokedAt: new Date() },
+    });
+  } else if (allOther === true) {
+    const activeSessionId = getActiveSessionId();
+    await prisma.session.updateMany({
+      where: { userId: user.id, revokedAt: null, ...(activeSessionId ? { id: { not: activeSessionId } } : {}) },
       data: { revokedAt: new Date() },
     });
   } else {

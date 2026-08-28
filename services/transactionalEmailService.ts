@@ -29,6 +29,14 @@ async function sendEmail(input: { to: string; subject: string; html: string }) {
   }
 }
 
+function securityNotice(title: string, body: string) {
+  return `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111827"><h1>${escapeHtml(title)}</h1><p>${escapeHtml(body)}</p><p style="font-size:13px;color:#6b7280">If this was not you, contact Mento support immediately.</p></div>`;
+}
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>'"]/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[character] ?? character);
+}
+
 function layout(title: string, body: string, link: string, action: string) {
   return `<div style="font-family:Arial,sans-serif;max-width:560px;margin:auto;color:#111827"><h1>${title}</h1><p>${body}</p><p><a href="${link}" style="display:inline-block;padding:12px 18px;background:#2563eb;color:white;text-decoration:none;border-radius:8px">${action}</a></p><p style="font-size:13px;color:#6b7280">This link expires soon. If you did not request this, you can ignore this email.</p></div>`;
 }
@@ -46,4 +54,20 @@ export async function sendPasswordResetEmail(email: string, token: string) {
 export async function sendEmailChangeConfirmation(email: string, token: string) {
   const link = buildAuthWebLink('confirm-email-change', token);
   await sendEmail({ to: email, subject: 'Confirm your new Mento email', html: layout('Confirm your new email', 'Confirm this address before Mento changes the email on your account.', link, 'Confirm new email') });
+}
+
+export async function sendPasswordChangedEmail(email: string) {
+  await sendEmail({
+    to: email,
+    subject: 'Your Mento password was changed',
+    html: securityNotice('Password changed', 'The password for your Mento account was changed and all existing sessions were signed out.'),
+  });
+}
+
+export async function sendEmailChangedNotice(email: string, newEmail: string) {
+  await sendEmail({
+    to: email,
+    subject: 'Your Mento email address was changed',
+    html: securityNotice('Email address changed', `The email address on your Mento account was changed to ${newEmail}.`),
+  });
 }

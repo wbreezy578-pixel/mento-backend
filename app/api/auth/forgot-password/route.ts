@@ -16,6 +16,7 @@ export async function OPTIONS(req: Request) {
 }
 
 export async function POST(req: Request) {
+  const startedAt = Date.now();
   try {
     const body = await req.json().catch(() => ({}));
     const email = typeof body?.email === 'string' ? body.email : '';
@@ -26,8 +27,11 @@ export async function POST(req: Request) {
     }
 
     const clientIp = getClientIp(req);
-    const rateLimit = await ensureSlidingWindow(`forgot-password:${clientIp}:${authRateLimitSubject(normalizedEmail)}`, 5, 15 * 60);
-    if (!rateLimit.ok) {
+    const [ipLimit, accountLimit] = await Promise.all([
+      ensureSlidingWindow(`forgot-password:ip:${clientIp}`, 20, 15 * 60),
+      ensureSlidingWindow(`forgot-password:account:${authRateLimitSubject(normalizedEmail)}`, 5, 15 * 60),
+    ]);
+    if (!ipLimit.ok || !accountLimit.ok) {
       return NextResponse.json({ error: 'Too many password reset requests. Please try again later.' }, { status: 429, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
@@ -41,12 +45,18 @@ export async function POST(req: Request) {
       const acceptsReset = user.authProvider === 'email' || user.authProvider === 'mixed';
       if (acceptsReset) {
         const token = await createPasswordResetToken(user.id);
-        await sendPasswordResetEmail(user.email, token);
+        await sendPasswordResetEmail(user.email, token).catch((error) => {
+          logger.warn('Password reset email delivery failed', { error });
+        });
       }
-      await recordSecurityEvent(user.id, 'password_reset_requested', { email: normalizedEmail, ipAddress: clientIp, acceptsReset });
+      await recordSecurityEvent(user.id, 'password_reset_requested', { acceptsReset, networkSubject: authRateLimitSubject(clientIp) });
     } else {
-      await recordSecurityEvent(null, 'password_reset_requested', { email: normalizedEmail, ipAddress: clientIp, userFound: false });
+      await recordSecurityEvent(null, 'password_reset_requested', { accountSubject: authRateLimitSubject(normalizedEmail), networkSubject: authRateLimitSubject(clientIp), userFound: false });
     }
+
+    const minimumResponseMs = 650;
+    const remainingDelayMs = minimumResponseMs - (Date.now() - startedAt);
+    if (remainingDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, remainingDelayMs));
 
     return NextResponse.json({ ok: true, message: 'If an account exists for that email, a password reset link has been sent.' }, {
       status: 200,

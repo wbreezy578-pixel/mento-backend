@@ -1,8 +1,8 @@
 import { NextResponse } from 'next/server';
-import logger from '../../../../lib/logger';
-import { signToken, normalizeEmail, recordSecurityEvent, buildUserSummary, applyAuthCookies } from '../../../lib/auth';
-import { findSessionByToken, generateSecureToken, hashToken, RefreshSessionAlreadyUsedError, revokeSessionFamily, rotateRefreshSession } from '../../../../lib/authSession';
+import { signToken, normalizeEmail, recordSecurityEvent, buildUserSummary, applyAuthCookies, getClientIp } from '../../../lib/auth';
+import { findSessionByToken, generateSecureToken, RefreshSessionAlreadyUsedError, revokeSessionFamily, rotateRefreshSession } from '../../../../lib/authSession';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
+import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
@@ -13,20 +13,17 @@ export async function OPTIONS(req: Request) {
 
 export async function POST(req: Request) {
   try {
+    const limit = await ensureSlidingWindow(`refresh:ip:${getClientIp(req)}`, 60, 15 * 60);
+    if (!limit.ok) return NextResponse.json({ error: 'Too many refresh attempts. Please try again later.' }, { status: 429, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     const body = await req.json();
     const refreshToken = typeof body?.refreshToken === 'string' ? body.refreshToken.trim() : '';
     if (!refreshToken) {
       return NextResponse.json({ error: 'Refresh token required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    const tokenHash = hashToken(refreshToken);
-    const tokenFingerprint = tokenHash.slice(0, 12);
-    logger.info('auth.refresh request', { tokenFingerprint, userAgent: req.headers.get('user-agent') ?? null, ip: req.headers.get('x-forwarded-for') ?? null });
-
     const sessionRecord = await findSessionByToken(refreshToken);
 
     if (!sessionRecord) {
-      logger.warn('auth.refresh: no matching session found', { tokenFingerprint });
       return NextResponse.json({ error: 'Refresh token expired' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
@@ -37,7 +34,6 @@ export async function POST(req: Request) {
     }
 
     if (sessionRecord.expiresAt.getTime() <= Date.now() || sessionRecord.absoluteExpiresAt.getTime() <= Date.now()) {
-      logger.warn('auth.refresh: matching session expired', { sessionId: sessionRecord.id, expiresAt: sessionRecord.expiresAt?.toISOString() });
       return NextResponse.json({ error: 'Refresh token expired' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
@@ -58,10 +54,7 @@ export async function POST(req: Request) {
     });
     const accessToken = signToken(user.id, normalizeEmail(user.email), { sessionId: newSession.id, expiresInSeconds: 15 * 60 });
 
-    logger.info('auth.refresh: created rotated session', { newSessionId: newSession.id, replacedOldSessionId: sessionRecord.id });
-    logger.info('auth.refresh: revoked previous session', { oldSessionId: sessionRecord.id, replacedBy: newSession.id });
-
-    await recordSecurityEvent(user.id, 'token_refresh', { ip: req.headers.get('x-forwarded-for') ?? null });
+    await recordSecurityEvent(user.id, 'token_refresh');
 
     const response = NextResponse.json({
       token: accessToken,

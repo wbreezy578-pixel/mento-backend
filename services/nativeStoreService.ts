@@ -241,7 +241,7 @@ export const nativeStoreCatalog = PRODUCT_CATALOG;
 
 export async function cancelGooglePlaySubscriptionsForAccountDeletion(userId: string): Promise<number> {
   const subscriptions = await prisma.storePurchase.findMany({
-    where: { userId, provider: 'GOOGLE_PLAY', purchaseType: 'SUBSCRIPTION', status: { notIn: ['EXPIRED', 'REFUNDED', 'REVOKED'] } },
+    where: { userId, provider: 'GOOGLE_PLAY', purchaseType: 'SUBSCRIPTION', status: { notIn: ['EXPIRED', 'REFUNDED', 'REVOKED', 'CANCELED_BY_USER'] } },
     select: { id: true, purchaseToken: true },
   });
   for (const subscription of subscriptions) {

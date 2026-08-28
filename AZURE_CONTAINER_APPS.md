@@ -40,6 +40,12 @@ Before an iOS launch, also set `APPLE_ROOT_CERTIFICATES_BASE64` and the numeric 
 
 Paddle is only the web checkout path. Its server API key, webhook secret, three price IDs, environment, and Vercel checkout URL remain Azure settings; the public Paddle client token belongs only on Vercel.
 
+## Authentication and deletion operations
+
+Production authentication also requires `RESEND_API_KEY`, `AUTH_EMAIL_FROM`, and `AUTH_WEB_BASE_URL`. The sender must use a verified Resend domain and the web base URL must be HTTPS. `RETENTION_JOB_SECRET` protects both internal maintenance endpoints.
+
+Account deletion first revokes every session and marks the user as deletion-pending. Paddle, Google Play, Supabase Auth, and local data cleanup are checkpointed in `AccountDeletionJob`, so provider or process failures can be retried safely. Invoke `POST /api/internal/account-deletions` with `Authorization: Bearer <RETENTION_JOB_SECRET>` from a protected scheduled job at least every 15 minutes. Never expose this endpoint or secret in the mobile application.
+
 ## Current scope
 
 - Persistent Node process

@@ -3,23 +3,12 @@ import assert from 'node:assert/strict';
 import { resolveDeletionCredential } from './accountDeletion';
 
 test('prefers password credentials when provided', async () => {
-  const result = await resolveDeletionCredential({ password: 'StrongPassword123!', googleAccessToken: '' }, { authProvider: 'email' });
+  const result = await resolveDeletionCredential({ password: 'StrongPassword123!' }, { authProvider: 'email' });
   assert.deepEqual(result, { mode: 'password', value: 'StrongPassword123!' });
 });
 
-test('accepts recent Google re-authentication when no password is present', async () => {
-  const result = await resolveDeletionCredential({ password: '', googleAccessToken: 'google-token' }, {
-    authProvider: 'google',
-    email: 'user@example.com',
-    lastOAuthReauthAt: new Date(Date.now() - 5 * 60 * 1000),
-  }, {
-    verifyGoogleAccessToken: async () => ({ email: 'user@example.com' }),
-  });
-  assert.deepEqual(result, { mode: 'google', value: 'google-token' });
-});
-
 test('accepts a freshly reissued Mento session after Google re-authentication', async () => {
-  const result = await resolveDeletionCredential({ password: '', googleAccessToken: '' }, {
+  const result = await resolveDeletionCredential({ password: '' }, {
     authProvider: 'google',
     email: 'user@example.com',
     lastOAuthReauthAt: new Date(Date.now() - 5 * 60 * 1000),
@@ -27,9 +16,18 @@ test('accepts a freshly reissued Mento session after Google re-authentication', 
   assert.deepEqual(result, { mode: 'google', value: '' });
 });
 
+test('uses the persisted Apple provider for mixed accounts', async () => {
+  const result = await resolveDeletionCredential({ password: '' }, {
+    authProvider: 'mixed',
+    oauthProvider: 'apple',
+    lastOAuthReauthAt: new Date(Date.now() - 5 * 60 * 1000),
+  });
+  assert.deepEqual(result, { mode: 'apple', value: '' });
+});
+
 test('requires recent Google re-authentication for Google-linked accounts', async () => {
   await assert.rejects(
-    () => resolveDeletionCredential({ password: '', googleAccessToken: '' }, {
+    () => resolveDeletionCredential({ password: '' }, {
       authProvider: 'google',
       email: 'user@example.com',
       lastOAuthReauthAt: new Date(Date.now() - 20 * 60 * 1000),
@@ -44,20 +42,6 @@ test('rejects password credentials for Google-linked accounts', async () => {
     /OAuth-linked accounts require a recent provider re-authentication/i
   );
 });
-test('requires recent Google re-authentication for stale OAuth sessions', async () => {
-  await assert.rejects(
-    () => resolveDeletionCredential(
-      { password: '', googleAccessToken: 'google-token' },
-      {
-        authProvider: 'google',
-        email: 'user@example.com',
-        lastOAuthReauthAt: new Date(Date.now() - 20 * 60 * 1000),
-      },
-      { verifyGoogleAccessToken: async () => ({ email: 'user@example.com' }) }
-    ),
-    /Please re-authenticate with Google recently before deleting your account\./i
-  );
-});
 test('rejects missing credentials', async () => {
-  await assert.rejects(() => resolveDeletionCredential({ password: '', googleAccessToken: '' }, { authProvider: 'email' }), /Password confirmation is required to delete your account\.|Password or Google re-authentication/i);
+  await assert.rejects(() => resolveDeletionCredential({ password: '' }, { authProvider: 'email' }), /Password confirmation is required to delete your account\./i);
 });

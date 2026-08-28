@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 
 export const metadata: Metadata = {
   title: 'Mento',
-  description: 'Mento secure billing and account services',
+  description: 'Mento is an AI learning companion for focused chat, image understanding, and optional Live Tutor conversations.',
 };
 
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {

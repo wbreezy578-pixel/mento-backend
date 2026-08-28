@@ -15,6 +15,11 @@ describe('trusted request metadata', () => {
     expect(getTrustedClientIp(headers, { TRUSTED_PROXY_PROVIDER: 'vercel' })).toBe('198.51.100.30');
   });
 
+  it('ignores a caller-supplied X-Forwarded-For when Vercel metadata is absent', () => {
+    const headers = new Headers({ 'x-forwarded-for': '203.0.113.8' });
+    expect(getTrustedClientIp(headers, { TRUSTED_PROXY_PROVIDER: 'vercel' })).toBe('');
+  });
+
   it('does not trust caller-controlled IP headers behind an unknown production proxy', () => {
     const headers = new Headers({ 'x-forwarded-for': '203.0.113.8' });
     expect(getTrustedClientIp(headers, { NODE_ENV: 'production' })).toBe('');

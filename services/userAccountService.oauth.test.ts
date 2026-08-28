@@ -20,7 +20,7 @@ vi.mock('../lib/prisma', () => ({
   },
 }));
 
-import { createGoogleOAuthAccount, InvalidAccountInputError } from './userAccountService';
+import { createGoogleOAuthAccount, InvalidAccountInputError, OAuthAccountLinkRequiredError } from './userAccountService';
 
 const existingUser = {
   id: 'user-1',
@@ -44,24 +44,14 @@ describe('OAuth account linking', () => {
     mocks.updateUser.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ ...existingUser, ...data }));
   });
 
-  it('safely transfers an unverified password placeholder to a verified provider identity', async () => {
-    const result = await createGoogleOAuthAccount({
+  it('requires explicit linking for an existing password account', async () => {
+    await expect(createGoogleOAuthAccount({
       email: 'LEARNER@example.com',
       name: 'Learner',
       externalUserId: 'google-user-1',
-    });
-
-    expect(result.created).toBe(false);
-    expect(result.user.password).toBe('');
-    expect(result.user.authProvider).toBe('google');
-    expect(mocks.revokeSessions).toHaveBeenCalledWith({ where: { userId: existingUser.id, revokedAt: null }, data: { revokedAt: expect.any(Date) } });
-    expect(mocks.updateUser).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({
-        emailVerified: true,
-        supabaseUserId: 'google-user-1',
-        credentialsChangedAt: expect.any(Date),
-      }),
-    }));
+    })).rejects.toBeInstanceOf(OAuthAccountLinkRequiredError);
+    expect(mocks.revokeSessions).not.toHaveBeenCalled();
+    expect(mocks.updateUser).not.toHaveBeenCalled();
   });
 
   it('refuses to replace an account already bound to another provider identity', async () => {
@@ -74,7 +64,8 @@ describe('OAuth account linking', () => {
   });
 
   it('keeps a verified password when adding a verified provider as mixed authentication', async () => {
-    const verified = { ...existingUser, emailVerified: true, accountStatus: 'ACTIVE' };
+    const verified = { ...existingUser, emailVerified: true, accountStatus: 'ACTIVE', supabaseUserId: 'google-user-verified' };
+    mocks.findUnique.mockResolvedValue(verified);
     mocks.findFirst.mockResolvedValue(verified);
     mocks.updateUser.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ ...verified, ...data }));
 

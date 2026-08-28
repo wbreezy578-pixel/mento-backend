@@ -4,7 +4,7 @@ import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REDIS_URL = getRedisUrl();
 const REQUIRE_DISTRIBUTED_RATE_LIMIT = process.env.REQUIRE_RATE_LIMIT_REDIS === 'true'
-  || (process.env.NODE_ENV === 'production' && Boolean(REDIS_URL));
+  || process.env.NODE_ENV === 'production';
 let redis: MentoRedisClient | null = null;
 
 function distributedLimiterUnavailable(type: 'cooldown' | 'sliding' | 'daily') {

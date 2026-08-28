@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { NextResponse } from 'next/server';
 import * as auth from './auth';
 import { sanitizeForLogging } from '../../lib/sanitize';
 
@@ -73,8 +74,9 @@ test('isAdminUser honors explicit admin markers and configured admin emails', ()
 });
 
 test('isBcryptHash detects valid bcrypt hashes', () => {
-  assert.equal(auth.isBcryptHash('$2a$12$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOpqrstuv'), true);
-  assert.equal(auth.isBcryptHash('$2b$10$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOpqrstuv'), true);
+  assert.equal(auth.isBcryptHash('$2a$12$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy'), true);
+  assert.equal(auth.isBcryptHash('$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy'), true);
+  assert.equal(auth.isBcryptHash('$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhW'), false);
   assert.equal(auth.isBcryptHash('not-a-bcrypt-hash'), false);
 });
 
@@ -86,6 +88,18 @@ test('verifyPassword supports bcrypt and rejects legacy raw passwords', async ()
   assert.equal(await auth.verifyPassword('wrong-password', bcryptHash), false);
   assert.equal(await auth.verifyPassword(rawPassword, rawPassword), false);
   assert.equal(await auth.verifyPassword('wrong-password', rawPassword), false);
+});
+
+test('browser session cookies remain disabled for the mobile-only product', () => {
+  const response = NextResponse.json({ ok: true });
+  auth.applyAuthCookies(response, {
+    accessToken: 'access-token',
+    refreshToken: 'refresh-token',
+    isProduction: true,
+  });
+  assert.equal(response.cookies.get('mento_access_token'), undefined);
+  assert.equal(response.cookies.get('mento_refresh_token'), undefined);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
 });
 
 test('validatePasswordStrength enforces passphrase length and bcrypt byte safety', () => {

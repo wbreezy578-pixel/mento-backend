@@ -357,6 +357,12 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: mobileAppScheme
             }
             {
+              // Browser sign-in is intentionally disabled until a separately
+              // tested cookie + CSRF flow is approved for the web product.
+              name: 'AUTH_BROWSER_SIGN_IN_ENABLED'
+              value: 'false'
+            }
+            {
               name: 'TRUSTED_PROXY_PROVIDER'
               value: 'azure-container-apps'
             }

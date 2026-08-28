@@ -212,6 +212,13 @@ export async function createGoogleOAuthAccount(input: CreateUserAccountInput): P
   return createOAuthAccount(input, 'google');
 }
 
+export class OAuthAccountLinkRequiredError extends Error {
+  constructor() {
+    super('This email is already registered. Sign in first, then explicitly link the provider.');
+    this.name = 'OAuthAccountLinkRequiredError';
+  }
+}
+
 export async function createAppleAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
   return createOAuthAccount(input, 'apple');
 }
@@ -232,6 +239,13 @@ async function createOAuthAccount(input: CreateUserAccountInput, provider: 'goog
     }
     if (existingUser.supabaseUserId && existingUser.supabaseUserId !== input.externalUserId) {
       throw new InvalidAccountInputError('This email is already linked to another identity.');
+    }
+
+    // Never silently replace or clear a password account just because an OAuth
+    // provider presented the same email.  The caller must authenticate to the
+    // existing Mento account and use the explicit linking endpoint instead.
+    if (!byIdentity && !existingUser.supabaseUserId) {
+      throw new OAuthAccountLinkRequiredError();
     }
 
     const wasUnverifiedPasswordAccount = !existingUser.emailVerified && Boolean(existingUser.password?.trim());

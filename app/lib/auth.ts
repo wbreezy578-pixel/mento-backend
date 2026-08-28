@@ -35,6 +35,13 @@ const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
 const REFRESH_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
 const LOGIN_LOCKOUT_THRESHOLD = 5;
 const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+// Valid digest used for constant-work comparisons when an account is missing
+// or contains a legacy/malformed password value.
+export const DUMMY_BCRYPT_HASH = '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy';
+// Mento currently ships as a native mobile application.  Browser sign-in is
+// deliberately opt-in so the web host used for email actions cannot silently
+// become a second session surface.
+const BROWSER_AUTH_ENABLED = process.env.AUTH_BROWSER_SIGN_IN_ENABLED === 'true';
 const userContext = new AsyncLocalStorage<{ userId: string; sessionId: string } | null>();
 
 export interface JwtPayload {
@@ -95,10 +102,12 @@ function extractTokenFromRequest(req: Request): { token: string | null; source: 
     return { token: headerMatch[1].trim(), source: 'authorization' };
   }
 
-  const cookieHeader = req.headers.get('cookie') ?? '';
-  const cookieMatch = cookieHeader.match(/(?:^|;\s*)mento_access_token=([^;]+)/);
-  if (cookieMatch?.[1]) {
-    return { token: decodeURIComponent(cookieMatch[1]).trim(), source: 'cookie' };
+  if (BROWSER_AUTH_ENABLED) {
+    const cookieHeader = req.headers.get('cookie') ?? '';
+    const cookieMatch = cookieHeader.match(/(?:^|;\s*)mento_access_token=([^;]+)/);
+    if (cookieMatch?.[1]) {
+      return { token: decodeURIComponent(cookieMatch[1]).trim(), source: 'cookie' };
+    }
   }
 
   return { token: null, source: 'none' };
@@ -177,8 +186,9 @@ export function normalizeEmail(email: string | null | undefined) {
 }
 
 export function isBcryptHash(hash: string) {
-  // Accept common bcrypt prefixes and a base64-like payload of variable length
-  return /^\$2[abxy]?\$\d{2}\$[./A-Za-z0-9]+$/.test(hash);
+  // A bcrypt digest is exactly 60 characters.  Accept the prefixes supported
+  // by bcryptjs and the full cost range, but reject truncated/dummy values.
+  return /^\$2[abxy]\$(0[4-9]|[12]\d|3[01])\$[./A-Za-z0-9]{53}$/.test(hash);
 }
 
 export function isAdminUser(user: { email?: string | null; authProvider?: string | null; role?: string | null }) {
@@ -227,6 +237,9 @@ export async function verifyPassword(password: string, passwordHash: string | nu
     }
   }
 
+  // Keep malformed/legacy account checks close to the bcrypt timing profile
+  // without ever accepting or migrating the stored value.
+  await bcrypt.compare(password, DUMMY_BCRYPT_HASH);
   logger.warn('Rejected account with unsupported legacy password format', {
     hashLength: trimmedHash.length,
     category: 'legacy_password_rejected',
@@ -293,6 +306,9 @@ export function applyAuthCookies(
   response: NextResponse,
   params: { accessToken: string; refreshToken: string; isProduction: boolean; accessMaxAgeSeconds?: number; refreshMaxAgeSeconds?: number; path?: string }
 ) {
+  response.headers.set('Cache-Control', 'no-store');
+  if (!BROWSER_AUTH_ENABLED) return response;
+
   response.cookies.set('mento_access_token', params.accessToken, buildAuthCookieOptions({
     isProduction: params.isProduction,
     maxAgeSeconds: params.accessMaxAgeSeconds ?? ACCESS_TOKEN_TTL_SECONDS,
@@ -315,17 +331,21 @@ export async function recordSecurityEvent(userId: string | null, eventType: stri
 }
 
 export async function incrementFailedLoginAttempts(userId: string) {
-  const updated = await prisma.user.update({
-    where: { id: userId },
-    data: {
-      failedLoginAttempts: { increment: 1 },
-      lastFailedLoginAt: new Date(),
-    },
-  });
-  if (updated.failedLoginAttempts >= LOGIN_LOCKOUT_THRESHOLD) {
-    return prisma.user.update({ where: { id: userId }, data: { lockedAt: new Date(Date.now() + LOGIN_LOCKOUT_MS) } });
-  }
-  return updated;
+  const now = new Date();
+  const lockUntil = new Date(now.getTime() + LOGIN_LOCKOUT_MS);
+  const rows = await prisma.$queryRaw<Array<{ failedLoginAttempts: number; lockedAt: Date | null }>>(Prisma.sql`
+    UPDATE "User"
+    SET "failedLoginAttempts" = "failedLoginAttempts" + 1,
+        "lastFailedLoginAt" = ${now},
+        "lockedAt" = CASE
+          WHEN "failedLoginAttempts" + 1 >= ${LOGIN_LOCKOUT_THRESHOLD} THEN ${lockUntil}
+          ELSE "lockedAt"
+        END
+    WHERE "id" = ${userId}
+    RETURNING "failedLoginAttempts", "lockedAt"
+  `);
+  if (!rows[0]) throw new Error('User not found');
+  return rows[0];
 }
 
 export async function resetFailedLoginAttempts(userId: string) {

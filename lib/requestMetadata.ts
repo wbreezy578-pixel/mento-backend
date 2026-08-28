@@ -33,7 +33,9 @@ export function getTrustedClientIp(headers: Headers, environment: NodeJS.Process
       .split(',')
       .map((value) => normalizeIp(value))
       .find(Boolean);
-    return vercelForwarded || forwarded[0] || '';
+    // Do not fall back to caller-controlled X-Forwarded-For on Vercel.  The
+    // platform-owned header is the only trusted source in this deployment.
+    return vercelForwarded || '';
   }
 
   if (provider === 'azure-container-apps') {

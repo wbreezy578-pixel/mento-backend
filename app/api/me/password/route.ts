@@ -5,44 +5,49 @@ import { getUserFromRequest, normalizeEmail, hashPassword, validatePasswordStren
 import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
 import { sendPasswordChangedEmail } from '../../../../services/transactionalEmailService';
 
+const authJson = (body: unknown, init: ResponseInit = {}) => NextResponse.json(body, {
+  ...init,
+  headers: { 'Cache-Control': 'no-store', ...(init.headers ?? {}) },
+});
+
 export async function POST(req: Request) {
   try {
     const user = await getUserFromRequest(req);
     if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      return authJson({ error: 'Unauthorized' }, { status: 401 });
     }
     const limit = await ensureSlidingWindow(`account-password:${user.id}`, 5, 15 * 60);
-    if (!limit.ok) return NextResponse.json({ error: 'Too many password change attempts. Please try again later.' }, { status: 429 });
+    if (!limit.ok) return authJson({ error: 'Too many password change attempts. Please try again later.' }, { status: 429 });
 
     const { currentPassword, newPassword, confirmPassword } = await req.json();
     if (typeof newPassword !== 'string' || !newPassword.trim()) {
-      return NextResponse.json({ error: 'New password is required.' }, { status: 400 });
+      return authJson({ error: 'New password is required.' }, { status: 400 });
     }
     if (typeof confirmPassword !== 'string' || confirmPassword !== newPassword) {
-      return NextResponse.json({ error: 'New passwords must match.' }, { status: 400 });
+      return authJson({ error: 'New passwords must match.' }, { status: 400 });
     }
 
     const alreadyHasPassword = typeof user.password === 'string' && user.password.trim().length > 0;
     if (alreadyHasPassword) {
       if (typeof currentPassword !== 'string' || !currentPassword.trim()) {
-        return NextResponse.json({ error: 'Current password is required.' }, { status: 400 });
+        return authJson({ error: 'Current password is required.' }, { status: 400 });
       }
 
       const currentPasswordMatches = await verifyPassword(currentPassword, user.password);
       if (!currentPasswordMatches) {
-        return NextResponse.json({ error: 'Current password is incorrect.' }, { status: 401 });
+        return authJson({ error: 'Current password is incorrect.' }, { status: 401 });
       }
     }
 
     const actionRequirements = getSensitiveActionRequirements(user);
     if (actionRequirements.requiresRecentOAuthReauth) {
       const providerName = user.oauthProvider === 'apple' ? 'Apple' : 'your sign-in provider';
-      return NextResponse.json({ error: `Please confirm with ${providerName} before changing your password.` }, { status: 403 });
+      return authJson({ error: `Please confirm with ${providerName} before changing your password.` }, { status: 403 });
     }
 
     const passwordPolicy = validatePasswordStrength(newPassword);
     if (!passwordPolicy.isValid) {
-      return NextResponse.json({ error: passwordPolicy.reasons.join(' ') }, { status: 400 });
+      return authJson({ error: passwordPolicy.reasons.join(' ') }, { status: 400 });
     }
 
     const normalizedEmail = normalizeEmail(user.email);
@@ -81,9 +86,9 @@ export async function POST(req: Request) {
       logger.warn('Password change security notice could not be sent', { error });
     });
 
-    return NextResponse.json({ success: true, passwordSetup: !alreadyHasPassword });
+    return authJson({ ok: true, success: true, passwordSetup: !alreadyHasPassword });
   } catch (error: unknown) {
     logger.error('Password change failed', { error });
-    return NextResponse.json({ error: 'Unable to change password right now.' }, { status: 500 });
+    return authJson({ error: 'Unable to change password right now.' }, { status: 500 });
   }
 }

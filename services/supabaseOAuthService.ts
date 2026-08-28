@@ -3,7 +3,7 @@ import { applyAuthCookies, authRateLimitSubject, buildUserSummary, getClientIp, 
 import { createSessionRecord, generateSecureToken, getRefreshSessionExpiry, REFRESH_SESSION_ABSOLUTE_TTL_MS } from '../lib/authSession';
 import { getSupabaseClientKey, getSupabaseUrl } from '../lib/env';
 import { buildCorsHeaders } from '../lib/securityHeaders';
-import { createAppleAccount, createGoogleOAuthAccount } from './userAccountService';
+import { createAppleAccount, createGoogleOAuthAccount, InvalidAccountInputError, OAuthAccountLinkRequiredError } from './userAccountService';
 import { CURRENT_LEGAL_VERSIONS } from '../lib/legalVersions';
 import { prisma } from '../lib/prisma';
 import { randomUUID } from 'crypto';
@@ -94,8 +94,73 @@ export async function exchangeSupabaseOAuth(req: Request, provider: OAuthProvide
     const result = NextResponse.json({ token: accessToken, refreshToken, sessionExpiresAt: sessionExpiresAt.toISOString(), user: buildUserSummary(user) }, { headers: headers(req) });
     applyAuthCookies(result, { accessToken, refreshToken, isProduction: process.env.NODE_ENV === 'production' });
     return result;
-  } catch {
+  } catch (error: unknown) {
+    if (error instanceof OAuthAccountLinkRequiredError) {
+      return NextResponse.json({
+        error: 'This email is already registered. Sign in first, then link this provider from account settings.',
+        code: 'oauth_link_required',
+      }, { status: 409, headers: headers(req) });
+    }
     return NextResponse.json({ error: `${provider === 'apple' ? 'Apple' : 'Google'} sign-in is temporarily unavailable.` }, { status: 503, headers: headers(req) });
+  }
+}
+
+/**
+ * Link a provider only after the caller has authenticated to the existing
+ * Mento account.  Email equality alone is not sufficient for account linking.
+ */
+export async function linkSupabaseOAuth(req: Request, provider: OAuthProvider) {
+  try {
+    const user = await getUserFromRequest(req);
+    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: headers(req) });
+    if (!await enforceOAuthLimits(req, provider, user.id)) {
+      return NextResponse.json({ error: 'Too many linking attempts. Please try again later.' }, { status: 429, headers: headers(req) });
+    }
+
+    const body = await req.json().catch(() => ({})) as { access_token?: unknown };
+    if (typeof body.access_token !== 'string' || !body.access_token.trim()) {
+      return NextResponse.json({ error: 'Provider authentication token is required.' }, { status: 400, headers: headers(req) });
+    }
+    const profile = await verifySupabaseOAuthToken(body.access_token.trim(), provider);
+    if (!profile || normalizeEmail(profile.email) !== normalizeEmail(user.email)) {
+      await recordSecurityEvent(user.id, 'oauth_link_rejected', { provider, reason: 'email_mismatch' });
+      return NextResponse.json({ error: 'The provider email must match your Mento account email.' }, { status: 403, headers: headers(req) });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      const current = await tx.user.findUnique({ where: { id: user.id } });
+      if (!current || current.accountStatus !== 'ACTIVE') throw new InvalidAccountInputError('Account is not active.');
+      if (current.supabaseUserId && current.supabaseUserId !== profile.externalUserId) {
+        throw new InvalidAccountInputError('A different provider identity is already linked.');
+      }
+      const identityOwner = await tx.user.findUnique({ where: { supabaseUserId: profile.externalUserId } });
+      if (identityOwner && identityOwner.id !== user.id) {
+        throw new InvalidAccountInputError('That provider identity is already linked to another account.');
+      }
+      const hasPassword = Boolean(current.password?.trim());
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          supabaseUserId: profile.externalUserId,
+          oauthProvider: provider,
+          authProvider: hasPassword ? 'mixed' : provider,
+          emailVerified: true,
+          accountStatus: 'ACTIVE',
+          lastOAuthReauthAt: new Date(),
+          failedLoginAttempts: 0,
+          lastFailedLoginAt: null,
+          lockedAt: null,
+        },
+      });
+    }, { maxWait: 10000, timeout: 30000 });
+
+    await recordSecurityEvent(user.id, 'oauth_link_completed', { provider });
+    return NextResponse.json({ ok: true, provider, user: buildUserSummary(user) }, { headers: headers(req) });
+  } catch (error: unknown) {
+    if (error instanceof InvalidAccountInputError) {
+      return NextResponse.json({ error: error.message }, { status: 409, headers: headers(req) });
+    }
+    return NextResponse.json({ error: 'Provider linking is temporarily unavailable.' }, { status: 503, headers: headers(req) });
   }
 }
 

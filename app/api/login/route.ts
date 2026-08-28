@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../lib/prisma';
 import logger from '../../../lib/logger';
-import { signToken, normalizeEmail, verifyPassword, buildUserSummary, getLoginPolicyState, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, getSessionClientIp, authRateLimitSubject } from '../../lib/auth';
+import { signToken, normalizeEmail, verifyPassword, buildUserSummary, getLoginPolicyState, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, getSessionClientIp, authRateLimitSubject, DUMMY_BCRYPT_HASH } from '../../lib/auth';
 import { createNotification } from '../../services/notificationService';
 import { createSessionRecord, generateSecureToken, getRefreshSessionExpiry, REFRESH_SESSION_ABSOLUTE_TTL_MS } from '../../../lib/authSession';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
@@ -33,13 +33,13 @@ export async function POST(req: Request) {
       ensureSlidingWindow(`login:ip:${clientIp}`, 30, 15 * 60),
       ensureSlidingWindow(`login:account:${authRateLimitSubject(normalizedEmail)}`, 10, 15 * 60),
     ]);
-    if (!ipLimit.ok || !accountLimit.ok) return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429 });
+    if (!ipLimit.ok || !accountLimit.ok) return NextResponse.json({ error: 'Too many sign-in attempts. Please try again later.' }, { status: 429, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
 
     const user = await prisma.user.findFirst({
       where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
     });
     if (!user) {
-      await verifyPassword(String(password), '$2b$12$C6UzMDM.H6dfI/f/IKcEe.8jO4KQWv6q6Qp2kCB2Q9d8qQ0N9cF8K');
+      await verifyPassword(String(password), DUMMY_BCRYPT_HASH);
       await recordSecurityEvent(null, 'login_failed', { accountSubject: authRateLimitSubject(normalizedEmail), reason: 'user_not_found' });
       return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }

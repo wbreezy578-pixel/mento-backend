@@ -12,6 +12,7 @@ export async function OPTIONS(req: Request) {
 }
 
 export async function POST(req: Request) {
+  let sessionRecord: Awaited<ReturnType<typeof findSessionByToken>> = null;
   try {
     const limit = await ensureSlidingWindow(`refresh:ip:${getClientIp(req)}`, 60, 15 * 60);
     if (!limit.ok) return NextResponse.json({ error: 'Too many refresh attempts. Please try again later.' }, { status: 429, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
@@ -21,7 +22,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Refresh token required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    const sessionRecord = await findSessionByToken(refreshToken);
+    sessionRecord = await findSessionByToken(refreshToken);
 
     if (!sessionRecord) {
       return NextResponse.json({ error: 'Refresh token expired' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
@@ -30,7 +31,7 @@ export async function POST(req: Request) {
     if (sessionRecord.revokedAt || sessionRecord.replacedBySessionId) {
       await revokeSessionFamily(sessionRecord.familyId);
       await recordSecurityEvent(sessionRecord.userId, 'refresh_token_reuse_detected', { familyId: sessionRecord.familyId });
-      return NextResponse.json({ error: 'Session security check failed. Please sign in again.' }, { status: 401 });
+      return NextResponse.json({ error: 'Session security check failed. Please sign in again.' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     if (isRefreshSessionExpired(sessionRecord)) {
@@ -38,7 +39,7 @@ export async function POST(req: Request) {
     }
 
     const user = sessionRecord.user;
-    if (!user.emailVerified || user.accountStatus !== 'ACTIVE') return NextResponse.json({ error: 'Account is not active.' }, { status: 403 });
+    if (!user.emailVerified || user.accountStatus !== 'ACTIVE') return NextResponse.json({ error: 'Account is not active.' }, { status: 403, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     const rotatedRefreshToken = generateSecureToken();
     const rollingExpiry = getRefreshSessionExpiry(sessionRecord.absoluteExpiresAt);
 
@@ -59,6 +60,7 @@ export async function POST(req: Request) {
     const response = NextResponse.json({
       token: accessToken,
       refreshToken: rotatedRefreshToken,
+      sessionExpiresAt: newSession.expiresAt.toISOString(),
       user: buildUserSummary(user),
     }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     applyAuthCookies(response, {
@@ -69,6 +71,13 @@ export async function POST(req: Request) {
     return response;
   } catch (error) {
     if (error instanceof RefreshSessionAlreadyUsedError) {
+      // A raced or replayed refresh token invalidates the complete family,
+      // including the winning replacement, so an attacker cannot continue a
+      // stolen branch after reuse is detected.
+      if (sessionRecord) {
+        await revokeSessionFamily(sessionRecord.familyId).catch(() => undefined);
+        await recordSecurityEvent(sessionRecord.userId, 'refresh_token_reuse_detected', { familyId: sessionRecord.familyId, source: 'rotation_race' });
+      }
       return NextResponse.json({ error: 'Refresh token expired' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
     return NextResponse.json({ error: 'Unable to refresh session' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });

@@ -1,14 +1,19 @@
 import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../../lib/auth';
 
+const authJson = (body: unknown, init: ResponseInit = {}) => NextResponse.json(body, {
+  ...init,
+  headers: { 'Cache-Control': 'no-store', ...(init.headers ?? {}) },
+});
+
 export async function GET(req: Request) {
   try {
     const user = await getUserFromRequest(req);
     if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      return authJson({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    return NextResponse.json({
+    return authJson({
       id: user.id,
       email: user.email,
       authProvider: user.authProvider,
@@ -17,6 +22,6 @@ export async function GET(req: Request) {
       emailVerified: Boolean(user.emailVerified),
     });
   } catch {
-    return NextResponse.json({ error: 'Unable to fetch profile' }, { status: 500 });
+    return authJson({ error: 'Unable to fetch profile' }, { status: 500 });
   }
 }

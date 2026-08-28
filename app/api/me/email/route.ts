@@ -6,41 +6,46 @@ import { createEmailActionToken } from '../../../../lib/authSession';
 import { sendEmailChangeConfirmation } from '../../../../services/transactionalEmailService';
 import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
 
+const authJson = (body: unknown, init: ResponseInit = {}) => NextResponse.json(body, {
+  ...init,
+  headers: { 'Cache-Control': 'no-store', ...(init.headers ?? {}) },
+});
+
 export async function POST(req: Request) {
   try {
     const user = await getUserFromRequest(req);
     if (!user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+      return authJson({ error: 'Unauthorized' }, { status: 401 });
     }
 
     const { password, email } = await req.json();
     const normalizedEmail = normalizeEmail(email);
     const limit = await ensureSlidingWindow(`account-email:${user.id}`, 3, 60 * 60);
-    if (!limit.ok) return NextResponse.json({ error: 'Too many email change attempts. Please try again later.' }, { status: 429 });
+    if (!limit.ok) return authJson({ error: 'Too many email change attempts. Please try again later.' }, { status: 429 });
     if (!normalizedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
-      return NextResponse.json({ error: 'A valid email is required.' }, { status: 400 });
+      return authJson({ error: 'A valid email is required.' }, { status: 400 });
     }
 
     const hasPassword = typeof user.password === 'string' && user.password.trim().length > 0;
     if (hasPassword) {
-      if (typeof password !== 'string' || !password.trim()) return NextResponse.json({ error: 'Password confirmation is required.' }, { status: 400 });
+      if (typeof password !== 'string' || !password.trim()) return authJson({ error: 'Password confirmation is required.' }, { status: 400 });
       const passwordMatches = await verifyPassword(password, user.password);
-      if (!passwordMatches) return NextResponse.json({ error: 'Incorrect password.' }, { status: 401 });
+      if (!passwordMatches) return authJson({ error: 'Incorrect password.' }, { status: 401 });
     } else if (!['google', 'apple', 'mixed'].includes(user.authProvider)) {
-      return NextResponse.json({ error: 'This account cannot confirm an email change.' }, { status: 403 });
+      return authJson({ error: 'This account cannot confirm an email change.' }, { status: 403 });
     }
 
     const actionRequirements = getSensitiveActionRequirements(user);
     if (actionRequirements.requiresRecentOAuthReauth) {
       const providerName = user.oauthProvider === 'apple' ? 'Apple' : 'your sign-in provider';
-      return NextResponse.json({ error: `Please confirm with ${providerName} before changing your email.` }, { status: 403 });
+      return authJson({ error: `Please confirm with ${providerName} before changing your email.` }, { status: 403 });
     }
 
     const existing = await prisma.user.findFirst({
       where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
     });
     if (existing && existing.id !== user.id) {
-      return NextResponse.json({ error: 'Email already in use.' }, { status: 409 });
+      return authJson({ error: 'Email already in use.' }, { status: 409 });
     }
 
     await prisma.user.update({
@@ -58,9 +63,9 @@ export async function POST(req: Request) {
       throw error;
     }
     await recordSecurityEvent(user.id, 'email_change_requested');
-    return NextResponse.json({ ok: true, message: 'Check the new address to confirm this change.' });
+    return authJson({ ok: true, message: 'Check the new address to confirm this change.' });
   } catch (error: unknown) {
     logger.error('Email change failed', { error });
-    return NextResponse.json({ error: 'Unable to change email right now.' }, { status: 500 });
+    return authJson({ error: 'Unable to change email right now.' }, { status: 500 });
   }
 }

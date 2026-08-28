@@ -163,8 +163,10 @@ export async function rotateRefreshSession(input: {
       where: {
         id: input.sessionId,
         userId: input.userId,
+        familyId: input.familyId,
         revokedAt: null,
         expiresAt: { gt: new Date() },
+        absoluteExpiresAt: { gt: new Date() },
       },
       data: {
         revokedAt: new Date(),

@@ -4,9 +4,14 @@ import { prisma } from '../../../../lib/prisma';
 import { CURRENT_LEGAL_VERSIONS } from '../../../../lib/legalVersions';
 import { getUserFromRequest } from '../../../lib/auth';
 
+const authJson = (body: unknown, init: ResponseInit = {}) => NextResponse.json(body, {
+  ...init,
+  headers: { 'Cache-Control': 'no-store', ...(init.headers ?? {}) },
+});
+
 export async function GET(req: Request) {
   const user = await getUserFromRequest(req);
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (!user) return authJson({ error: 'Unauthorized' }, { status: 401 });
 
   const records = await prisma.$queryRaw<Array<{ id: string }>>`
     SELECT "id" FROM "ConsentRecord"
@@ -18,17 +23,17 @@ export async function GET(req: Request) {
     LIMIT 1
   `;
 
-  return NextResponse.json({ accepted: records.length > 0, versions: CURRENT_LEGAL_VERSIONS });
+  return authJson({ accepted: records.length > 0, versions: CURRENT_LEGAL_VERSIONS });
 }
 
 export async function POST(req: Request) {
   const user = await getUserFromRequest(req);
-  if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  if (!user) return authJson({ error: 'Unauthorized' }, { status: 401 });
 
   const body = await req.json().catch(() => null) as { versions?: typeof CURRENT_LEGAL_VERSIONS; source?: unknown } | null;
   const versions = body?.versions;
   if (!versions || versions.privacy !== CURRENT_LEGAL_VERSIONS.privacy || versions.terms !== CURRENT_LEGAL_VERSIONS.terms || versions.aiNotice !== CURRENT_LEGAL_VERSIONS.aiNotice) {
-    return NextResponse.json({ error: 'The legal notice has changed. Please review the current version.', versions: CURRENT_LEGAL_VERSIONS }, { status: 409 });
+    return authJson({ error: 'The legal notice has changed. Please review the current version.', versions: CURRENT_LEGAL_VERSIONS }, { status: 409 });
   }
 
   const source = body?.source === 'android' ? 'android' : 'mobile';
@@ -40,5 +45,5 @@ export async function POST(req: Request) {
     DO UPDATE SET "acceptedAt" = EXCLUDED."acceptedAt", "revokedAt" = NULL, "source" = EXCLUDED."source"
   `;
 
-  return NextResponse.json({ accepted: true, acceptedAt, versions: CURRENT_LEGAL_VERSIONS });
+  return authJson({ accepted: true, acceptedAt, versions: CURRENT_LEGAL_VERSIONS });
 }

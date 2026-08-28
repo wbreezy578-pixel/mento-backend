@@ -11,29 +11,37 @@ import { validateLegalAcceptance } from '../../../lib/legalConsent';
 import { sendVerificationEmail } from '../../../services/transactionalEmailService';
 import { ensureSlidingWindow } from '../../../lib/rateLimiter';
 import { authRateLimitSubject, getClientIp } from '../../lib/auth';
+import { buildCorsHeaders } from '../../../lib/securityHeaders';
+
+const CORS_METHODS = 'POST, OPTIONS';
+const responseHeaders = (req: Request) => ({ ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS });
+
+export async function OPTIONS(req: Request) {
+  return new NextResponse(null, { status: 204, headers: responseHeaders(req) });
+}
 
 export async function POST(req: Request) {
   try {
     const { email, password, confirmPassword, name, ageConfirmed, legalVersions } = await req.json();
     const normalizedEmail = normalizeEmail(email);
     if (!normalizedEmail || typeof password !== 'string' || !password.trim()) {
-      return NextResponse.json({ error: 'Email and password are required' }, { status: 400 });
+      return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: responseHeaders(req) });
     }
     if (typeof confirmPassword !== 'string' || confirmPassword !== password) {
-      return NextResponse.json({ error: 'Password confirmation must match.' }, { status: 400 });
+      return NextResponse.json({ error: 'Password confirmation must match.' }, { status: 400, headers: responseHeaders(req) });
     }
     const clientIp = getClientIp(req);
     const [ipLimit, emailLimit] = await Promise.all([
       ensureSlidingWindow(`signup:ip:${clientIp}`, 10, 60 * 60),
       ensureSlidingWindow(`signup:email:${authRateLimitSubject(normalizedEmail)}`, 3, 60 * 60),
     ]);
-    if (!ipLimit.ok || !emailLimit.ok) return NextResponse.json({ error: 'Too many signup attempts. Please try again later.' }, { status: 429 });
+    if (!ipLimit.ok || !emailLimit.ok) return NextResponse.json({ error: 'Too many signup attempts. Please try again later.' }, { status: 429, headers: responseHeaders(req) });
     const legalError = validateLegalAcceptance({ ageConfirmed, legalVersions });
-    if (legalError) return NextResponse.json({ error: legalError }, { status: legalError.includes('18') ? 400 : 409 });
+    if (legalError) return NextResponse.json({ error: legalError }, { status: legalError.includes('18') ? 400 : 409, headers: responseHeaders(req) });
 
     const passwordPolicy = validatePasswordStrength(password);
     if (!passwordPolicy.isValid) {
-      return NextResponse.json({ error: passwordPolicy.reasons.join(' ') }, { status: 400 });
+      return NextResponse.json({ error: passwordPolicy.reasons.join(' ') }, { status: 400, headers: responseHeaders(req) });
     }
 
     let accountResult;
@@ -45,7 +53,7 @@ export async function POST(req: Request) {
       });
     } catch (error) {
       if (error instanceof InvalidAccountInputError) {
-        return NextResponse.json({ error: error.message }, { status: 400 });
+        return NextResponse.json({ error: error.message }, { status: 400, headers: responseHeaders(req) });
       }
       throw error;
     }
@@ -55,7 +63,7 @@ export async function POST(req: Request) {
         const token = await createEmailActionToken({ userId: accountResult.user.id, purpose: 'VERIFY_EMAIL', expiresInMinutes: 60 });
         await sendVerificationEmail(accountResult.user.email, token);
       }
-      return NextResponse.json({ ok: true, requiresEmailVerification: true, message: 'If this address can be registered, check your email for the next step.' }, { status: 202 });
+      return NextResponse.json({ ok: true, requiresEmailVerification: true, message: 'If this address can be registered, check your email for the next step.' }, { status: 202, headers: responseHeaders(req) });
     }
 
     const user = accountResult.user;
@@ -79,9 +87,9 @@ export async function POST(req: Request) {
       // ignore notification errors
     }
 
-    return NextResponse.json({ ok: true, requiresEmailVerification: true, message: 'Check your email to verify your Mento account.' }, { status: 201 });
+    return NextResponse.json({ ok: true, requiresEmailVerification: true, message: 'Check your email to verify your Mento account.' }, { status: 201, headers: responseHeaders(req) });
   } catch (err: unknown) {
     logger.error('Signup error', { error: err });
-    return NextResponse.json({ error: 'Unable to create account right now.' }, { status: 500 });
+    return NextResponse.json({ error: 'Unable to create account right now.' }, { status: 500, headers: responseHeaders(req) });
   }
 }

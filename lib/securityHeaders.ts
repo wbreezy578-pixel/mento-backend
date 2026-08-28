@@ -43,6 +43,7 @@ export function buildCorsHeaders(origin: string | null | undefined): Record<stri
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Allow-Credentials': 'true',
+    'Cache-Control': 'no-store',
     Vary: 'Origin',
   };
 

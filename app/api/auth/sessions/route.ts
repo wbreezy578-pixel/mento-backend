@@ -2,6 +2,13 @@ import { NextResponse } from 'next/server';
 import { getActiveSessionId, getUserFromRequest } from '../../../lib/auth';
 import { prisma } from '../../../../lib/prisma';
 import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
+import { buildCorsHeaders } from '../../../../lib/securityHeaders';
+
+const responseHeaders = (req: Request) => ({ ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': 'GET, DELETE, OPTIONS' });
+
+export async function OPTIONS(req: Request) {
+  return new NextResponse(null, { status: 204, headers: responseHeaders(req) });
+}
 
 function maskNetworkAddress(value: string | null) {
   if (!value) return null;
@@ -15,7 +22,7 @@ function maskNetworkAddress(value: string | null) {
 export async function GET(req: Request) {
   const user = await getUserFromRequest(req);
   if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: responseHeaders(req) });
   }
 
   const sessions = await prisma.session.findMany({
@@ -34,16 +41,16 @@ export async function GET(req: Request) {
   });
 
   const activeSessionId = getActiveSessionId();
-  return NextResponse.json({ sessions: sessions.map((session) => ({ ...session, ipAddress: maskNetworkAddress(session.ipAddress), current: session.id === activeSessionId })) });
+  return NextResponse.json({ sessions: sessions.map((session) => ({ ...session, ipAddress: maskNetworkAddress(session.ipAddress), current: session.id === activeSessionId })) }, { headers: responseHeaders(req) });
 }
 
 export async function DELETE(req: Request) {
   const user = await getUserFromRequest(req);
   if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: responseHeaders(req) });
   }
   const limit = await ensureSlidingWindow(`sessions:revoke:${user.id}`, 20, 15 * 60);
-  if (!limit.ok) return NextResponse.json({ error: 'Too many session changes. Please try again later.' }, { status: 429 });
+  if (!limit.ok) return NextResponse.json({ error: 'Too many session changes. Please try again later.' }, { status: 429, headers: responseHeaders(req) });
 
   const { sessionId, allOther } = await req.json().catch(() => ({ sessionId: null, allOther: false }));
   if (sessionId) {
@@ -64,5 +71,5 @@ export async function DELETE(req: Request) {
     });
   }
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true }, { headers: responseHeaders(req) });
 }

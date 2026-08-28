@@ -127,7 +127,7 @@ export async function linkSupabaseOAuth(req: Request, provider: OAuthProvider) {
       return NextResponse.json({ error: 'The provider email must match your Mento account email.' }, { status: 403, headers: headers(req) });
     }
 
-    await prisma.$transaction(async (tx) => {
+    const linkedUser = await prisma.$transaction(async (tx) => {
       const current = await tx.user.findUnique({ where: { id: user.id } });
       if (!current || current.accountStatus !== 'ACTIVE') throw new InvalidAccountInputError('Account is not active.');
       if (current.supabaseUserId && current.supabaseUserId !== profile.externalUserId) {
@@ -138,7 +138,7 @@ export async function linkSupabaseOAuth(req: Request, provider: OAuthProvider) {
         throw new InvalidAccountInputError('That provider identity is already linked to another account.');
       }
       const hasPassword = Boolean(current.password?.trim());
-      await tx.user.update({
+      return tx.user.update({
         where: { id: user.id },
         data: {
           supabaseUserId: profile.externalUserId,
@@ -155,7 +155,7 @@ export async function linkSupabaseOAuth(req: Request, provider: OAuthProvider) {
     }, { maxWait: 10000, timeout: 30000 });
 
     await recordSecurityEvent(user.id, 'oauth_link_completed', { provider });
-    return NextResponse.json({ ok: true, provider, user: buildUserSummary(user) }, { headers: headers(req) });
+    return NextResponse.json({ ok: true, provider, user: buildUserSummary(linkedUser) }, { headers: headers(req) });
   } catch (error: unknown) {
     if (error instanceof InvalidAccountInputError) {
       return NextResponse.json({ error: error.message }, { status: 409, headers: headers(req) });

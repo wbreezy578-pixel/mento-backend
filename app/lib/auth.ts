@@ -270,8 +270,20 @@ export function requireUserScope(requestedUserId: string | null | undefined) {
   return activeUserId;
 }
 
-export function buildUserSummary(user: { id: string; email: string; name?: string | null }) {
-  return { id: user.id, email: user.email, name: user.name ?? null };
+export function buildUserSummary(user: {
+  id: string;
+  email: string;
+  name?: string | null;
+  authProvider?: string | null;
+  password?: string | null;
+}) {
+  return {
+    id: user.id,
+    email: normalizeEmail(user.email),
+    name: user.name ?? null,
+    authProvider: user.authProvider ?? null,
+    hasPassword: Boolean(user.password?.trim()),
+  };
 }
 
 export function signToken(userId: string, email: string, options: { sessionId: string; expiresInSeconds?: number }) {

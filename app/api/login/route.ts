@@ -142,7 +142,7 @@ export async function POST(req: Request) {
     });
     return response;
   } catch (err: unknown) {
-    logger.error('Login error', { error: err });
+    logger.error('Login failed', { errorName: err instanceof Error ? err.name : 'unknown' });
     return NextResponse.json({ error: 'Unable to sign in right now.' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

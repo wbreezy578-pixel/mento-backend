@@ -14,10 +14,6 @@ loadAndValidateEnvironment();
 const JWT_SECRET = getConfiguredJwtSecret();
 const resolvedJwtSecret = JWT_SECRET;
 
-function getJwtSecret(): string | undefined {
-  return resolvedJwtSecret;
-}
-
 function ensureJwtSecret(): string {
   if (!resolvedJwtSecret) {
     throw new Error('JWT_SECRET must be configured');
@@ -115,17 +111,15 @@ function extractTokenFromRequest(req: Request): { token: string | null; source: 
 
 export async function getUserFromRequest(req: Request) {
   const { token } = extractTokenFromRequest(req);
-  const tokenPresent = Boolean(token);
 
-  if (!tokenPresent || !token) {
+  if (!token) {
     userContext.enterWith(null);
     return null;
   }
 
   try {
-    const jwtSecret = getJwtSecret();
+    const jwtSecret = resolvedJwtSecret;
     if (!jwtSecret) {
-      logger.warn('JWT_SECRET not configured: auth verification is disabled');
       userContext.enterWith(null);
       return null;
     }
@@ -135,13 +129,11 @@ export async function getUserFromRequest(req: Request) {
       audience: JWT_AUDIENCE,
     }) as Partial<JwtPayload>;
     if (typeof payload !== 'object' || payload === null || typeof (payload as Partial<JwtPayload>).sub !== 'string' || typeof (payload as Partial<JwtPayload>).email !== 'string' || typeof (payload as Partial<JwtPayload>).sid !== 'string') {
-      logger.warn('Auth rejected: invalid JWT payload');
       userContext.enterWith(null);
       return null;
     }
 
     if ((payload as JwtPayload).type === 'refresh') {
-      logger.warn('Auth rejected: refresh token used as access token');
       userContext.enterWith(null);
       return null;
     }
@@ -157,7 +149,6 @@ export async function getUserFromRequest(req: Request) {
     const userFound = Boolean(user);
     const issuedAt = typeof payload.iat === 'number' ? payload.iat * 1000 : 0;
     if (!userFound || !user || !session || user.accountStatus !== 'ACTIVE' || issuedAt < user.credentialsChangedAt.getTime() - 1000) {
-      logger.warn('Auth rejected: user lookup failed');
       userContext.enterWith(null);
       return null;
     }
@@ -167,15 +158,7 @@ export async function getUserFromRequest(req: Request) {
       void prisma.session.update({ where: { id: sessionId }, data: { lastUsedAt: new Date() } }).catch(() => undefined);
     }
     return user;
-  } catch (error: unknown) {
-    const errorName = error instanceof Error ? error.name : 'UnknownError';
-    const tokenExpired = errorName === 'TokenExpiredError';
-    logger.warn('JWT verification failed', {
-      errorName,
-      tokenPresent,
-      tokenExpired,
-      algorithm: JWT_ALGORITHM,
-    });
+  } catch {
     userContext.enterWith(null);
     return null;
   }
@@ -228,11 +211,7 @@ export async function verifyPassword(password: string, passwordHash: string | nu
   if (isBcrypt) {
     try {
       return await bcrypt.compare(password, trimmedHash);
-    } catch (error) {
-      logger.warn('Password verification failed due to invalid bcrypt hash', {
-        error: error instanceof Error ? error.message : String(error),
-        hashLength: trimmedHash.length,
-      });
+    } catch {
       return false;
     }
   }
@@ -240,10 +219,6 @@ export async function verifyPassword(password: string, passwordHash: string | nu
   // Keep malformed/legacy account checks close to the bcrypt timing profile
   // without ever accepting or migrating the stored value.
   await bcrypt.compare(password, DUMMY_BCRYPT_HASH);
-  logger.warn('Rejected account with unsupported legacy password format', {
-    hashLength: trimmedHash.length,
-    category: 'legacy_password_rejected',
-  });
   return false;
 }
 
@@ -338,7 +313,7 @@ export async function recordSecurityEvent(userId: string | null, eventType: stri
   try {
     await prisma.securityEvent.create({ data: { userId, eventType, severity: 'info', details: details as Prisma.InputJsonValue } });
   } catch (error) {
-    logger.warn('Security event persistence failed', { error });
+    logger.warn('Security event persistence failed', { errorName: error instanceof Error ? error.name : 'unknown' });
   }
 }
 

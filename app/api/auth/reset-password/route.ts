@@ -82,12 +82,12 @@ export async function POST(req: Request) {
 
     await recordSecurityEvent(resetUser.id, 'password_reset_completed');
     await sendPasswordChangedEmail(resetUser.email).catch((error) => {
-      logger.warn('Password reset security notice could not be sent', { error });
+      logger.warn('Password reset security notice could not be sent', { errorName: error instanceof Error ? error.name : 'unknown' });
     });
 
     return NextResponse.json({ ok: true }, { status: 200, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   } catch (error) {
-    logger.error('Password reset failed', { error });
+    logger.error('Password reset failed', { errorName: error instanceof Error ? error.name : 'unknown' });
     return NextResponse.json({ error: 'Unable to reset password.' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

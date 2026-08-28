@@ -11,6 +11,7 @@ import {
 import { finalizePayment, startPayment } from './paymentService';
 import { getCircuitBreaker } from '../lib/resilience';
 import logger from '../lib/logger';
+import { isIdempotentProviderCancellationError } from './accountDeletionPolicy';
 
 const paddleBreaker = getCircuitBreaker('payment:paddle', 3, 60_000);
 
@@ -138,11 +139,12 @@ export async function cancelPaddleSubscriptionForAccountDeletion(subscriptionId:
     }
     paddleBreaker.recordSuccess();
   } catch (error) {
+    if (isIdempotentProviderCancellationError(error)) {
+      paddleBreaker.recordSuccess();
+      return;
+    }
     paddleBreaker.recordFailure();
-    logger.error('Paddle cancellation before account deletion failed', {
-      subscriptionId,
-      error: error instanceof Error ? error.message : String(error),
-    });
+    logger.error('Paddle cancellation before account deletion failed', { errorName: error instanceof Error ? error.name : 'unknown' });
     throw new Error('We could not cancel your active subscription. Your account was not deleted; please try again or contact support.', { cause: error });
   }
 }

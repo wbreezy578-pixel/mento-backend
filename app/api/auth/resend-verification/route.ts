@@ -29,7 +29,7 @@ export async function POST(req: Request) {
   if (user) {
     const token = await createEmailActionToken({ userId: user.id, purpose: 'VERIFY_EMAIL', expiresInMinutes: 60 });
     await sendVerificationEmail(user.email, token).catch((error) => {
-      logger.warn('Verification email delivery failed', { error });
+      logger.warn('Verification email delivery failed', { errorName: error instanceof Error ? error.name : 'unknown' });
     });
   }
   const remainingDelayMs = 650 - (Date.now() - startedAt);

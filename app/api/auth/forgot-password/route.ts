@@ -46,7 +46,7 @@ export async function POST(req: Request) {
       if (acceptsReset) {
         const token = await createPasswordResetToken(user.id);
         await sendPasswordResetEmail(user.email, token).catch((error) => {
-          logger.warn('Password reset email delivery failed', { error });
+          logger.warn('Password reset email delivery failed', { errorName: error instanceof Error ? error.name : 'unknown' });
         });
       }
       await recordSecurityEvent(user.id, 'password_reset_requested', { acceptsReset, networkSubject: authRateLimitSubject(clientIp) });
@@ -63,7 +63,7 @@ export async function POST(req: Request) {
       headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS },
     });
   } catch (error) {
-    logger.error('Forgot password failed', { error });
+    logger.error('Forgot password failed', { errorName: error instanceof Error ? error.name : 'unknown' });
     return NextResponse.json({ error: 'Unable to process password reset request.' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

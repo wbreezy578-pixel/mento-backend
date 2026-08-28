@@ -73,7 +73,7 @@ export async function POST(req: Request) {
     }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Account deletion failed.';
-    logger.error('Account deletion failed', { error });
+    logger.error('Account deletion request failed', { errorName: error instanceof Error ? error.name : 'unknown' });
 
     if (error instanceof Error) {
       if (/incorrect password/i.test(message)) {

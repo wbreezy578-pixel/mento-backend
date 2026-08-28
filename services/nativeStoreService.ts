@@ -5,6 +5,7 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { getRequiredEnv } from '../lib/env';
 import { finalizePayment, startPayment } from './paymentService';
+import { isIdempotentProviderCancellationError } from './accountDeletionPolicy';
 
 export type NativeStoreProductId = 'mento_pro_monthly' | 'mento_live_tutor_50' | 'mento_live_tutor_100';
 
@@ -40,6 +41,17 @@ type GoogleProductPurchase = {
   quantity?: number;
 };
 
+class GooglePlayPublisherError extends Error {
+  public readonly idempotentTerminal: boolean;
+
+  constructor(public readonly status: number, providerBody: string) {
+    super(`Google Play request failed with status ${status}.`);
+    this.name = 'GooglePlayPublisherError';
+    this.idempotentTerminal = status === 404 || status === 410
+      || /already (?:cancelled|canceled|deleted)|subscription (?:is )?(?:cancelled|canceled)|not found/i.test(providerBody);
+  }
+}
+
 function isNativeStoreProductId(value: string): value is NativeStoreProductId {
   return Object.prototype.hasOwnProperty.call(PRODUCT_CATALOG, value);
 }
@@ -73,7 +85,7 @@ async function googlePublisherRequest<T>(path: string, init?: RequestInit): Prom
   });
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`Google Play verification failed (${response.status}): ${body.slice(0, 300)}`);
+    throw new GooglePlayPublisherError(response.status, body.slice(0, 300));
   }
   if (response.status === 204 || response.headers.get('content-length') === '0') return {} as T;
   return await response.json() as T;
@@ -245,10 +257,14 @@ export async function cancelGooglePlaySubscriptionsForAccountDeletion(userId: st
     select: { id: true, purchaseToken: true },
   });
   for (const subscription of subscriptions) {
-    await googlePublisherRequest(
-      `/applications/${encodeURIComponent(PACKAGE_NAME)}/purchases/subscriptionsv2/tokens/${encodeURIComponent(subscription.purchaseToken)}:cancel`,
-      { method: 'POST', body: JSON.stringify({ cancellationContext: { cancellationType: 'USER_REQUESTED_STOP_RENEWALS' } }) },
-    );
+    try {
+      await googlePublisherRequest(
+        `/applications/${encodeURIComponent(PACKAGE_NAME)}/purchases/subscriptionsv2/tokens/${encodeURIComponent(subscription.purchaseToken)}:cancel`,
+        { method: 'POST', body: JSON.stringify({ cancellationContext: { cancellationType: 'USER_REQUESTED_STOP_RENEWALS' } }) },
+      );
+    } catch (error) {
+      if (!isIdempotentProviderCancellationError(error)) throw error;
+    }
     await prisma.storePurchase.update({ where: { id: subscription.id }, data: { autoRenewing: false, status: 'CANCELED_BY_USER', lastVerifiedAt: new Date() } });
   }
   return subscriptions.length;

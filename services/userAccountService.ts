@@ -11,6 +11,13 @@ export interface CreateUserAccountInput {
   authProvider?: SupportedAuthProvider;
   emailVerified?: boolean;
   externalUserId?: string;
+  legalConsent?: {
+    privacyVersion: string;
+    termsVersion: string;
+    aiNoticeVersion: string;
+    source: string;
+    acceptedAt?: Date;
+  };
 }
 
 export interface CreateUserAccountResult {
@@ -183,6 +190,18 @@ async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateU
 
     const freePlan = await ensureFreePlan(tx);
     await createDefaultWalletsAndPreferences(tx, user.id, freePlan.id);
+    if (input.legalConsent) {
+      await tx.consentRecord.create({
+        data: {
+          userId: user.id,
+          privacyVersion: input.legalConsent.privacyVersion,
+          termsVersion: input.legalConsent.termsVersion,
+          aiNoticeVersion: input.legalConsent.aiNoticeVersion,
+          source: input.legalConsent.source,
+          acceptedAt: input.legalConsent.acceptedAt ?? new Date(),
+        },
+      });
+    }
 
     return buildAccountResult(user, true);
   } catch (error) {
@@ -201,7 +220,7 @@ async function createNewUserAccount(tx: Prisma.TransactionClient, input: CreateU
   }
 }
 
-export async function createEmailAccount(input: CreateUserAccountInput): Promise<CreateUserAccountResult> {
+export async function createEmailAccount(input: CreateUserAccountInput & { legalConsent: NonNullable<CreateUserAccountInput['legalConsent']> }): Promise<CreateUserAccountResult> {
   return prisma.$transaction(
     async (tx) => createNewUserAccount(tx, { ...input, authProvider: 'email' }),
     { maxWait: 10000, timeout: 30000 }

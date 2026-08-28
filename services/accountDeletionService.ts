@@ -4,6 +4,11 @@ import logger from '../lib/logger';
 import { cancelPaddleSubscriptionForAccountDeletion } from './paddleService';
 import { cancelGooglePlaySubscriptionsForAccountDeletion } from './nativeStoreService';
 import { deleteSupabaseAuthUser } from './supabaseAdminService';
+import {
+  type AccountDeletionFailureCode,
+  isAccountDeletionJobStalled,
+  isAccountDeletionRetryDue,
+} from './accountDeletionPolicy';
 
 export class AccountDeletionPendingError extends Error {
   constructor(public readonly jobId: string) {
@@ -70,35 +75,45 @@ export async function processAccountDeletionJob(jobId: string) {
   });
   if (claim.count !== 1) throw new AccountDeletionPendingError(jobId);
   const job = await prisma.accountDeletionJob.findUniqueOrThrow({ where: { id: jobId } });
+  let failureCode: AccountDeletionFailureCode = 'internal_delete_failed';
 
   try {
     if (!job.paddleCanceledAt) {
+      failureCode = 'paddle_cancel_failed';
       if (job.paddleSubscriptionId) await cancelPaddleSubscriptionForAccountDeletion(job.paddleSubscriptionId);
       await prisma.accountDeletionJob.update({ where: { id: job.id }, data: { paddleCanceledAt: new Date() } });
     }
     if (!job.googlePlayCanceledAt) {
+      failureCode = 'google_play_cancel_failed';
       await cancelGooglePlaySubscriptionsForAccountDeletion(job.userId);
       await prisma.accountDeletionJob.update({ where: { id: job.id }, data: { googlePlayCanceledAt: new Date() } });
     }
     if (!job.supabaseDeletedAt) {
+      failureCode = 'supabase_delete_failed';
       if (job.supabaseUserId) await deleteSupabaseAuthUser(job.supabaseUserId);
       await prisma.accountDeletionJob.update({ where: { id: job.id }, data: { supabaseDeletedAt: new Date() } });
     }
+    failureCode = 'internal_delete_failed';
     await prisma.$transaction((tx) => removeInternalAccountData(tx, job.userId, job.id));
     return prisma.accountDeletionJob.findUniqueOrThrow({ where: { id: job.id } });
   } catch (error) {
-    logger.error('Durable account deletion attempt failed', { error, deletionJobId: job.id });
+    logger.error('Durable account deletion attempt failed', {
+      failureCode,
+      errorName: error instanceof Error ? error.name : 'unknown',
+      attempt: job.attempts,
+    });
     await prisma.accountDeletionJob.update({
       where: { id: job.id },
-      data: { status: 'PENDING', lastError: 'A deletion dependency is temporarily unavailable.' },
+      data: { status: 'PENDING', lastError: failureCode },
     }).catch(() => undefined);
     throw new AccountDeletionPendingError(job.id);
   }
 }
 
 export async function retryPendingAccountDeletions(limit = 20) {
+  const now = new Date();
   const staleBefore = new Date(Date.now() - 5 * 60 * 1000);
-  const jobs = await prisma.accountDeletionJob.findMany({
+  const candidates = await prisma.accountDeletionJob.findMany({
     where: {
       completedAt: null,
       OR: [
@@ -107,8 +122,11 @@ export async function retryPendingAccountDeletions(limit = 20) {
       ],
     },
     orderBy: { updatedAt: 'asc' },
-    take: Math.max(1, Math.min(limit, 100)),
+    take: 100,
   });
+  const jobs = candidates
+    .filter((job) => isAccountDeletionRetryDue(job, now))
+    .slice(0, Math.max(1, Math.min(limit, 100)));
   let completed = 0;
   for (const job of jobs) {
     try {
@@ -118,5 +136,18 @@ export async function retryPendingAccountDeletions(limit = 20) {
       if (!(error instanceof AccountDeletionPendingError)) throw error;
     }
   }
-  return { attempted: jobs.length, completed, pending: jobs.length - completed };
+  const pending = await prisma.accountDeletionJob.findMany({
+    where: { completedAt: null },
+    select: { attempts: true, createdAt: true },
+  });
+  const needsAttention = pending.filter((job) => isAccountDeletionJobStalled(job, now)).length;
+  if (needsAttention > 0) {
+    logger.warn('Account deletion jobs require operator attention', { needsAttention, pending: pending.length });
+  }
+  return {
+    attempted: jobs.length,
+    completed,
+    pending: pending.length,
+    needsAttention,
+  };
 }

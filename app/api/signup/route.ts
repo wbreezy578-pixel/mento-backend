@@ -5,8 +5,6 @@ import { createEmailActionToken } from '../../../lib/authSession';
 import { createNotification } from '../../services/notificationService';
 import { createEmailAccount, InvalidAccountInputError } from '../../../services/userAccountService';
 import { CURRENT_LEGAL_VERSIONS } from '../../../lib/legalVersions';
-import { prisma } from '../../../lib/prisma';
-import { randomUUID } from 'crypto';
 import { validateLegalAcceptance } from '../../../lib/legalConsent';
 import { sendVerificationEmail } from '../../../services/transactionalEmailService';
 import { ensureSlidingWindow } from '../../../lib/rateLimiter';
@@ -50,6 +48,12 @@ export async function POST(req: Request) {
         email: normalizedEmail,
         password,
         name,
+        legalConsent: {
+          privacyVersion: CURRENT_LEGAL_VERSIONS.privacy,
+          termsVersion: CURRENT_LEGAL_VERSIONS.terms,
+          aiNoticeVersion: CURRENT_LEGAL_VERSIONS.aiNotice,
+          source: 'android-signup',
+        },
       });
     } catch (error) {
       if (error instanceof InvalidAccountInputError) {
@@ -67,11 +71,6 @@ export async function POST(req: Request) {
     }
 
     const user = accountResult.user;
-    await prisma.$executeRaw`
-      INSERT INTO "ConsentRecord" ("id", "userId", "privacyVersion", "termsVersion", "aiNoticeVersion", "source", "acceptedAt", "revokedAt")
-      VALUES (${randomUUID()}, ${user.id}, ${CURRENT_LEGAL_VERSIONS.privacy}, ${CURRENT_LEGAL_VERSIONS.terms}, ${CURRENT_LEGAL_VERSIONS.aiNotice}, 'android-signup', ${new Date()}, NULL)
-      ON CONFLICT ("userId", "privacyVersion", "termsVersion", "aiNoticeVersion") DO NOTHING
-    `;
     const verificationToken = await createEmailActionToken({ userId: user.id, purpose: 'VERIFY_EMAIL', expiresInMinutes: 60 });
     await sendVerificationEmail(user.email, verificationToken);
     await recordSecurityEvent(user.id, 'signup_verification_sent');
@@ -89,7 +88,7 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ ok: true, requiresEmailVerification: true, message: 'Check your email to verify your Mento account.' }, { status: 201, headers: responseHeaders(req) });
   } catch (err: unknown) {
-    logger.error('Signup error', { error: err });
+    logger.error('Signup failed', { errorName: err instanceof Error ? err.name : 'unknown' });
     return NextResponse.json({ error: 'Unable to create account right now.' }, { status: 500, headers: responseHeaders(req) });
   }
 }

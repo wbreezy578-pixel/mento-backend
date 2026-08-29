@@ -47,6 +47,7 @@ export async function POST(req: Request) {
     const passwordFieldExists = typeof user.password === 'string' && user.password.trim().length > 0;
 
     if (!passwordFieldExists) {
+      await verifyPassword(String(password), DUMMY_BCRYPT_HASH);
       return NextResponse.json(
         { error: LOGIN_FAILURE_MESSAGE },
         { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } }

@@ -11,22 +11,26 @@ export async function OPTIONS(req: Request) {
 }
 
 export async function POST(req: Request) {
-  const body = await req.json().catch(() => ({}));
-  const user = await getUserFromRequest(req);
-  if (!user) {
-    const refreshToken = typeof body?.refreshToken === 'string' ? body.refreshToken.trim() : '';
-    const refreshSession = refreshToken ? await findSessionByToken(refreshToken) : null;
-    if (!refreshSession) return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
-    await revokeSession(refreshSession.id);
-    return clearLogoutCookies(req);
-  }
+  try {
+    const body = await req.json().catch(() => ({}));
+    const user = await getUserFromRequest(req);
+    if (!user) {
+      const refreshToken = typeof body?.refreshToken === 'string' ? body.refreshToken.trim() : '';
+      const refreshSession = refreshToken ? await findSessionByToken(refreshToken) : null;
+      if (!refreshSession) return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      await revokeSession(refreshSession.id);
+      return clearLogoutCookies(req);
+    }
 
-  if (body?.allDevices === true) await revokeAllUserSessions(user.id);
-  else {
-    const sessionId = getActiveSessionId();
-    if (sessionId) await revokeSession(sessionId);
+    if (body?.allDevices === true) await revokeAllUserSessions(user.id);
+    else {
+      const sessionId = getActiveSessionId();
+      if (sessionId) await revokeSession(sessionId);
+    }
+    return clearLogoutCookies(req);
+  } catch {
+    return NextResponse.json({ error: 'Unable to sign out right now.' }, { status: 503, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
-  return clearLogoutCookies(req);
 }
 
 function clearLogoutCookies(req: Request) {

@@ -5,10 +5,18 @@ const session = {
   create: vi.fn(),
   update: vi.fn(),
 };
+const passwordResetToken = {
+  findFirst: vi.fn(),
+  updateMany: vi.fn(),
+};
+const emailActionToken = {
+  findFirst: vi.fn(),
+  updateMany: vi.fn(),
+};
 
 vi.mock('./prisma', () => ({
   prisma: {
-    $transaction: vi.fn(async (operation: (transaction: { session: typeof session }) => unknown) => operation({ session })),
+    $transaction: vi.fn(async (operation: (transaction: { session: typeof session; passwordResetToken: typeof passwordResetToken; emailActionToken: typeof emailActionToken }) => unknown) => operation({ session, passwordResetToken, emailActionToken })),
   },
 }));
 
@@ -16,7 +24,7 @@ vi.mock('./logger', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { getRefreshSessionExpiry, isRefreshSessionExpired, REFRESH_SESSION_IDLE_TTL_MS, RefreshSessionAlreadyUsedError, rotateRefreshSession } from './authSession';
+import { consumeEmailActionToken, consumePasswordResetToken, getRefreshSessionExpiry, isRefreshSessionExpired, REFRESH_SESSION_IDLE_TTL_MS, RefreshSessionAlreadyUsedError, rotateRefreshSession } from './authSession';
 
 describe('refresh session lifetime', () => {
   it('enforces the rolling idle deadline without exceeding the absolute deadline', () => {
@@ -72,5 +80,49 @@ describe('rotateRefreshSession', () => {
       where: { id: 'old-session' },
       data: { replacedBySessionId: 'replacement-session' },
     });
+  });
+});
+
+describe('one-time authentication token consumption', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('claims a password-reset token atomically so replay gets no record', async () => {
+    let claimed = false;
+    const record = { id: 'reset-1', userId: 'user-1', user: { id: 'user-1' } };
+    passwordResetToken.findFirst.mockResolvedValue(record);
+    passwordResetToken.updateMany.mockImplementation(async () => {
+      if (claimed) return { count: 0 };
+      claimed = true;
+      return { count: 1 };
+    });
+
+    const results = await Promise.all([
+      consumePasswordResetToken('reset-token'),
+      consumePasswordResetToken('reset-token'),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(passwordResetToken.updateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps email verification tokens single-use under replay', async () => {
+    let claimed = false;
+    const record = { id: 'email-1', userId: 'user-1', user: { id: 'user-1' } };
+    emailActionToken.findFirst.mockResolvedValue(record);
+    emailActionToken.updateMany.mockImplementation(async () => {
+      if (claimed) return { count: 0 };
+      claimed = true;
+      return { count: 1 };
+    });
+
+    const results = await Promise.all([
+      consumeEmailActionToken('verification-token', 'VERIFY_EMAIL'),
+      consumeEmailActionToken('verification-token', 'VERIFY_EMAIL'),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(emailActionToken.updateMany).toHaveBeenCalledTimes(2);
   });
 });

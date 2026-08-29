@@ -68,26 +68,27 @@ export async function createPasswordResetToken(userId: string, expiresInMinutes 
 
 export async function consumePasswordResetToken(token: string) {
   const tokenHash = hashToken(token);
-  const passwordResetToken = await prisma.passwordResetToken.findFirst({
-    where: {
-      tokenHash,
-      usedAt: null,
-      revokedAt: null,
-      expiresAt: { gt: new Date() },
-    },
-    include: { user: true },
+  return prisma.$transaction(async (tx) => {
+    const now = new Date();
+    const passwordResetToken = await tx.passwordResetToken.findFirst({
+      where: {
+        tokenHash,
+        usedAt: null,
+        revokedAt: null,
+        expiresAt: { gt: now },
+      },
+      include: { user: true },
+    });
+
+    if (!passwordResetToken) return null;
+
+    const claimed = await tx.passwordResetToken.updateMany({
+      where: { id: passwordResetToken.id, usedAt: null, revokedAt: null, expiresAt: { gt: now } },
+      data: { usedAt: now, revokedAt: now },
+    });
+
+    return claimed.count === 1 ? passwordResetToken : null;
   });
-
-  if (!passwordResetToken) {
-    return null;
-  }
-
-  await prisma.passwordResetToken.update({
-    where: { id: passwordResetToken.id },
-    data: { usedAt: new Date(), revokedAt: new Date() },
-  });
-
-  return passwordResetToken;
 }
 
 export async function findSessionByToken(token: string) {

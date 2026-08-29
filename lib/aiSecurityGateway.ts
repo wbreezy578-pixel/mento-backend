@@ -6,6 +6,8 @@ import { consumeLiveTutorSeconds } from '../services/liveTutorBillingService';
 import logger from './logger';
 import { observeMonitoringLatency } from './monitoring';
 import { getRateLimitClientKey } from './requestMetadata';
+import { createHash } from 'node:crypto';
+import { prisma } from './prisma';
 
 export class AIRequestGatewayError extends Error {
   status: number;
@@ -24,6 +26,54 @@ export function getClientIp(req: Request): string {
 
 export function buildAIRequestId(prefix = 'ai'): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function stableSerialize(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`).join(',')}}`;
+}
+
+export function buildBoundAIRequestId(options: {
+  userId: string;
+  feature: string;
+  clientRequestId: string;
+  metadata?: Record<string, unknown>;
+}): string {
+  const clientRequestId = options.clientRequestId.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/.test(clientRequestId)) {
+    throw new AIRequestGatewayError(400, { error: 'Invalid request operation ID', code: 'invalid_operation_id' });
+  }
+  const binding = stableSerialize({
+    userId: options.userId,
+    feature: options.feature,
+    operationType: options.metadata?.operationType ?? options.feature,
+    conversationId: options.metadata?.conversationId ?? null,
+    payloadHash: options.metadata?.payloadHash ?? null,
+    clientRequestId,
+  });
+  return `ai-${createHash('sha256').update(binding).digest('hex')}`;
+}
+
+export async function assertAIRequestNotProcessed(options: {
+  userId: string;
+  feature: 'chat' | 'image' | 'live_tutor';
+  provider: string;
+  clientRequestId: string;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  const boundRequestId = buildBoundAIRequestId(options);
+  const existing = await prisma.usageLog.findUnique({
+    where: { provider_requestId: { provider: options.provider, requestId: boundRequestId } },
+    select: { id: true },
+  });
+  if (existing) {
+    throw new AIRequestGatewayError(409, {
+      error: 'This AI operation has already been processed. Reload the conversation before trying again.',
+      code: 'operation_already_processed',
+    });
+  }
 }
 
 export async function authenticateAIRequest(req: Request) {
@@ -148,10 +198,22 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
   billingDecision: BillingDecision;
   sanitizedInput?: string;
 }> {
-  const requestId = options.requestId;
-  let sanitizedInput: string | undefined;
-
   const userId = getUserId(options.user);
+  const boundMetadata = {
+    ...options.metadata,
+    payloadHash: options.metadata?.payloadHash
+      ?? (typeof options.securityInput === 'string'
+        ? createHash('sha256').update(options.securityInput).digest('hex')
+        : null),
+  };
+  const requestId = buildBoundAIRequestId({
+    userId,
+    feature: options.feature,
+    clientRequestId: options.requestId,
+    metadata: boundMetadata,
+  });
+  let sanitizedInput: string | undefined;
+  const billingMetadata = { ...boundMetadata, clientOperationId: options.requestId };
 
   if (typeof options.securityInput === 'string') {
     const securityStartedAt = Date.now();
@@ -174,10 +236,16 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
     provider: options.provider,
     requestId,
     modelUsed: options.modelUsed ?? null,
-    metadata: options.metadata,
+    metadata: billingMetadata,
     pending: options.pending ?? true,
   });
 
+  if (billingDecision.idempotent) {
+    throw new AIRequestGatewayError(409, {
+      error: 'This AI operation has already been processed. Reload the conversation before trying again.',
+      code: 'operation_already_processed',
+    });
+  }
   if (!billingDecision.allowed) {
     throw new AIRequestGatewayError(402, {
       error: billingDecision.reason,
@@ -192,6 +260,13 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
       sanitizedInput,
     });
 
+    if (typeof result === 'string' && !result.trim()) {
+      throw new AIRequestGatewayError(503, {
+        error: 'The AI provider did not produce a usable response.',
+        code: 'empty_ai_response',
+      });
+    }
+
     if (options.finalize !== false) await finalizeAIUsage({
       userId,
       feature: options.feature,
@@ -199,13 +274,7 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
       provider: options.provider,
       requestId,
       modelUsed: options.modelUsed ?? null,
-      metadata: options.metadata,
-    }).catch((finalizeError) => {
-      logger.error('AI billing finalization failed', {
-        error: String(finalizeError),
-        userId,
-        requestId,
-      });
+      metadata: billingMetadata,
     });
 
     return { result, billingDecision, sanitizedInput };
@@ -218,7 +287,7 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
         provider: options.provider,
         requestId,
         modelUsed: options.modelUsed ?? null,
-        metadata: options.metadata,
+        metadata: billingMetadata,
       });
     } catch (rollbackError) {
       logger.error('AI billing rollback failed', {

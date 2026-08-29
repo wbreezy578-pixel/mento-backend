@@ -4,7 +4,14 @@ const RATE_WINDOW_SECONDS = parseInt(process.env.RATE_WINDOW_SECONDS || '60', 10
 const RATE_LIMIT_PER_USER = parseInt(process.env.RATE_LIMIT_PER_USER || '30', 10);
 const RATE_LIMIT_PER_IP = parseInt(process.env.RATE_LIMIT_PER_IP || '60', 10);
 const MESSAGE_COOLDOWN_MS = parseInt(process.env.MESSAGE_COOLDOWN_MS || '2000', 10);
-const DAILY_MESSAGES_LIMIT = parseInt(process.env.DAILY_MESSAGES_LIMIT || '100', 10);
+// Product quotas are enforced by the billing ledger using the user's effective
+// plan. This optional global ceiling is abuse-only and is disabled by default.
+export function resolveDailyMessageAbuseLimit(rawValue: string | undefined): number {
+  const parsed = Number.parseInt(rawValue ?? '-1', 10);
+  return Number.isFinite(parsed) ? parsed : -1;
+}
+
+const DAILY_MESSAGES_LIMIT = resolveDailyMessageAbuseLimit(process.env.DAILY_MESSAGES_LIMIT);
 
 export async function enforceRateLimit(userId: string, ip: string) {
   // Cooldown per user

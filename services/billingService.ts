@@ -550,9 +550,13 @@ async function createUsageLedgerEntry(
   userChargeUSD: number,
   profitUSD: number,
   metadata?: Record<string, unknown>,
-): Promise<{ id: string; success: boolean; providerCostUSD: number; userChargeUSD: number; profitUSD: number }> {
+): Promise<{ id: string; success: boolean | null; providerCostUSD: number; userChargeUSD: number; profitUSD: number }> {
   const provider = input.provider ?? getDefaultProvider(input.feature);
-  const successValue = typeof input.success === 'boolean' ? input.success : (input.pending ? false : allowed);
+  const successValue = input.pending
+    ? null
+    : typeof input.success === 'boolean'
+      ? input.success
+      : allowed;
   const secondsUsed = typeof input.secondsUsed === 'number' ? input.secondsUsed : (input.feature === 'live_tutor' ? (input.amount ?? 1) * 60 : 0);
 
   try {
@@ -804,11 +808,15 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       }
 
       await lockWalletRow(tx, validatedInput.userId);
+      const pendingCutoff = new Date(Date.now() - 5 * 60 * 1000);
       const used = await tx.usageLog.count({
         where: {
           userId: validatedInput.userId,
           feature: toUsageFeature(validatedInput.feature),
-          success: true,
+          OR: [
+            { success: true },
+            { success: null, createdAt: { gte: pendingCutoff } },
+          ],
           createdAt: { gte: windowStart },
         },
       });

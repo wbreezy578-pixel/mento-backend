@@ -8,11 +8,13 @@ import {
   setConversationTitleIfMissing,
   updateConversationSummary,
 } from '@/lib/conversationDb';
-import { AIRequestGatewayError, authenticateAIRequest, enforceAIGatewayRateLimit, executeAIRequest, getClientIp, buildAIRequestId } from '../../../lib/aiSecurityGateway';
+import { AIRequestGatewayError, assertAIRequestNotProcessed, authenticateAIRequest, enforceAIGatewayRateLimit, executeAIRequest, getClientIp, buildAIRequestId } from '../../../lib/aiSecurityGateway';
 import { validateImageBuffer } from '../../../lib/imageValidator';
 import logger from '../../../lib/logger';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
 import { classifyAppError, createApiErrorResponse } from '../../../lib/errorHandling';
+import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../lib/aiGenerationLock';
+import { createHash } from 'node:crypto';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
@@ -114,7 +116,28 @@ export async function POST(req: Request) {
     }
     logger.info('Chat conversation selected', { userId, conversationId });
 
-    const historyForAI = await getConversationHistoryForAI(conversationId);
+    const operationPayloadHash = createHash('sha256')
+      .update(savedUserText)
+      .update('\0')
+      .update(answerMode)
+      .update('\0')
+      .update(validatedImage ? createHash('sha256').update(validatedImage.data).digest('hex') : 'no-image')
+      .digest('hex');
+    const generationOwnerId = `${userId}:${requestId}`;
+    if (!(await acquireAIGenerationLock(conversationId, generationOwnerId))) {
+      return buildErrorResponse('A response is already being generated for this conversation.', 409, 'generation_in_progress', req.headers.get('origin'), requestId);
+    }
+
+    try {
+      await assertAIRequestNotProcessed({
+        userId,
+        feature: validatedImage ? 'image' : 'chat',
+        provider: 'Gemini',
+        clientRequestId: requestId,
+        metadata: { conversationId, operationType: 'chat.send', payloadHash: operationPayloadHash },
+      });
+
+      const historyForAI = await getConversationHistoryForAI(conversationId);
 
     const result = await executeAIRequest({
       user,
@@ -123,7 +146,7 @@ export async function POST(req: Request) {
       provider: 'Gemini',
       amount: 1,
       requestId,
-      metadata: { conversationId },
+      metadata: { conversationId, operationType: 'chat.send', payloadHash: operationPayloadHash },
       pending: true,
       securityInput: userText,
       securityContext: { conversationId, hasImage: Boolean(validatedImage) },
@@ -161,7 +184,12 @@ export async function POST(req: Request) {
       logger.error('Failed to save chat to DB', { error: String(dbErr) });
     }
 
-    return NextResponse.json({ result: result.result, conversationId }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      return NextResponse.json({ result: result.result, conversationId }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    } finally {
+      await releaseAIGenerationLock(conversationId, generationOwnerId).catch((lockError) => {
+        logger.error('Failed to release chat generation lock', { conversationId, error: String(lockError) });
+      });
+    }
   } catch (err: unknown) {
     if (err instanceof AIRequestGatewayError) {
       return NextResponse.json(err.body, { status: err.status, headers: buildJsonHeaders(req.headers.get('origin')) });

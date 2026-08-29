@@ -17,6 +17,7 @@ import {
   executeAIRequest,
   getClientIp,
   buildAIRequestId,
+  assertAIRequestNotProcessed,
 } from '../../../../lib/aiSecurityGateway';
 import { validateImageBuffer } from '../../../../lib/imageValidator';
 import logger from '../../../../lib/logger';
@@ -25,6 +26,7 @@ import { createSafeStreamWriter } from '../../../lib/streamUtils';
 import { observeMonitoringLatency } from '../../../../lib/monitoring';
 import { createHash } from 'node:crypto';
 import { takeChatImage } from '../../../../lib/chatImageUpload';
+import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../lib/aiGenerationLock';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
@@ -126,9 +128,46 @@ export async function POST(req: Request) {
     }
     logger.info('Chat stream conversation selected', { userId, conversationId });
 
-    const historyStartedAt = Date.now();
-    const historyForAI = await getConversationHistoryForAI(conversationId);
-    observeMonitoringLatency('database', Date.now() - historyStartedAt, { route: 'chat-stream', operation: 'history' });
+    const operationPayloadHash = createHash('sha256')
+      .update(savedUserText)
+      .update('\0')
+      .update(answerMode)
+      .update('\0')
+      .update(validatedImage ? createHash('sha256').update(validatedImage.data).digest('hex') : 'no-image')
+      .digest('hex');
+    const generationOwnerId = `${userId}:${requestId}`;
+    const generationLockAcquired = await acquireAIGenerationLock(conversationId, generationOwnerId);
+    if (!generationLockAcquired) {
+      if (createdForRequest) await deleteConversation(conversationId).catch(() => undefined);
+      return NextResponse.json(
+        { error: 'A response is already being generated for this conversation.', code: 'generation_in_progress' },
+        { status: 409, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } },
+      );
+    }
+
+    try {
+      await assertAIRequestNotProcessed({
+        userId,
+        feature: validatedImage ? 'image' : 'chat',
+        provider: 'Gemini',
+        clientRequestId: requestId,
+        metadata: { conversationId, operationType: 'chat.send', payloadHash: operationPayloadHash },
+      });
+    } catch (error) {
+      await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
+      if (createdForRequest) await deleteConversation(conversationId).catch(() => undefined);
+      throw error;
+    }
+
+    let historyForAI: GeminiMessage[];
+    try {
+      const historyStartedAt = Date.now();
+      historyForAI = await getConversationHistoryForAI(conversationId);
+      observeMonitoringLatency('database', Date.now() - historyStartedAt, { route: 'chat-stream', operation: 'history' });
+    } catch (error) {
+      await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
+      throw error;
+    }
 
     const stream = new ReadableStream({
       async start(controller) {
@@ -167,6 +206,7 @@ export async function POST(req: Request) {
         } catch (dbErr) {
           logger.error('Failed to save initial conversation state before streaming', { error: String(dbErr) });
           if (createdForRequest) await deleteConversation(conversationId).catch(() => undefined);
+          await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
           if (!isStreamClosed()) {
             enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', message: 'Unable to start the response. Please try again.' })}\n\n`));
           }
@@ -182,7 +222,7 @@ export async function POST(req: Request) {
             provider: 'Gemini',
             amount: 1,
             requestId,
-            metadata: { conversationId },
+            metadata: { conversationId, operationType: 'chat.send', payloadHash: operationPayloadHash },
             pending: true,
             securityInput: userText,
             securityContext: { conversationId, hasImage: Boolean(validatedImage) },
@@ -284,6 +324,10 @@ export async function POST(req: Request) {
             enqueue(encoder.encode(`data: ${errPayload}\n\n`));
           }
           close();
+        } finally {
+          await releaseAIGenerationLock(conversationId, generationOwnerId).catch((lockError) => {
+            logger.error('Failed to release chat generation lock', { conversationId, error: String(lockError) });
+          });
         }
       }
     });

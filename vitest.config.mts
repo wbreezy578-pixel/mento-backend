@@ -19,6 +19,8 @@ export default defineConfig({
       "lib/requestMetadata.test.ts",
       "lib/internalJobAuth.test.ts",
       "lib/realtimeRedis.test.ts",
+      "lib/aiBillingSecurity.test.ts",
+      "lib/aiGenerationLock.test.ts",
       "services/liveTutorGeminiLiveService.test.ts",
       "services/geminiService.test.ts",
       "services/liveTutorAudioProtocol.test.ts",

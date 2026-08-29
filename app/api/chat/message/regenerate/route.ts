@@ -7,10 +7,14 @@ import {
   enforceAIGatewayRateLimit,
   executeAIRequest,
   getClientIp,
+  buildAIRequestId,
+  assertAIRequestNotProcessed,
 } from '../../../../../lib/aiSecurityGateway';
 import { buildCorsHeaders } from '../../../../../lib/securityHeaders';
 import logger from '../../../../../lib/logger';
 import { createSafeStreamWriter } from '../../../../lib/streamUtils';
+import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../../lib/aiGenerationLock';
+import { createHash } from 'node:crypto';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
@@ -34,15 +38,18 @@ export async function POST(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
 
-    let body: { messageId?: unknown; answerMode?: unknown } | null = null;
+    let body: { messageId?: unknown; answerMode?: unknown; requestId?: unknown } | null = null;
     try {
-      body = (await req.json()) as { messageId?: unknown; answerMode?: unknown };
+      body = (await req.json()) as { messageId?: unknown; answerMode?: unknown; requestId?: unknown };
     } catch {
       return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     const messageId = typeof body?.messageId === 'string' ? body.messageId.trim() : '';
     const answerMode = body?.answerMode === 'short' ? 'short' : 'detailed';
+    const requestId = typeof body?.requestId === 'string' && body.requestId.trim()
+      ? body.requestId.trim()
+      : buildAIRequestId('chat-regenerate');
     if (!messageId) {
       return NextResponse.json({ error: 'Invalid input: messageId is required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
@@ -94,12 +101,43 @@ export async function POST(req: Request) {
       : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
     const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${regeneratePrompt.trim()}${modeInstruction}` }] };
     const contents: GeminiMessage[] = [...historyForAI, userEntry];
+    const operationPayloadHash = createHash('sha256')
+      .update(messageId)
+      .update('\0')
+      .update(regeneratePrompt.trim())
+      .update('\0')
+      .update(answerMode)
+      .digest('hex');
+    const generationOwnerId = `${user.id}:${requestId}`;
+    const generationLockAcquired = await acquireAIGenerationLock(conversationId, generationOwnerId);
+    if (!generationLockAcquired) {
+      return NextResponse.json(
+        { error: 'A response is already being generated for this conversation.', code: 'generation_in_progress' },
+        { status: 409, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } },
+      );
+    }
+    try {
+      await assertAIRequestNotProcessed({
+        userId: user.id,
+        feature: 'chat',
+        provider: 'Gemini',
+        clientRequestId: requestId,
+        metadata: { conversationId, operationType: 'chat.regenerate', payloadHash: operationPayloadHash, targetMessageId: messageId },
+      });
+    } catch (error) {
+      await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
+      throw error;
+    }
 
-    const encoder = new TextEncoder();
-    await prisma.conversationMessage.update({
-      where: { id: messageId },
-      data: { status: 'streaming', content: '', text: '' },
-    });
+    try {
+      await prisma.conversationMessage.update({
+        where: { id: messageId },
+        data: { status: 'streaming', content: '', text: '' },
+      });
+    } catch (error) {
+      await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
+      throw error;
+    }
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
@@ -113,8 +151,8 @@ export async function POST(req: Request) {
             feature: 'chat',
             provider: 'Gemini',
             amount: 1,
-            requestId: messageId,
-            metadata: { conversationId },
+            requestId,
+            metadata: { conversationId, operationType: 'chat.regenerate', payloadHash: operationPayloadHash, targetMessageId: messageId },
             pending: true,
             securityInput: regeneratePrompt.trim(),
             securityContext: { conversationId },
@@ -161,6 +199,10 @@ export async function POST(req: Request) {
             enqueue(encoder.encode(`data: ${errorPayload}\n\n`));
           }
           close();
+        } finally {
+          await releaseAIGenerationLock(conversationId, generationOwnerId).catch((lockError) => {
+            logger.error('Failed to release regenerate lock', { conversationId, error: String(lockError) });
+          });
         }
       },
     });

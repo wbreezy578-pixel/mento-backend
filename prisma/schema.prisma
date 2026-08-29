@@ -188,7 +188,7 @@ model UsageLog {
   metadata        Json?
   modelUsed       String?
   planName        String?
-  success         Boolean  @default(true)
+  success         Boolean? @default(true)
   user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([provider, requestId])

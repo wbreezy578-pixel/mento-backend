@@ -2,6 +2,10 @@ import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../../../lib/auth';
 import { prisma } from '../../../../../lib/prisma';
 import logger from '../../../../../lib/logger';
+import { ensureCooldown } from '../../../../../lib/rateLimiter';
+
+const MAX_EDIT_LENGTH = 8_000;
+const EDIT_COOLDOWN_MS = 1_000;
 
 /**
  * POST /api/chat/message/edit
@@ -24,6 +28,18 @@ export async function POST(req: Request) {
     if (!text || typeof text !== 'string' || !text.trim()) {
       return NextResponse.json({ error: 'Invalid text' }, { status: 400 });
     }
+    const normalizedText = text.trim();
+    if (normalizedText.length > MAX_EDIT_LENGTH) {
+      return NextResponse.json({ error: `Message must be ${MAX_EDIT_LENGTH.toLocaleString()} characters or fewer` }, { status: 413 });
+    }
+
+    const rateLimit = await ensureCooldown(`chat-edit:${user.id}`, EDIT_COOLDOWN_MS);
+    if (!rateLimit.ok) {
+      return NextResponse.json(
+        { error: 'Please wait a moment before editing another message.' },
+        { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSec ?? 1) } },
+      );
+    }
 
     // Fetch the message to verify conversation ownership
     const message = await prisma.conversationMessage.findUnique({
@@ -45,13 +61,31 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Cannot edit assistant messages' }, { status: 400 });
     }
 
-    // Update the message
-    const updated = await prisma.conversationMessage.update({
-      where: { id: messageId },
-      data: { text: text.trim() }
+    const { updated, deletedMessageIds } = await prisma.$transaction(async (tx) => {
+      const staleMessages = await tx.conversationMessage.findMany({
+        where: {
+          conversationId: message.conversationId,
+          createdAt: { gt: message.createdAt },
+        },
+        select: { id: true },
+      });
+      if (staleMessages.length > 0) {
+        await tx.conversationMessage.deleteMany({
+          where: { id: { in: staleMessages.map((item) => item.id) } },
+        });
+      }
+      const updatedMessage = await tx.conversationMessage.update({
+        where: { id: messageId },
+        data: { text: normalizedText, content: normalizedText, status: 'completed' },
+      });
+      await tx.conversation.update({
+        where: { id: message.conversationId },
+        data: { updatedAt: new Date(), summary: null, summaryUpdatedAt: null },
+      });
+      return { updated: updatedMessage, deletedMessageIds: staleMessages.map((item) => item.id) };
     });
 
-    return NextResponse.json({ success: true, message: updated });
+    return NextResponse.json({ success: true, message: updated, deletedMessageIds });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Internal Server Error';
     logger.error('Edit message failed', { error: err });

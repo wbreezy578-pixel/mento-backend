@@ -1,6 +1,6 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { buildGeminiHealthCheckResult, buildGeminiRequestPayload, classifyGeminiError, getModelCandidatesForKind, isGeminiResponseSuccessful, shouldTryNextGeminiModel } from './geminiService';
+import { boundGeminiContext, buildGeminiHealthCheckResult, buildGeminiRequestPayload, classifyGeminiError, extractLatestUserPrompt, getModelCandidatesForKind, isGeminiResponseSuccessful, shouldFallbackStreamingModel, shouldTryNextGeminiModel } from './geminiService';
 
 test('getModelCandidatesForKind uses a supported fallback chain', () => {
   const candidates = getModelCandidatesForKind('chat', 'gemini-3.5-flash');
@@ -55,4 +55,31 @@ test('buildGeminiRequestPayload preserves image bytes as Gemini inlineData', () 
     inlineData: { mimeType: 'image/jpeg', data: '/9j/4AAQ' },
   });
   assert.match(payload.systemInstruction, /When analyzing images/);
+});
+
+test('security input uses only the latest user turn instead of accumulated history', () => {
+  const prompt = extractLatestUserPrompt([
+    { role: 'user', parts: [{ text: 'older question' }] },
+    { role: 'model', parts: [{ text: 'a very long previous answer' }] },
+    { role: 'user', parts: [{ text: 'new question' }] },
+  ]);
+
+  assert.equal(prompt, 'new question');
+});
+
+test('context budgeting preserves the newest turns and drops old context', () => {
+  const bounded = boundGeminiContext([
+    { role: 'user', parts: [{ text: 'old-12345' }] },
+    { role: 'model', parts: [{ text: 'middle-12345' }] },
+    { role: 'user', parts: [{ text: 'latest' }] },
+  ], 18);
+
+  assert.deepEqual(bounded.map((message) => message.parts[0].text), ['latest']);
+});
+
+test('streaming model fallback is allowed only before any token is emitted', () => {
+  const overload = { status: 503, message: 'Model overloaded' };
+  assert.equal(shouldFallbackStreamingModel(overload, false), true);
+  assert.equal(shouldFallbackStreamingModel(overload, true), false);
+  assert.equal(shouldFallbackStreamingModel({ status: 401, message: 'Invalid key' }, false), false);
 });

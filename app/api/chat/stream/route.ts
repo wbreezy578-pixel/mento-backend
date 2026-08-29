@@ -214,7 +214,7 @@ export async function POST(req: Request) {
                 const payload = JSON.stringify({ type: 'token', token });
                 enqueue(encoder.encode(`data: ${payload}\n\n`));
 
-              }, modelToUse, req.signal);
+              }, modelToUse, req.signal, sanitizedText);
 
               return assistantText;
             },
@@ -240,6 +240,17 @@ export async function POST(req: Request) {
             }
           } catch (dbErr) {
             logger.error('Failed to finalize assistant message after streaming', { error: String(dbErr), assistantMessageId });
+            if (assistantMessageId) {
+              await prisma.conversationMessage.update({
+                where: { id: assistantMessageId },
+                data: { status: 'failed' },
+              }).catch(() => undefined);
+            }
+            if (!isStreamClosed()) {
+              enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', message: 'The reply was generated but could not be saved to history. Please copy it before leaving.' })}\n\n`));
+            }
+            close();
+            return;
           }
 
           if (!isStreamClosed()) {

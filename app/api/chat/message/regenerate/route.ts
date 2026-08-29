@@ -127,7 +127,7 @@ export async function POST(req: Request) {
                 finalText += token;
                 const payload = JSON.stringify({ type: 'token', token });
                 enqueue(encoder.encode(`data: ${payload}\n\n`));
-              }, modelToUse, req.signal);
+              }, modelToUse, req.signal, regeneratePrompt.trim());
               return finalText;
             },
           });

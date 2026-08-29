@@ -167,6 +167,10 @@ export function shouldTryNextGeminiModel(error: unknown): boolean {
   return category === 'model_not_found' || category === 'rate_limit' || category === 'model_overloaded';
 }
 
+export function shouldFallbackStreamingModel(error: unknown, emittedToken: boolean): boolean {
+  return !emittedToken && shouldTryNextGeminiModel(error);
+}
+
 function assertFeatureEnabled(feature: boolean, message: string): void {
   if (!feature) {
     throw new Error(message);
@@ -191,6 +195,33 @@ function getMaxOutputTokensForKind(kind: GeminiModelKind): number {
 function normalizeText(text?: string): string | undefined {
   const trimmedText = typeof text === 'string' ? text.trim() : '';
   return trimmedText ? trimmedText : undefined;
+}
+
+const DEFAULT_CHAT_CONTEXT_MAX_CHARS = 60_000;
+
+function getChatContextMaxChars(): number {
+  const configured = Number.parseInt(process.env.CHAT_CONTEXT_MAX_CHARS ?? '', 10);
+  return Number.isFinite(configured) && configured >= 8_000
+    ? configured
+    : DEFAULT_CHAT_CONTEXT_MAX_CHARS;
+}
+
+export function boundGeminiContext(messages: GeminiMessage[], maxChars = getChatContextMaxChars()): GeminiMessage[] {
+  if (messages.length <= 1) return messages;
+
+  const retained: GeminiMessage[] = [];
+  let retainedChars = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const messageChars = message.parts.reduce((total, part) => total + (part.text?.length ?? 0), 0);
+    if (retained.length > 0 && retainedChars + messageChars > maxChars) break;
+    retained.unshift(message);
+    retainedChars += messageChars;
+  }
+  while (retained.length > 1 && retained[0].role === 'model') {
+    retained.shift();
+  }
+  return retained;
 }
 
 export function isGeminiResponseSuccessful(response: unknown): boolean {
@@ -283,7 +314,7 @@ function buildGeminiRequestPayload(input: string | GeminiContent[], kind: Gemini
       }
     }
 
-    const contents = nonSystemMessages
+    const contents = boundGeminiContext(nonSystemMessages
       .map((message) => {
         const compactedParts = compactParts(message.parts);
         if (compactedParts.length === 0) {
@@ -294,7 +325,7 @@ function buildGeminiRequestPayload(input: string | GeminiContent[], kind: Gemini
           parts: compactedParts,
         };
       })
-      .filter((message): message is GeminiMessage => Boolean(message));
+      .filter((message): message is GeminiMessage => Boolean(message)));
 
     if (contents.length === 0) {
       throw new Error('Conversation must contain at least one user or model message');
@@ -312,26 +343,21 @@ function buildGeminiRequestPayload(input: string | GeminiContent[], kind: Gemini
 
 export { buildGeminiRequestPayload };
 
-function extractPromptText(input: string | GeminiContent[]): string {
+export function extractLatestUserPrompt(input: string | GeminiContent[]): string {
   if (typeof input === 'string') {
     return input.trim();
   }
 
   if (Array.isArray(input)) {
-    const texts = input.flatMap((item) => {
-      if (typeof item === 'object' && 'role' in item && Array.isArray(item.parts)) {
-        return item.parts.map((part) => part.text || '').filter(Boolean);
-      }
-      return [];
-    });
-    return texts.join('\n').trim();
+    const latestUserMessage = [...input].reverse().find((item) => item.role === 'user');
+    return latestUserMessage?.parts.map((part) => part.text || '').filter(Boolean).join('\n').trim() ?? '';
   }
 
   return '';
 }
 
 async function runSecurityCheck(input: string | GeminiContent[]): Promise<void> {
-  const promptText = extractPromptText(input);
+  const promptText = extractLatestUserPrompt(input);
   const result = await secureAIInput(promptText || 'Please continue the conversation.', {
     userId: 'gemini-service',
     requestId: `gemini-${Date.now()}`,
@@ -587,7 +613,8 @@ export async function askGeminiStream(
   input: string | GeminiContent[],
   onToken: (token: string) => Promise<void> | void,
   modelOverride?: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  securityInputOverride?: string,
 ): Promise<string> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
   assertFeatureEnabled(AI_FEATURES.STREAMING, 'Streaming is currently disabled.');
@@ -606,7 +633,7 @@ export async function askGeminiStream(
     throw new Error('Gemini is temporarily unavailable. Please try again shortly.');
   }
 
-  await runSecurityCheck(input);
+  await runSecurityCheck(securityInputOverride ?? input);
   const payload = buildGeminiRequestPayload(input, requestKind);
   const requestStartedAt = Date.now();
   const candidates = getModelCandidatesForKind(requestKind, modelOverride);
@@ -647,6 +674,7 @@ export async function askGeminiStream(
         return '';
       }
 
+      let emittedTokenForModel = false;
       try {
         currentStream = await retryGeminiCall(async () => {
           logger.info('Calling Gemini streaming provider', {
@@ -684,6 +712,7 @@ export async function askGeminiStream(
           }
 
           completionText += chunkText;
+          emittedTokenForModel = true;
           if (!firstTokenObserved) {
             firstTokenObserved = true;
             observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'first-token' });
@@ -726,6 +755,10 @@ export async function askGeminiStream(
           classification,
           latencyMs: Date.now() - requestStartedAt,
         });
+
+        if (!shouldFallbackStreamingModel(error, emittedTokenForModel)) {
+          break;
+        }
       }
     }
   } finally {

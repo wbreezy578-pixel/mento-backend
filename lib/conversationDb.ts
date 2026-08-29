@@ -174,6 +174,10 @@ export async function getConversationHistoryForAI(conversationId: string) {
     where: { id: conversationId },
     select: {
       messages: {
+        where: {
+          status: 'completed',
+          OR: [{ content: { not: '' } }, { text: { not: '' } }],
+        },
         orderBy: { createdAt: 'desc' },
         take: AI_HISTORY_MESSAGE_LIMIT,
         select: {

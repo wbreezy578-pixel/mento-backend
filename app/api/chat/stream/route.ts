@@ -88,6 +88,7 @@ export async function POST(req: Request) {
 
     let conversationId = typeof body?.conversationId === 'string' ? body.conversationId : undefined;
     let createdForRequest = false;
+    let userMessageId: string | null = null;
     if (conversationId && !(await validateConversationOwnership(conversationId, userId))) {
       return NextResponse.json({ error: 'Forbidden' }, { status: 403, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
@@ -122,6 +123,11 @@ export async function POST(req: Request) {
       const conv = await createConversationWithInitialMessage(userId, savedUserText, { requestId });
       conversationId = conv.id;
       createdForRequest = true;
+      const initialUserMessage = await prisma.conversationMessage.findUnique({
+        where: { conversationId_requestId_role: { conversationId, requestId, role: 'user' } },
+        select: { id: true },
+      });
+      userMessageId = initialUserMessage?.id ?? null;
     }
     logger.info('Chat stream conversation selected', { userId, conversationId });
 
@@ -184,7 +190,11 @@ export async function POST(req: Request) {
             await setConversationTitleIfMissing(conversationId, message);
           }
           if (!createdForRequest) {
-            await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
+            const savedUserMessage = await addMessageToConversation(conversationId, 'user', savedUserText, userId, { requestId });
+            userMessageId = savedUserMessage.id;
+          }
+          if (userMessageId) {
+            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'user_message', messageId: userMessageId })}\n\n`));
           }
           if (repeatedPrompt) {
             await prisma.chatAnalyticsEvent.create({

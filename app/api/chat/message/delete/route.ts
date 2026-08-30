@@ -59,6 +59,15 @@ export async function POST(req: Request) {
       if (targetIndex < 0) {
         return NextResponse.json({ error: 'Message not found' }, { status: 404 });
       }
+      if (targetIndex === 0) {
+        return NextResponse.json(
+          {
+            error: 'Deleting the first message would delete the entire conversation. Use Delete Conversation instead.',
+            code: 'delete_conversation_required',
+          },
+          { status: 409 },
+        );
+      }
       deletedMessageIds = orderedMessages.slice(targetIndex).map((item) => item.id);
       await prisma.$transaction([
         prisma.conversationMessage.deleteMany({ where: { id: { in: deletedMessageIds } } }),

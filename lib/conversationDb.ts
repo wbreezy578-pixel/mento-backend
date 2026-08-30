@@ -1,6 +1,5 @@
 import { prisma } from './prisma';
 
-const messageDedupCache = new Map<string, { expiresAt: number; messageId: string }>();
 const AI_HISTORY_MESSAGE_LIMIT = 40;
 export const RECENT_MESSAGE_WINDOW = AI_HISTORY_MESSAGE_LIMIT;
 
@@ -43,6 +42,7 @@ export async function createConversationWithInitialMessage(
         status: 'completed',
         content: text,
         text,
+        requestId: options?.requestId,
       },
     });
     return conversation;
@@ -96,15 +96,14 @@ export async function addMessageToConversation(
   conversationId: string,
   role: 'user' | 'assistant',
   text: string,
-  userId?: string,
+  userId: string,
   options?: { requestId?: string; status?: 'streaming' | 'completed' | 'failed' }
 ) {
-  const dedupKey = options?.requestId ? `${options.requestId}:${role}` : undefined;
-  if (dedupKey) {
-    const cached = messageDedupCache.get(dedupKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      return await prisma.conversationMessage.findUnique({
-        where: { id: cached.messageId },
+  if (options?.requestId) {
+    const existing = await prisma.conversationMessage.findUnique({
+      where: {
+        conversationId_requestId_role: { conversationId, requestId: options.requestId, role },
+      },
         select: {
           id: true,
           conversationId: true,
@@ -113,49 +112,21 @@ export async function addMessageToConversation(
           content: true,
           createdAt: true,
         },
-      });
-    }
-  }
-
-  const recentDuplicate = await prisma.conversationMessage.findFirst({
-    where: {
-      conversationId,
-      role,
-      userId: userId ?? '',
-      OR: [{ content: text }, { text }],
-      createdAt: {
-        gte: new Date(Date.now() - 5_000),
-      },
-    },
-    orderBy: { createdAt: 'desc' },
-    select: {
-      id: true,
-      conversationId: true,
-      role: true,
-      text: true,
-      content: true,
-      createdAt: true,
-    },
-  });
-
-  if (recentDuplicate) {
-    return recentDuplicate;
+    });
+    if (existing) return existing;
   }
 
   const message = await prisma.conversationMessage.create({
     data: {
       conversationId,
-      userId: userId ?? '',
+      userId,
       role,
         status: options?.status ?? 'completed',
       content: text,
       text,
+      requestId: options?.requestId,
     },
   });
-
-  if (dedupKey) {
-    messageDedupCache.set(dedupKey, { expiresAt: Date.now() + 60_000, messageId: message.id });
-  }
 
   await prisma.conversation.update({
     where: { id: conversationId },

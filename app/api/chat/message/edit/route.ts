@@ -2,10 +2,12 @@ import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../../../lib/auth';
 import { prisma } from '../../../../../lib/prisma';
 import logger from '../../../../../lib/logger';
-import { ensureCooldown } from '../../../../../lib/rateLimiter';
+import { ensureCooldown, ensureSlidingWindow } from '../../../../../lib/rateLimiter';
 
 const MAX_EDIT_LENGTH = 8_000;
 const EDIT_COOLDOWN_MS = 1_000;
+const EDIT_WINDOW_LIMIT = 30;
+const EDIT_WINDOW_SECONDS = 15 * 60;
 
 /**
  * POST /api/chat/message/edit
@@ -18,17 +20,25 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const body = await req.json();
+    let body: { messageId?: unknown; text?: unknown };
+    try {
+      body = await req.json() as { messageId?: unknown; text?: unknown };
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
     const { messageId, text } = body;
 
-    if (!messageId || typeof messageId !== 'string') {
+    if (typeof messageId !== 'string' || !messageId.trim() || messageId.length > 128) {
       return NextResponse.json({ error: 'Invalid messageId' }, { status: 400 });
     }
+    const normalizedMessageId = messageId.trim();
 
-    if (!text || typeof text !== 'string' || !text.trim()) {
+    if (typeof text !== 'string' || !text.trim()) {
       return NextResponse.json({ error: 'Invalid text' }, { status: 400 });
     }
-    const normalizedText = text.trim();
+    // Match normal chat submission: canonical Unicode normalization, trim,
+    // and the same 8,000-character ceiling before anything reaches storage.
+    const normalizedText = text.normalize('NFC').trim();
     if (normalizedText.length > MAX_EDIT_LENGTH) {
       return NextResponse.json({ error: `Message must be ${MAX_EDIT_LENGTH.toLocaleString()} characters or fewer` }, { status: 413 });
     }
@@ -40,10 +50,22 @@ export async function POST(req: Request) {
         { status: 429, headers: { 'Retry-After': String(rateLimit.retryAfterSec ?? 1) } },
       );
     }
+    const editWindow = await ensureSlidingWindow(
+      `chat-edit:${user.id}`,
+      EDIT_WINDOW_LIMIT,
+      EDIT_WINDOW_SECONDS,
+      'rl:chat-edit',
+    );
+    if (!editWindow.ok) {
+      return NextResponse.json(
+        { error: 'Too many message edits. Please wait before trying again.' },
+        { status: 429, headers: { 'Retry-After': String(editWindow.retryAfterSec ?? EDIT_WINDOW_SECONDS) } },
+      );
+    }
 
     // Fetch the message to verify conversation ownership
     const message = await prisma.conversationMessage.findUnique({
-      where: { id: messageId },
+      where: { id: normalizedMessageId },
       include: { conversation: { select: { userId: true } } }
     });
 
@@ -75,7 +97,7 @@ export async function POST(req: Request) {
         });
       }
       const updatedMessage = await tx.conversationMessage.update({
-        where: { id: messageId },
+        where: { id: normalizedMessageId },
         data: { text: normalizedText, content: normalizedText, status: 'completed' },
       });
       await tx.conversation.update({

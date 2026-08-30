@@ -14,6 +14,7 @@ import { buildCorsHeaders } from '../../../../../lib/securityHeaders';
 import logger from '../../../../../lib/logger';
 import { createSafeStreamWriter } from '../../../../lib/streamUtils';
 import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../../lib/aiGenerationLock';
+import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../../lib/userSettings';
 import { createHash } from 'node:crypto';
 
 const CORS_METHODS = 'POST, OPTIONS';
@@ -100,7 +101,12 @@ export async function POST(req: Request) {
       ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
       : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
     const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${regeneratePrompt.trim()}${modeInstruction}` }] };
-    const contents: GeminiMessage[] = [...historyForAI, userEntry];
+    const tutorLanguage = await getTutorLanguage(user.id);
+    const contents: GeminiMessage[] = [
+      { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
+      ...historyForAI,
+      userEntry,
+    ];
     const operationPayloadHash = createHash('sha256')
       .update(messageId)
       .update('\0')
@@ -212,7 +218,8 @@ export async function POST(req: Request) {
         ...buildCorsHeaders(req.headers.get('origin')),
         'Access-Control-Allow-Methods': CORS_METHODS,
         'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-store, private',
+        'X-Accel-Buffering': 'no',
         Connection: 'keep-alive',
       },
     });

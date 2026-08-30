@@ -16,6 +16,7 @@ export default defineConfig({
       "app/api/auth/refresh.security.test.ts",
       "app/api/auth/logout.security.test.ts",
       "app/api/authFlowSecurity.test.ts",
+      "app/api/chat/message/edit/route.test.ts",
       "lib/requestMetadata.test.ts",
       "lib/internalJobAuth.test.ts",
       "lib/realtimeRedis.test.ts",

@@ -14,6 +14,7 @@ import logger from '../../../lib/logger';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
 import { classifyAppError, createApiErrorResponse } from '../../../lib/errorHandling';
 import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../lib/aiGenerationLock';
+import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../lib/userSettings';
 import { createHash } from 'node:crypto';
 
 const CORS_METHODS = 'POST, OPTIONS';
@@ -163,7 +164,12 @@ export async function POST(req: Request) {
           ],
         };
         const priorHistory = createdForRequest ? historyForAI.slice(0, -1) : historyForAI;
-        const contents: GeminiMessage[] = [...priorHistory, userEntry];
+        const tutorLanguage = await getTutorLanguage(userId);
+        const contents: GeminiMessage[] = [
+          { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
+          ...priorHistory,
+          userEntry,
+        ];
 
         const modelToUse = billingDecision.modelUsed ?? undefined;
         return askGemini(contents, modelToUse);

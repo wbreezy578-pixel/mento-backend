@@ -19,16 +19,17 @@ import {
   buildAIRequestId,
   assertAIRequestNotProcessed,
 } from '../../../../lib/aiSecurityGateway';
-import { validateImageBuffer } from '../../../../lib/imageValidator';
+import { MAX_IMAGE_BYTES, validateImageBuffer } from '../../../../lib/imageValidator';
 import logger from '../../../../lib/logger';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import { createSafeStreamWriter } from '../../../lib/streamUtils';
 import { observeMonitoringLatency } from '../../../../lib/monitoring';
 import { createHash } from 'node:crypto';
-import { takeChatImage } from '../../../../lib/chatImageUpload';
 import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../lib/aiGenerationLock';
+import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../lib/userSettings';
 
 const CORS_METHODS = 'POST, OPTIONS';
+const MAX_IMAGE_BASE64_CHARS = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
 
 export async function OPTIONS(req: Request) {
   return new NextResponse(null, {
@@ -93,18 +94,15 @@ export async function POST(req: Request) {
     const userText = message || (imagePayload ? 'Please analyze the attached image and explain it clearly as a tutor.' : '');
 
     // Validate image if provided
-    let validatedImage: { data: string; mimeType: string; uri?: string | null } | null = null;
+    let validatedImage: { data: string; mimeType: string } | null = null;
     if (imagePayload) {
-      let imageData = imagePayload.data;
-      let imageMimeType = imagePayload.mimeType;
-      if (typeof imageData !== 'string' && typeof imagePayload.uri === 'string') {
-        const uploadId = imagePayload.uri.split('/').pop() || '';
-        const uploaded = takeChatImage(uploadId);
-        imageData = uploaded?.data;
-        imageMimeType = uploaded?.mimeType;
-      }
+      const imageData = imagePayload.data;
+      const imageMimeType = imagePayload.mimeType;
       if (typeof imageData !== 'string' || typeof imageMimeType !== 'string') {
-        return NextResponse.json({ error: 'Invalid image: upload has expired or is malformed' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+        return NextResponse.json({ error: 'Invalid image: inline image data is required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      }
+      if (imageData.length > MAX_IMAGE_BASE64_CHARS) {
+        return NextResponse.json({ error: 'Invalid image: image is too large' }, { status: 413, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
       }
       try {
         const imageBuffer = Buffer.from(imageData, 'base64');
@@ -112,7 +110,6 @@ export async function POST(req: Request) {
         validatedImage = {
           data: imageData,
           mimeType: validated.mimeType,
-          uri: typeof imagePayload.uri === 'string' ? imagePayload.uri : undefined,
         };
       } catch (err: unknown) {
         const errMsg = err instanceof Error ? err.message : 'Image validation failed';
@@ -243,7 +240,12 @@ export async function POST(req: Request) {
                 ],
               };
               const priorHistory = createdForRequest ? historyForAI.slice(0, -1) : historyForAI;
-              const contents: GeminiMessage[] = [...priorHistory, userEntry];
+              const tutorLanguage = await getTutorLanguage(userId);
+              const contents: GeminiMessage[] = [
+                { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
+                ...priorHistory,
+                userEntry,
+              ];
 
               const modelToUse = billingDecision.modelUsed ?? undefined;
               assistantText = '';
@@ -338,7 +340,8 @@ export async function POST(req: Request) {
         ...buildCorsHeaders(req.headers.get('origin')),
         'Access-Control-Allow-Methods': CORS_METHODS,
         'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-store, private',
+        'X-Accel-Buffering': 'no',
         Connection: 'keep-alive',
       },
     });

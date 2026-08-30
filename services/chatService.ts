@@ -18,8 +18,8 @@ export async function saveChatToDatabase(userId: string, prompt: string, respons
 
   const messages = await prisma.conversationMessage.createManyAndReturn({
     data: [
-      { conversationId: conversation.id, role: 'user', text: prompt },
-      { conversationId: conversation.id, role: 'assistant', text: response },
+      { conversationId: conversation.id, userId, role: 'user', text: prompt },
+      { conversationId: conversation.id, userId, role: 'assistant', text: response },
     ],
     select: { id: true, role: true },
   });

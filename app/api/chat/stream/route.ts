@@ -198,6 +198,7 @@ export async function POST(req: Request) {
           const assistantPlaceholder = await addMessageToConversation(conversationId, 'assistant', '', userId, { requestId, status: 'streaming' });
           if (assistantPlaceholder?.id) {
             assistantMessageId = assistantPlaceholder.id;
+            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'assistant_message', messageId: assistantMessageId })}\n\n`));
           }
           enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'conversation', conversationId })}\n\n`));
           if (validatedImage) {

@@ -97,10 +97,11 @@ model Notification {
   createdAt  DateTime             @default(now())
   updatedAt  DateTime             @updatedAt
   category   NotificationCategory
-  externalId String?              @unique
+  externalId String?
   user       User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt])
+  @@unique([userId, externalId])
 }
 
 model UserWallet {

@@ -4,6 +4,8 @@ import { deleteConversation, validateConversationOwnership } from '../../../../l
 import { info, warn } from '../../../../lib/logger';
 
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
+import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../lib/aiGenerationLock';
+import { randomUUID } from 'node:crypto';
 
 const CORS_METHODS = 'DELETE, OPTIONS';
 
@@ -32,7 +34,18 @@ export async function DELETE(req: Request, context: { params: Promise<{ id: stri
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
-    await deleteConversation(conversationId);
+    const lockOwner = `${user.id}:conversation-delete:${randomUUID()}`;
+    if (!await acquireAIGenerationLock(conversationId, lockOwner)) {
+      return NextResponse.json(
+        { error: 'This conversation is busy. Wait for the current response to finish.', code: 'generation_in_progress' },
+        { status: 409, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } },
+      );
+    }
+    try {
+      await deleteConversation(conversationId);
+    } finally {
+      await releaseAIGenerationLock(conversationId, lockOwner).catch(() => undefined);
+    }
     return NextResponse.json({ success: true }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Internal Server Error';

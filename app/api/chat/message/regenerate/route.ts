@@ -135,15 +135,6 @@ export async function POST(req: Request) {
       throw error;
     }
 
-    try {
-      await prisma.conversationMessage.update({
-        where: { id: messageId },
-        data: { status: 'streaming', content: '', text: '' },
-      });
-    } catch (error) {
-      await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
-      throw error;
-    }
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
@@ -196,10 +187,8 @@ export async function POST(req: Request) {
           close();
         } catch (_err: unknown) {
           const message = 'We couldn’t regenerate that reply right now. Please try again shortly.';
-          await prisma.conversationMessage.update({
-            where: { id: messageId },
-            data: { status: 'failed' },
-          }).catch(() => undefined);
+          // Keep the last completed answer intact. The client may show streamed
+          // draft text, but failed regeneration must never destroy durable content.
           if (!isStreamClosed()) {
             const errorPayload = JSON.stringify({ type: 'error', message });
             enqueue(encoder.encode(`data: ${errorPayload}\n\n`));

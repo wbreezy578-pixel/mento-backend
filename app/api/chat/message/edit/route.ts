@@ -3,6 +3,8 @@ import { getUserFromRequest } from '../../../../lib/auth';
 import { prisma } from '../../../../../lib/prisma';
 import logger from '../../../../../lib/logger';
 import { ensureCooldown, ensureSlidingWindow } from '../../../../../lib/rateLimiter';
+import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../../lib/aiGenerationLock';
+import { randomUUID } from 'node:crypto';
 
 const MAX_EDIT_LENGTH = 8_000;
 const EDIT_COOLDOWN_MS = 1_000;
@@ -83,6 +85,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Cannot edit assistant messages' }, { status: 400 });
     }
 
+    const lockOwner = `${user.id}:chat-edit:${randomUUID()}`;
+    if (!await acquireAIGenerationLock(message.conversationId, lockOwner)) {
+      return NextResponse.json(
+        { error: 'This conversation is busy. Wait for the current response to finish.', code: 'generation_in_progress' },
+        { status: 409 },
+      );
+    }
+
+    try {
     const { updated, deletedMessageIds } = await prisma.$transaction(async (tx) => {
       const staleMessages = await tx.conversationMessage.findMany({
         where: {
@@ -108,6 +119,9 @@ export async function POST(req: Request) {
     });
 
     return NextResponse.json({ success: true, message: updated, deletedMessageIds });
+    } finally {
+      await releaseAIGenerationLock(message.conversationId, lockOwner).catch(() => undefined);
+    }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Internal Server Error';
     logger.error('Edit message failed', { error: err });

@@ -8,7 +8,9 @@ const DEFAULT_ALLOWED_ORIGINS = [
   'http://10.0.0.7:8082',
 ];
 
-const DEFAULT_CONTENT_SECURITY_POLICY = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https:; object-src 'none'; base-uri 'self'; frame-ancestors 'none';";
+const CSP_NONCE_PATTERN = /^[A-Za-z0-9+/_-]{16,128}={0,2}$/;
+const PADDLE_SCRIPT_ORIGIN = 'https://cdn.paddle.com';
+const PADDLE_BROWSER_ORIGIN = 'https://*.paddle.com';
 
 function normalizeAllowedOrigins() {
   const configured = process.env.ALLOWED_ORIGINS?.split(',').map((entry) => entry.trim()).filter(Boolean) ?? [];
@@ -21,21 +23,74 @@ export function isAllowedOrigin(origin: string | null | undefined) {
   return allowedOrigins.includes(origin);
 }
 
-export function buildContentSecurityPolicy(pathname: string, environment = process.env.NODE_ENV ?? 'development') {
-  const basePolicy = DEFAULT_CONTENT_SECURITY_POLICY;
+export function createCspNonce(): string {
+  return crypto.randomUUID().replaceAll('-', '');
+}
 
-  if (pathname === '/billing/checkout') {
-    return basePolicy
-      .replace("script-src 'self'", "script-src 'self' https://cdn.paddle.com")
-      .replace("connect-src 'self' https:", "connect-src 'self' https: https://*.paddle.com")
-      .replace("object-src 'none'", "frame-src https://*.paddle.com; object-src 'none'");
+export function isValidCspNonce(nonce: string): boolean {
+  return CSP_NONCE_PATTERN.test(nonce);
+}
+
+export function buildContentSecurityPolicy(
+  pathname: string,
+  environment: string = process.env.NODE_ENV ?? 'development',
+  nonce: string,
+) {
+  if (!isValidCspNonce(nonce)) {
+    throw new Error('A valid server-generated CSP nonce is required.');
   }
 
-  if (environment !== 'production' && pathname === '/dev/simli-test') {
-    return basePolicy.replace("connect-src 'self' https:", "connect-src 'self' https: wss://api.simli.ai wss://*.livekit.cloud");
-  }
+  const isDevelopment = environment !== 'production';
+  const isCheckout = pathname === '/billing/checkout';
+  const isSimliDevelopmentPage = isDevelopment && pathname === '/dev/simli-test';
 
-  return basePolicy;
+  const scriptSources = [
+    "'self'",
+    `'nonce-${nonce}'`,
+    "'strict-dynamic'",
+    ...(isDevelopment ? ["'unsafe-eval'"] : []),
+    ...(isCheckout ? [PADDLE_SCRIPT_ORIGIN] : []),
+  ];
+  const connectSources = [
+    "'self'",
+    ...(isDevelopment ? ['ws:', 'wss:'] : []),
+    ...(isCheckout ? [PADDLE_BROWSER_ORIGIN] : []),
+    ...(isSimliDevelopmentPage ? ['wss://api.simli.ai', 'wss://*.livekit.cloud'] : []),
+  ];
+
+  const directives = [
+    "default-src 'self'",
+    `script-src ${scriptSources.join(' ')}`,
+    // Current web pages use React style attributes. Keep this style-only
+    // exception separate from script execution until those styles move to CSS.
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data: blob:",
+    "font-src 'self' data:",
+    `connect-src ${connectSources.join(' ')}`,
+    "media-src 'self'",
+    "worker-src 'self'",
+    isCheckout ? `frame-src ${PADDLE_BROWSER_ORIGIN}` : "frame-src 'none'",
+    "frame-ancestors 'none'",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "manifest-src 'self'",
+    ...(environment === 'production' ? ['upgrade-insecure-requests'] : []),
+  ];
+
+  return `${directives.join('; ')};`;
+}
+
+export function buildCspRequestHeaders(
+  incomingHeaders: Headers,
+  pathname: string,
+  environment: string,
+  nonce: string,
+): Headers {
+  const requestHeaders = new Headers(incomingHeaders);
+  requestHeaders.set('x-nonce', nonce);
+  requestHeaders.set('Content-Security-Policy', buildContentSecurityPolicy(pathname, environment, nonce));
+  return requestHeaders;
 }
 
 export function buildCorsHeaders(origin: string | null | undefined): Record<string, string> {

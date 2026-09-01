@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
-import { buildContentSecurityPolicy } from './lib/securityHeaders';
+import { buildContentSecurityPolicy, buildCspRequestHeaders, createCspNonce } from './lib/securityHeaders';
 import { observeMonitoringLatency } from './lib/monitoring';
 import { isHttpsRequestMetadata } from './lib/requestMetadata';
 
@@ -18,7 +18,11 @@ export default async function middleware(req: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  const response = NextResponse.next();
+  const nonce = createCspNonce();
+  const environment = process.env.NODE_ENV ?? 'development';
+  const contentSecurityPolicy = buildContentSecurityPolicy(req.nextUrl.pathname, environment, nonce);
+  const requestHeaders = buildCspRequestHeaders(req.headers, req.nextUrl.pathname, environment, nonce);
+  const response = NextResponse.next({ request: { headers: requestHeaders } });
 
   response.headers.set('X-Content-Type-Options', 'nosniff');
   response.headers.set(
@@ -40,7 +44,7 @@ export default async function middleware(req: NextRequest) {
   );
   response.headers.set(
     'Content-Security-Policy',
-    buildContentSecurityPolicy(req.nextUrl.pathname, process.env.NODE_ENV)
+    contentSecurityPolicy
   );
   response.headers.set(
     'Cross-Origin-Opener-Policy',

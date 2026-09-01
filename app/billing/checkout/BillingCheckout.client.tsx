@@ -15,7 +15,11 @@ declare global {
   interface Window { Paddle?: PaddleBrowserSdk }
 }
 
-export default function BillingCheckout({ clientToken, environment }: { clientToken: string; environment: 'sandbox' | 'production' }) {
+export default function BillingCheckout({ clientToken, environment, nonce }: {
+  clientToken: string;
+  environment: 'sandbox' | 'production';
+  nonce?: string;
+}) {
   const initialized = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const router = useRouter();
@@ -50,7 +54,7 @@ export default function BillingCheckout({ clientToken, environment }: { clientTo
 
   return (
     <main style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', padding: 24, background: '#f7f7fb', color: '#17171f' }}>
-      <Script src="https://cdn.paddle.com/paddle/v2/paddle.js" strategy="afterInteractive" onLoad={initialize} onReady={initialize} onError={() => setError('Paddle checkout could not be loaded.')} />
+      <Script nonce={nonce} src="https://cdn.paddle.com/paddle/v2/paddle.js" strategy="afterInteractive" onLoad={initialize} onReady={initialize} onError={() => setError('Paddle checkout could not be loaded.')} />
       <section style={{ maxWidth: 520, padding: 32, borderRadius: 20, background: 'white', boxShadow: '0 20px 60px rgba(0,0,0,.08)', textAlign: 'center' }}>
         <h1 style={{ marginBottom: 12 }}>Mento secure checkout</h1>
         <p>{error ?? 'Preparing your payment…'}</p>

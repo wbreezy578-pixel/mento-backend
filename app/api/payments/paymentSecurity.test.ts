@@ -5,6 +5,7 @@ import { isPaddleCheckoutSku } from '../../../services/paddleService';
 import { buildContentSecurityPolicy } from '../../../lib/securityHeaders';
 
 describe('payment security boundaries', () => {
+  const nonce = '0123456789abcdef0123456789abcdef';
   it('does not allow the legacy direct upgrade endpoint to grant Pro', async () => {
     const response = await directUpgrade();
     expect(response.status).toBe(410);
@@ -22,7 +23,7 @@ describe('payment security boundaries', () => {
   });
 
   it('allows Paddle resources only on the dedicated checkout page', () => {
-    expect(buildContentSecurityPolicy('/billing/checkout', 'production')).toContain('https://cdn.paddle.com');
-    expect(buildContentSecurityPolicy('/other', 'production')).not.toContain('https://cdn.paddle.com');
+    expect(buildContentSecurityPolicy('/billing/checkout', 'production', nonce)).toContain('https://cdn.paddle.com');
+    expect(buildContentSecurityPolicy('/other', 'production', nonce)).not.toContain('https://cdn.paddle.com');
   });
 });

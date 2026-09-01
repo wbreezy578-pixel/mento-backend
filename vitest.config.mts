@@ -6,6 +6,7 @@ export default defineConfig({
       "app/lib/chatScroll.test.ts",
       "app/lib/notificationNavigator.test.ts",
       "app/lib/aiSafety.test.ts",
+      "app/lib/securityHeaders.test.ts",
       "lib/supportReport.test.ts",
       "lib/sanitize.test.ts",
       "lib/imageValidator.test.ts",

@@ -7,9 +7,24 @@ const REQUIRE_DISTRIBUTED_RATE_LIMIT = process.env.REQUIRE_RATE_LIMIT_REDIS === 
   || process.env.NODE_ENV === 'production';
 let redis: MentoRedisClient | null = null;
 
+export type RateLimitDecision = {
+  ok: boolean;
+  retryAfterSec?: number;
+  unavailable?: boolean;
+};
+
+type RateLimitOptions = { requireDistributed?: boolean };
+
+function mustUseDistributedLimiter(options?: RateLimitOptions) {
+  return options?.requireDistributed === true || REQUIRE_DISTRIBUTED_RATE_LIMIT;
+}
+
 function distributedLimiterUnavailable(type: 'cooldown' | 'sliding' | 'daily') {
-  rateLimitDenied.inc({ type });
-  rateLimitHits.inc({ type });
+  // Dedicated bounded labels make Redis limiter outages alertable without
+  // conflating infrastructure failures with legitimate user throttling.
+  const outageType = `${type}_unavailable`;
+  rateLimitDenied.inc({ type: outageType });
+  rateLimitHits.inc({ type: outageType });
 }
 
 if (REDIS_URL) {
@@ -56,7 +71,7 @@ function pruneWindow(arr: number[], windowMs: number) {
   while (arr.length && arr[0] < cutoff) arr.shift();
 }
 
-export async function ensureCooldown(userId: string, cooldownMs: number): Promise<{ ok: boolean; retryAfterSec?: number }> {
+export async function ensureCooldown(userId: string, cooldownMs: number, options?: RateLimitOptions): Promise<RateLimitDecision> {
   if (redis) {
     const key = `rl:cooldown:${userId}`;
     try {
@@ -68,16 +83,16 @@ export async function ensureCooldown(userId: string, cooldownMs: number): Promis
       return { ok: false, retryAfterSec: Math.ceil(Math.max(ttl, 0) / 1000) };
     } catch (error) {
       console.error('Redis cooldown rate limiter failed:', error);
-      if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+      if (mustUseDistributedLimiter(options)) {
         distributedLimiterUnavailable('cooldown');
-        return { ok: false, retryAfterSec: 5 };
+        return { ok: false, retryAfterSec: 5, unavailable: true };
       }
     }
   }
 
-  if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+  if (mustUseDistributedLimiter(options)) {
     distributedLimiterUnavailable('cooldown');
-    return { ok: false, retryAfterSec: 5 };
+    return { ok: false, retryAfterSec: 5, unavailable: true };
   }
 
   // In-memory fallback
@@ -95,8 +110,9 @@ export async function ensureSlidingWindow(
   id: string,
   limit: number,
   windowSeconds: number,
-  keyPrefix = 'rl:window'
-): Promise<{ ok: boolean; retryAfterSec?: number }> {
+  keyPrefix = 'rl:window',
+  options?: RateLimitOptions,
+): Promise<RateLimitDecision> {
   const windowMs = windowSeconds * 1000;
   const redisKey = `${keyPrefix}:${id}`;
 
@@ -154,16 +170,16 @@ export async function ensureSlidingWindow(
         error
       );
 
-      if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+      if (mustUseDistributedLimiter(options)) {
         distributedLimiterUnavailable('sliding');
-        return { ok: false, retryAfterSec: 5 };
+        return { ok: false, retryAfterSec: 5, unavailable: true };
       }
     }
   }
 
-  if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+  if (mustUseDistributedLimiter(options)) {
     distributedLimiterUnavailable('sliding');
-    return { ok: false, retryAfterSec: 5 };
+    return { ok: false, retryAfterSec: 5, unavailable: true };
   }
 
   // In-memory fallback
@@ -216,7 +232,11 @@ function secondsUntilTomorrowUTC() {
   return Math.ceil((tomorrow.getTime() - now.getTime()) / 1000);
 }
 
-export async function ensureDailyQuota(userId: string, limitPerDay: number): Promise<{ ok: boolean; remaining?: number }> {
+export async function ensureDailyQuota(
+  userId: string,
+  limitPerDay: number,
+  options?: RateLimitOptions,
+): Promise<{ ok: boolean; remaining?: number; unavailable?: boolean }> {
   const day = todayKeySuffix();
   const key = `rl:daily:${userId}:${day}`;
   if (redis) {
@@ -234,16 +254,16 @@ export async function ensureDailyQuota(userId: string, limitPerDay: number): Pro
       return { ok: true, remaining: limitPerDay - val };
     } catch (error) {
       console.error('Redis daily quota limiter failed:', error);
-      if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+      if (mustUseDistributedLimiter(options)) {
         distributedLimiterUnavailable('daily');
-        return { ok: false, remaining: 0 };
+        return { ok: false, remaining: 0, unavailable: true };
       }
     }
   }
 
-  if (REQUIRE_DISTRIBUTED_RATE_LIMIT) {
+  if (mustUseDistributedLimiter(options)) {
     distributedLimiterUnavailable('daily');
-    return { ok: false, remaining: 0 };
+    return { ok: false, remaining: 0, unavailable: true };
   }
 
   // In-memory fallback

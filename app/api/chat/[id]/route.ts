@@ -3,6 +3,8 @@ import { getUserFromRequest } from '../../../lib/auth';
 import { prisma } from '../../../../lib/prisma';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import logger from '../../../../lib/logger';
+import { buildRateLimitHeaders, enforceChatEndpointRateLimit } from '../../../../lib/chatRateLimits';
+import { NORMAL_CHAT_HISTORY_WHERE, serializeNormalChatHistoryMessage } from '../../../../lib/normalChatHistory';
 
 const CORS_METHODS = 'GET, OPTIONS';
 
@@ -27,6 +29,13 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
 
     const user = await getUserFromRequest(req as Request);
     if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    const rateLimit = await enforceChatEndpointRateLimit(user.id, 'history');
+    if (!rateLimit.ok) {
+      return NextResponse.json(
+        { error: 'Too many history requests. Please try again later.', code: 'rate_limit_exceeded', retryAfterSec: rateLimit.retryAfterSec },
+        { status: 429, headers: { ...buildCorsHeaders(req.headers.get('origin')), ...buildRateLimitHeaders(rateLimit.retryAfterSec), 'Access-Control-Allow-Methods': CORS_METHODS } },
+      );
+    }
 
     const { id } = resolvedParams;
     const url = new URL(req.url);
@@ -42,8 +51,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         role: boolean;
         text: boolean;
         content: boolean;
+        status: boolean;
         createdAt: boolean;
       };
+      where: { status: string; role: { in: string[] } };
       orderBy: { createdAt: 'desc' };
       take: number;
       cursor?: { id: string };
@@ -55,8 +66,10 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
         role: true,
         text: true,
         content: true,
+        status: true,
         createdAt: true,
       },
+      where: NORMAL_CHAT_HISTORY_WHERE,
       orderBy: { createdAt: 'desc' },
       take,
     };
@@ -71,14 +84,17 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       include: { messages: messagesQuery },
     });
 
-    if (!conv || conv.userId !== user.id) {
+    if (!conv || conv.userId !== user.id || conv.source !== 'chat') {
       return NextResponse.json({ error: 'Not found' }, { status: 404, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     const messagesDesc = conv.messages;
     const hasMore = messagesDesc.length > limit;
     const limitedMessages = hasMore ? messagesDesc.slice(0, limit) : messagesDesc;
-    const messages = limitedMessages.reverse();
+    const messages = limitedMessages
+      .reverse()
+      .map(serializeNormalChatHistoryMessage)
+      .filter((message): message is NonNullable<typeof message> => message !== null);
 
     return NextResponse.json({
       conversation: {
@@ -95,6 +111,6 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Internal Server Error';
     logger.error('Chat history request failed', { error: err });
-    return NextResponse.json({ error: message }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    return NextResponse.json({ error: 'Unable to load conversation history.', code: 'history_load_failed' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

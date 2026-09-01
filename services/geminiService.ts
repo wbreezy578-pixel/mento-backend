@@ -11,6 +11,8 @@ import { getCircuitBreaker, getClientErrorMessage, getProviderRetryOptions, sani
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
 import '../lib/metrics';
 import { getGeminiApiKey, loadAndValidateEnvironment } from '../lib/env';
+import { isSupportedNormalChatModel, NORMAL_CHAT_COST_AWARE_FALLBACKS, NORMAL_CHAT_GEMINI_MODELS, type NormalChatGeminiModel } from './geminiPricing';
+import { trimContextByTokenBudget, checkContextFitsBudget, UNTRUSTED_SUMMARY_ACKNOWLEDGEMENT, type ContextBudgetTrimResult } from './contextBudgetManager';
 
 loadAndValidateEnvironment();
 const geminiApiKey = getGeminiApiKey();
@@ -34,6 +36,72 @@ export type GeminiContent = GeminiMessage;
 
 type GeminiModelKind = 'chat' | 'image' | 'live-tutor';
 
+export type GeminiUsage = {
+  model: string;
+  source: 'PROVIDER_REPORTED' | 'ESTIMATED' | 'UNKNOWN';
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  thinkingTokens: number;
+  totalTokens: number;
+};
+
+type GeminiUsageMetadata = {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  cachedContentTokenCount?: number;
+  thoughtsTokenCount?: number;
+  totalTokenCount?: number;
+};
+
+function normalizeTokenCount(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+export function normalizeGeminiUsage(model: string, metadata?: GeminiUsageMetadata): GeminiUsage {
+  const inputTokens = normalizeTokenCount(metadata?.promptTokenCount);
+  const outputTokens = normalizeTokenCount(metadata?.candidatesTokenCount);
+  const cachedTokens = normalizeTokenCount(metadata?.cachedContentTokenCount);
+  const thinkingTokens = normalizeTokenCount(metadata?.thoughtsTokenCount);
+  return {
+    model,
+    source: metadata ? 'PROVIDER_REPORTED' : 'UNKNOWN',
+    inputTokens,
+    outputTokens,
+    cachedTokens,
+    thinkingTokens,
+    totalTokens: normalizeTokenCount(metadata?.totalTokenCount),
+  };
+}
+
+export type NormalChatModelTelemetry = {
+  requestedModel: string;
+  actualModel: string;
+  fallbackOccurred: boolean;
+  fallbackReason: string | null;
+};
+
+export function buildNormalChatModelTelemetry(
+  requestedModel: string,
+  actualModel: string,
+  fallbackReason?: string,
+): NormalChatModelTelemetry {
+  return {
+    requestedModel,
+    actualModel,
+    fallbackOccurred: requestedModel !== actualModel,
+    fallbackReason: requestedModel !== actualModel ? (fallbackReason ?? 'provider_fallback') : null,
+  };
+}
+
+export function getNormalChatModelCandidates(modelOverride?: string): NormalChatGeminiModel[] {
+  const requestedModel = modelOverride?.trim() || AI_CONFIG.CHAT_MODEL;
+  if (!isSupportedNormalChatModel(requestedModel)) {
+    throw new Error('Unsupported Normal Chat Gemini model configuration.');
+  }
+  return [requestedModel, ...NORMAL_CHAT_COST_AWARE_FALLBACKS.filter((model) => model !== requestedModel)];
+}
+
 type GeminiRequestPayload = {
   contents: GeminiMessage[];
   systemInstruction: string;
@@ -54,9 +122,13 @@ function getConfiguredModelName(kind: GeminiModelKind): string {
 }
 
 export function getModelCandidatesForKind(kind: GeminiModelKind, modelOverride?: string): string[] {
+  if (kind === 'chat') {
+    return getNormalChatModelCandidates(modelOverride);
+  }
   const explicitOverride = modelOverride?.trim();
   const configuredModel = getConfiguredModelName(kind);
-  const fallbackModels = [configuredModel, 'gemini-2.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash-lite'];
+  const allowlist = new Set<string>(Object.keys(NORMAL_CHAT_GEMINI_MODELS));
+  const fallbackModels = [configuredModel, 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'].filter((candidate) => allowlist.has(candidate));
   const candidates = explicitOverride
     ? [explicitOverride, ...fallbackModels.filter((candidate) => candidate && candidate !== explicitOverride)]
     : fallbackModels;
@@ -157,6 +229,11 @@ export function classifyGeminiError(error: unknown): { category: GeminiErrorCate
   return { category: 'unknown', status, message, responseBody, details };
 }
 
+export function buildGeminiFailureTelemetry(error: unknown): { category: GeminiErrorCategory; status?: number } {
+  const classification = classifyGeminiError(error);
+  return { category: classification.category, status: classification.status };
+}
+
 function isTransientGeminiError(error: unknown): boolean {
   const classification = classifyGeminiError(error);
   return classification.category === 'rate_limit' || classification.category === 'model_overloaded' || classification.category === 'timeout' || classification.category === 'network_failure';
@@ -197,31 +274,20 @@ function normalizeText(text?: string): string | undefined {
   return trimmedText ? trimmedText : undefined;
 }
 
-const DEFAULT_CHAT_CONTEXT_MAX_CHARS = 60_000;
-
-function getChatContextMaxChars(): number {
-  const configured = Number.parseInt(process.env.CHAT_CONTEXT_MAX_CHARS ?? '', 10);
-  return Number.isFinite(configured) && configured >= 8_000
-    ? configured
-    : DEFAULT_CHAT_CONTEXT_MAX_CHARS;
-}
-
-export function boundGeminiContext(messages: GeminiMessage[], maxChars = getChatContextMaxChars()): GeminiMessage[] {
-  if (messages.length <= 1) return messages;
-
-  const retained: GeminiMessage[] = [];
-  let retainedChars = 0;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    const messageChars = message.parts.reduce((total, part) => total + (part.text?.length ?? 0), 0);
-    if (retained.length > 0 && retainedChars + messageChars > maxChars) break;
-    retained.unshift(message);
-    retainedChars += messageChars;
-  }
-  while (retained.length > 1 && retained[0].role === 'model') {
-    retained.shift();
-  }
-  return retained;
+/**
+ * DEPRECATED: boundGeminiContext (character-based)
+ * ⚠️ DO NOT USE - Use trimContextByTokenBudget instead
+ *
+ * This function is kept for backwards compatibility only.
+ * It has been replaced by token-aware budgeting in contextBudgetManager.ts
+ */
+export async function boundGeminiContext(messages: GeminiMessage[], maxChars?: number): Promise<GeminiMessage[]> {
+  logger.warn('[GeminiService] boundGeminiContext (character-based) called - DEPRECATED. Use trimContextByTokenBudget instead.');
+  // For backwards compatibility, import and use the new token-based trimming
+  const { trimContextByTokenBudget } = await import('./contextBudgetManager');
+  const systemPrompt = SYSTEM_PROMPT;
+  const result = await trimContextByTokenBudget(messages, systemPrompt);
+  return result.trimmedMessages;
 }
 
 export function isGeminiResponseSuccessful(response: unknown): boolean {
@@ -268,7 +334,7 @@ function compactParts(parts: GeminiMessage['parts']): GeminiMessage['parts'] {
   return compacted;
 }
 
-function buildGeminiRequestPayload(input: string | GeminiContent[], kind: GeminiModelKind): GeminiRequestPayload {
+function buildGeminiRequestPayloadSync(input: string | GeminiContent[], kind: GeminiModelKind): GeminiRequestPayload {
   const baseInstruction = kind === 'image'
     ? `${SYSTEM_PROMPT}\nWhen analyzing images, return a clear, structured explanation. Include a short "category" (e.g., Homework, Math equation, Diagram), a concise "description", an array of detected "objects" with brief notes, and an optional list of "followUpQuestions" to ask the user.`
     : kind === 'live-tutor'
@@ -314,7 +380,7 @@ function buildGeminiRequestPayload(input: string | GeminiContent[], kind: Gemini
       }
     }
 
-    const contents = boundGeminiContext(nonSystemMessages
+    const compactedMessages = nonSystemMessages
       .map((message) => {
         const compactedParts = compactParts(message.parts);
         if (compactedParts.length === 0) {
@@ -325,20 +391,107 @@ function buildGeminiRequestPayload(input: string | GeminiContent[], kind: Gemini
           parts: compactedParts,
         };
       })
-      .filter((message): message is GeminiMessage => Boolean(message)));
+      .filter((message): message is GeminiMessage => Boolean(message));
 
-    if (contents.length === 0) {
+    if (compactedMessages.length === 0) {
       throw new Error('Conversation must contain at least one user or model message');
     }
 
     return {
-      contents,
+      contents: compactedMessages,
       systemInstruction: systemInstructionParts.filter(Boolean).join('\n'),
       maxOutputTokens: getMaxOutputTokensForKind(kind),
     };
   }
 
   throw new Error('Invalid Gemini input');
+}
+
+async function buildGeminiRequestPayload(input: string | GeminiContent[], kind: GeminiModelKind): Promise<GeminiRequestPayload & { contextBudgetDebug?: ContextBudgetTrimResult }> {
+  // First, get the base payload structure
+  const basePayload = buildGeminiRequestPayloadSync(input, kind);
+
+  // If input is a string (single message), no trimming needed
+  if (typeof input === 'string') {
+    return basePayload;
+  }
+
+  // If input is an array of messages, apply token-aware context trimming
+  if (!Array.isArray(input) || input.length === 0) {
+    return basePayload;
+  }
+
+  if (kind !== 'live-tutor' && basePayload.contents.some((message) => message.role !== 'user' && message.role !== 'model')) {
+    throw new Error('Conversation contains an unsupported message role.');
+  }
+
+  // Apply token-aware context trimming for conversation arrays
+  try {
+    const contextBudgetResult = await trimContextByTokenBudget(
+      basePayload.contents,
+      basePayload.systemInstruction,
+      null,
+      undefined,
+      { secureUntrustedSummary: kind !== 'live-tutor' },
+    );
+
+    // Normal Chat summaries are derived from hostile conversation data. Keep
+    // them structurally in user/model content and never promote them into the
+    // trusted system instruction. Live Tutor retains its existing behavior.
+    let finalSystemInstruction = basePayload.systemInstruction;
+    let finalContents = contextBudgetResult.trimmedMessages;
+    if (contextBudgetResult.summary) {
+      if (kind === 'live-tutor') {
+        finalSystemInstruction = `${basePayload.systemInstruction}\n\n${contextBudgetResult.summary}`;
+      } else {
+        finalContents = [
+          { role: 'user', parts: [{ text: contextBudgetResult.summary }] },
+          { role: 'model', parts: [{ text: UNTRUSTED_SUMMARY_ACKNOWLEDGEMENT }] },
+          ...contextBudgetResult.trimmedMessages,
+        ];
+      }
+    }
+
+    logger.info('[GeminiService] Context trimmed by token budget', {
+      originalMessages: basePayload.contents.length,
+      trimmedMessages: contextBudgetResult.trimmedMessages.length,
+      trimmedTurns: contextBudgetResult.trimmedTurns,
+      wasTrimmed: contextBudgetResult.wasTrimmed,
+      tokenEstimates: contextBudgetResult.tokenEstimates,
+    });
+
+    return {
+      contents: finalContents,
+      systemInstruction: finalSystemInstruction,
+      maxOutputTokens: basePayload.maxOutputTokens,
+      contextBudgetDebug: contextBudgetResult,
+    };
+  } catch (error) {
+    // If context trimming fails (e.g., latest input too large), re-throw with better message
+    if (error instanceof Error && error.message.includes('exceeds maximum')) {
+      logger.error('[GeminiService] Latest input exceeds token budget', {
+        error: error.message,
+        kind,
+      });
+      throw error;
+    }
+
+    if (kind === 'live-tutor') {
+      logger.warn('[GeminiService] Context trimming failed, using untrimmed Live Tutor payload', {
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+        messageCount: basePayload.contents.length,
+      });
+      return basePayload;
+    }
+
+    // Billable Normal Chat fails closed rather than bypassing the context
+    // budget with an unbounded provider request.
+    logger.error('[GeminiService] Normal Chat context preparation failed closed', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+      messageCount: basePayload.contents.length,
+    });
+    throw new Error('Conversation context could not be prepared safely. Please try again.');
+  }
 }
 
 export { buildGeminiRequestPayload };
@@ -387,11 +540,25 @@ function createGeminiError(message: string, error: unknown): Error {
   return wrappedError;
 }
 
+function createSafeNormalChatGeminiError(error: unknown, message: string): Error {
+  const safeError = new Error(message) as Error & { status?: number; providerCategory?: GeminiErrorCategory };
+  const telemetry = buildGeminiFailureTelemetry(error);
+  safeError.status = telemetry.status;
+  safeError.providerCategory = telemetry.category;
+  return safeError;
+}
+
 function getPromptSizeBytes(contents: GeminiMessage[], systemInstruction: string): number {
   return Buffer.byteLength(JSON.stringify({ contents, systemInstruction }), 'utf8');
 }
 
-export async function askGemini(input: string | GeminiContent[], modelOverride?: string): Promise<string> {
+export async function askGemini(
+  input: string | GeminiContent[],
+  modelOverride?: string,
+  onUsage?: (usage: GeminiUsage) => void,
+  onProviderAttempt?: (model: string) => Promise<unknown>,
+  operationSignal?: AbortSignal,
+): Promise<string> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
 
   if (!geminiApiKey) {
@@ -403,14 +570,19 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
   }
 
   await runSecurityCheck(input);
-  const payload = buildGeminiRequestPayload(input, 'chat');
+  const payload = await buildGeminiRequestPayload(input, 'chat');
   const requestStartedAt = Date.now();
   const candidates = getModelCandidatesForKind('chat', modelOverride);
+  const requestedModel = modelOverride?.trim() || AI_CONFIG.CHAT_MODEL;
+  let fallbackReason: string | undefined;
 
   let lastError: unknown;
   for (const model of candidates) {
     try {
       const response = await retryGeminiCall(async () => {
+        if (operationSignal?.aborted) throw operationSignal.reason ?? new Error('Generation aborted.');
+        await onProviderAttempt?.(model);
+        if (operationSignal?.aborted) throw operationSignal.reason ?? new Error('Generation aborted.');
         logger.info('Calling Gemini provider', { model, kind: 'chat', promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction) });
         const result = await client.models.generateContent({
           model,
@@ -429,6 +601,8 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
         shouldRetry: (error: unknown) => isTransientGeminiError(error),
       });
 
+      if (operationSignal?.aborted) throw operationSignal.reason ?? new Error('Generation aborted.');
+
       const text = response?.text || response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
       const responseSizeBytes = Buffer.byteLength(text, 'utf8');
       logger.info('Gemini request completed', {
@@ -438,6 +612,7 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
         latencyMs: Date.now() - requestStartedAt,
         promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
         responseSizeBytes,
+        ...buildNormalChatModelTelemetry(requestedModel, model, fallbackReason),
       });
 
       if (!text || text.trim() === '') {
@@ -446,6 +621,7 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
       }
 
       geminiBreaker.recordSuccess();
+      onUsage?.(normalizeGeminiUsage(model, response?.usageMetadata));
       observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'chat' });
       return text.trim();
     } catch (error: unknown) {
@@ -455,11 +631,12 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
         provider: 'gemini',
         kind: 'chat',
         model,
-        classification,
+        classification: buildGeminiFailureTelemetry(error),
         latencyMs: Date.now() - requestStartedAt,
       });
 
       if (shouldTryNextGeminiModel(error) && model !== candidates[candidates.length - 1]) {
+        fallbackReason = classification.category;
         logger.warn('Falling back to the next Gemini model', { provider: 'gemini', kind: 'chat', fromModel: model, nextModel: candidates[candidates.indexOf(model) + 1] });
         continue;
       }
@@ -467,27 +644,20 @@ export async function askGemini(input: string | GeminiContent[], modelOverride?:
       geminiBreaker.recordFailure();
       observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'chat', status: classification.status ?? 'error' });
       incrementMonitoringFailure('tutor', { provider: 'gemini', feature: 'chat', reason: classification.category });
-      const errorMessage = getErrorMessage(error);
-      const rootCause = classification.message || getClientErrorMessage(errorMessage, 'Unable to generate a response right now.');
       logger.error('Gemini request failed', {
-        error: sanitizeForLogging({
-          status: classification.status,
-          message: rootCause,
-          responseBody: classification.responseBody,
-          details: classification.details,
-          stack: getErrorStack(error),
-        }),
         provider: 'gemini',
         kind: 'chat',
-        classification,
+        classification: buildGeminiFailureTelemetry(error),
         latencyMs: Date.now() - requestStartedAt,
         promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
       });
-      throw createGeminiError(rootCause, error);
+      throw createSafeNormalChatGeminiError(error, 'Gemini is temporarily unavailable. Please try again shortly.');
     }
   }
 
-  throw lastError ? createGeminiError(getErrorText(lastError) || 'Unable to generate a response right now.', lastError) : new Error('Unable to generate a response right now.');
+  throw lastError
+    ? createSafeNormalChatGeminiError(lastError, 'Gemini is temporarily unavailable. Please try again shortly.')
+    : new Error('Unable to generate a response right now.');
 }
 
 export async function askGeminiLiveTutor(input: string | GeminiContent[], modelOverride?: string): Promise<string> {
@@ -502,12 +672,12 @@ export async function askGeminiLiveTutor(input: string | GeminiContent[], modelO
   }
 
   await runSecurityCheck(input);
-  const payload = buildGeminiRequestPayload(input, 'live-tutor');
+  const payload = await buildGeminiRequestPayload(input, 'live-tutor');
   const requestStartedAt = Date.now();
   const candidates = getModelCandidatesForKind('live-tutor', modelOverride);
   const configuredModel = getConfiguredModelName('live-tutor');
 
-  // Calculate input character count (sum of all message text)
+  // Calculate input character count (sum of all message text) - for logging only, actual limits are token-based
   let inputCharCount = 0;
   for (const msg of payload.contents) {
     for (const part of msg.parts) {
@@ -609,13 +779,21 @@ export async function askGeminiLiveTutor(input: string | GeminiContent[], modelO
 
 export default askGemini;
 
+export type GeminiStreamResult = {
+  outcome: 'completed' | 'cancelled';
+  text: string;
+  usage: GeminiUsage;
+};
+
 export async function askGeminiStream(
   input: string | GeminiContent[],
   onToken: (token: string) => Promise<void> | void,
   modelOverride?: string,
   abortSignal?: AbortSignal,
   securityInputOverride?: string,
-): Promise<string> {
+  onUsage?: (usage: GeminiUsage) => void,
+  onProviderAttempt?: (model: string) => Promise<unknown>,
+): Promise<GeminiStreamResult> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
   assertFeatureEnabled(AI_FEATURES.STREAMING, 'Streaming is currently disabled.');
   const requestKind: GeminiModelKind = Array.isArray(input) && input.some(
@@ -634,9 +812,11 @@ export async function askGeminiStream(
   }
 
   await runSecurityCheck(securityInputOverride ?? input);
-  const payload = buildGeminiRequestPayload(input, requestKind);
+  const payload = await buildGeminiRequestPayload(input, requestKind);
   const requestStartedAt = Date.now();
   const candidates = getModelCandidatesForKind(requestKind, modelOverride);
+  const requestedModel = modelOverride?.trim() || getConfiguredModelName(requestKind);
+  let fallbackReason: string | undefined;
 
   logger.info('Gemini stream request started', {
     inputKind: typeof input === 'string' ? 'text' : 'conversation-array',
@@ -645,9 +825,9 @@ export async function askGeminiStream(
   });
 
   let lastError: unknown;
-  let currentStream: AsyncIterable<{ text?: string }> | null = null;
+  let currentStream: AsyncIterable<{ text?: string; usageMetadata?: GeminiUsageMetadata }> | null = null;
   const abortHandler = async () => {
-    const cancellableStream = currentStream as (AsyncIterable<{ text?: string }> & {
+    const cancellableStream = currentStream as (AsyncIterable<{ text?: string; usageMetadata?: GeminiUsageMetadata }> & {
       return?: () => Promise<unknown>;
     }) | null;
     if (typeof cancellableStream?.return === 'function') {
@@ -671,12 +851,17 @@ export async function askGeminiStream(
     for (const model of candidates) {
       if (abortSignal?.aborted) {
         logger.info('Gemini stream aborted before provider request', { provider: 'gemini', kind: requestKind, model });
-        return '';
+        const usage = normalizeGeminiUsage(model);
+        onUsage?.(usage);
+        return { outcome: 'cancelled', text: '', usage };
       }
 
       let emittedTokenForModel = false;
+      let completionText = '';
+      let usageMetadata: GeminiUsageMetadata | undefined;
       try {
         currentStream = await retryGeminiCall(async () => {
+          await onProviderAttempt?.(model);
           logger.info('Calling Gemini streaming provider', {
             model,
             kind: requestKind,
@@ -698,7 +883,6 @@ export async function askGeminiStream(
           shouldRetry: (error: unknown) => isTransientGeminiError(error),
         });
 
-        let completionText = '';
         let firstTokenObserved = false;
         for await (const chunk of currentStream) {
           if (abortSignal?.aborted) {
@@ -706,6 +890,9 @@ export async function askGeminiStream(
             break;
           }
 
+          if (chunk?.usageMetadata) {
+            usageMetadata = chunk.usageMetadata;
+          }
           const chunkText = typeof chunk?.text === 'string' ? chunk.text : '';
           if (!chunkText) {
             continue;
@@ -722,7 +909,9 @@ export async function askGeminiStream(
 
         if (abortSignal?.aborted) {
           logger.info('Gemini stream aborted while receiving content', { provider: 'gemini', kind: requestKind, model });
-          return completionText.trim();
+          const usage = normalizeGeminiUsage(model, usageMetadata);
+          onUsage?.(usage);
+          return { outcome: 'cancelled', text: completionText.trim(), usage };
         }
 
         if (!completionText.trim()) {
@@ -731,6 +920,8 @@ export async function askGeminiStream(
         }
 
         geminiBreaker.recordSuccess();
+        const usage = normalizeGeminiUsage(model, usageMetadata);
+        onUsage?.(usage);
         observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: requestKind });
         logger.info('Gemini stream completed', {
           provider: 'gemini',
@@ -738,12 +929,22 @@ export async function askGeminiStream(
           model,
           latencyMs: Date.now() - requestStartedAt,
           responseSizeBytes: Buffer.byteLength(completionText, 'utf8'),
+          ...(requestKind === 'chat' ? buildNormalChatModelTelemetry(requestedModel, model, fallbackReason) : {}),
         });
-        return completionText.trim();
+        return { outcome: 'completed', text: completionText.trim(), usage };
       } catch (error: unknown) {
         if (abortSignal?.aborted) {
-          logger.info('Gemini stream aborted during provider attempt', { provider: 'gemini', kind: requestKind, model, error: String(error) });
-          return ''; // Return partial text if available but do not escalate as provider error.
+          logger.info('Gemini stream aborted during provider attempt', { provider: 'gemini', kind: requestKind, model });
+          const usage = normalizeGeminiUsage(model, usageMetadata);
+          onUsage?.(usage);
+          return { outcome: 'cancelled', text: completionText.trim(), usage };
+        }
+
+        // A stream may fail after Gemini has already emitted billable work.
+        // Preserve provider-reported metadata when available; otherwise mark
+        // the usage UNKNOWN rather than fabricating token counts.
+        if (emittedTokenForModel || usageMetadata) {
+          onUsage?.(normalizeGeminiUsage(model, usageMetadata));
         }
 
         lastError = error;
@@ -752,13 +953,14 @@ export async function askGeminiStream(
           provider: 'gemini',
           kind: requestKind,
           model,
-          classification,
+          classification: buildGeminiFailureTelemetry(error),
           latencyMs: Date.now() - requestStartedAt,
         });
 
         if (!shouldFallbackStreamingModel(error, emittedTokenForModel)) {
           break;
         }
+        fallbackReason = classification.category;
       }
     }
   } finally {
@@ -770,9 +972,9 @@ export async function askGeminiStream(
   const fallbackMessage = 'Gemini is temporarily unavailable. Please try again shortly.';
   logger.warn('Gemini stream degraded gracefully', {
     fallbackMessage,
-    cause: lastError instanceof Error ? lastError.message : String(lastError),
+    classification: buildGeminiFailureTelemetry(lastError),
   });
-  throw new Error(fallbackMessage);
+  throw createSafeNormalChatGeminiError(lastError, fallbackMessage);
 }
 
 export async function analyzeImage(
@@ -780,6 +982,8 @@ export async function analyzeImage(
   mimeType: string,
   promptOverride?: string,
   modelOverride?: string,
+  onUsage?: (usage: GeminiUsage) => void,
+  onProviderAttempt?: (model: string) => Promise<unknown>,
 ): Promise<string> {
   assertFeatureEnabled(AI_FEATURES.IMAGE_UNDERSTANDING, 'Image understanding is currently disabled.');
 
@@ -794,7 +998,7 @@ export async function analyzeImage(
   await runSecurityCheck(promptOverride ?? 'Please analyze the uploaded image.');
 
   const base64 = imageBuffer.toString('base64');
-  const payload = buildGeminiRequestPayload(promptOverride ?? 'Please analyze the uploaded image and return a structured JSON response.', 'image');
+  const payload = await buildGeminiRequestPayload(promptOverride ?? 'Please analyze the uploaded image and return a structured JSON response.', 'image');
   const requestStartedAt = Date.now();
   const contents: GeminiMessage[] = payload.contents.map((message: GeminiMessage) => ({ ...message }));
   if (contents[0]) {
@@ -810,6 +1014,7 @@ export async function analyzeImage(
   for (const model of candidates) {
     try {
       const response = await retryGeminiCall(async () => {
+        await onProviderAttempt?.(model);
         logger.info('Calling Gemini Vision provider', { model, mimeType, imageBytes: imageBuffer.length, promptSizeBytes: getPromptSizeBytes(contents, payload.systemInstruction) });
         const result = await client.models.generateContent({
           model,
@@ -845,6 +1050,7 @@ export async function analyzeImage(
       }
 
       geminiBreaker.recordSuccess();
+      onUsage?.(normalizeGeminiUsage(model, response?.usageMetadata));
       observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'image' });
       return text.trim();
     } catch (error: unknown) {
@@ -854,7 +1060,7 @@ export async function analyzeImage(
         provider: 'gemini',
         kind: 'image',
         model,
-        classification,
+        classification: buildGeminiFailureTelemetry(error),
         latencyMs: Date.now() - requestStartedAt,
       });
 
@@ -866,27 +1072,20 @@ export async function analyzeImage(
       geminiBreaker.recordFailure();
       observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'image', status: classification.status ?? 'error' });
       incrementMonitoringFailure('tutor', { provider: 'gemini', feature: 'image', reason: classification.category });
-      const errorMessage = getErrorMessage(error);
-      const rootCause = classification.message || getClientErrorMessage(errorMessage, 'Unable to analyze image right now.');
       logger.error('Gemini image analysis failed', {
-        error: sanitizeForLogging({
-          status: classification.status,
-          message: rootCause,
-          responseBody: classification.responseBody,
-          details: classification.details,
-          stack: getErrorStack(error),
-        }),
         provider: 'gemini',
         kind: 'image',
-        classification,
+        classification: buildGeminiFailureTelemetry(error),
         latencyMs: Date.now() - requestStartedAt,
         promptSizeBytes: getPromptSizeBytes(contents, payload.systemInstruction),
       });
-      throw createGeminiError(rootCause, error);
+      throw createSafeNormalChatGeminiError(error, 'Gemini is temporarily unavailable. Please try again shortly.');
     }
   }
 
-  throw lastError ? createGeminiError(getErrorText(lastError) || 'Unable to analyze image right now.', lastError) : new Error('Unable to analyze image right now.');
+  throw lastError
+    ? createSafeNormalChatGeminiError(lastError, 'Gemini is temporarily unavailable. Please try again shortly.')
+    : new Error('Unable to analyze image right now.');
 }
 
 export function buildGeminiHealthCheckResult(startedAt: number, success: boolean, message: string): { apiKeyLoaded: boolean; modelAvailable: boolean; responseTimeMs: number; success: boolean; message: string } {

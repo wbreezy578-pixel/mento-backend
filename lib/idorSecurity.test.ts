@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const mocks = vi.hoisted(() => ({
@@ -120,7 +120,7 @@ describe('IDOR ownership boundaries', () => {
   });
 
   it('keeps every user-owned HTTP route bound to the authenticated identity', () => {
-    expect(source('app/api/chats/route.ts')).toMatch(/where:\s*\{\s*userId:\s*user\.id/);
+    expect(existsSync(resolve(process.cwd(), 'app/api/chats/route.ts'))).toBe(false);
     expect(source('app/api/conversations/route.ts')).toMatch(/getUserConversations\(user\.id/);
     expect(source('app/api/conversations/[id]/route.ts')).toMatch(/validateConversationOwnership\(conversationId, user\.id\)/);
     expect(source('app/api/conversations/[id]/rename/route.ts')).toMatch(/validateConversationOwnership\(conversationId, user\.id\)/);

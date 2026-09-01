@@ -69,7 +69,7 @@ describe('chat message editing security', () => {
       conversationId: 'conversation-1',
       role: 'user',
       createdAt,
-      conversation: { userId: 'user-a' },
+      conversation: { userId: 'user-a', source: 'chat' },
     });
     mocks.findMany.mockResolvedValue([]);
     mocks.updateMessage.mockResolvedValue({ id: 'message-1' });
@@ -84,6 +84,15 @@ describe('chat message editing security', () => {
     expect(mocks.updateMessage).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'message-1' },
       data: expect.objectContaining({ text: 'café', content: 'café' }),
+    }));
+    expect(mocks.updateConversation).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        summary: null,
+        summaryUpdatedAt: null,
+        summaryThroughMessageId: null,
+        summaryThroughCreatedAt: null,
+        summaryRevision: { increment: 1 },
+      }),
     }));
   });
 

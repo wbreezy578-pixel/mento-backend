@@ -9,6 +9,15 @@ import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/mon
 import logger from '../lib/logger';
 import '../lib/metrics';
 import { canStartLiveTutorSession } from './liveTutorBillingPolicy';
+import { calculateGeminiProviderCostUSD, GEMINI_PRICING_SOURCE, GEMINI_PRICING_VERSION, isSupportedNormalChatModel } from './geminiPricing';
+import {
+  assertAndLockGeminiDailyBudget,
+  assertAndLockGeminiAdditionalExposure,
+  getGeminiDailyBudgetPolicy,
+  GeminiDailyBudgetExceededError,
+  GeminiDailyBudgetUnavailableError,
+  isNormalChatGeminiBudgetSubject,
+} from './geminiDailyBudget';
 
 // LiveTutorWallet.minutesBalance is stored in minutes; live_tutor amounts are always passed in seconds.
 const SECONDS_PER_MINUTE = 60;
@@ -61,7 +70,14 @@ export interface BillingReservationInput {
   planOverride?: PlanRecord | null;
   tokensInput?: number;
   tokensOutput?: number;
+  tokensCached?: number;
+  tokensThinking?: number;
+  tokensTotal?: number;
+  usageSource?: 'PROVIDER_REPORTED' | 'ESTIMATED' | 'UNKNOWN';
   secondsUsed?: number;
+  providerCostUSDOverride?: number;
+  providerExposureUSD?: number;
+  providerAttemptCount?: number;
 }
 
 function normalizeReason(value: string | null | undefined): string {
@@ -91,7 +107,20 @@ function validateBillingReservationInput(input: BillingReservationInput) {
   const pending = Boolean(input.pending);
   const tokensInput = Math.max(0, Math.floor(input.tokensInput ?? 0));
   const tokensOutput = Math.max(0, Math.floor(input.tokensOutput ?? 0));
+  const tokensCached = Math.max(0, Math.floor(input.tokensCached ?? 0));
+  const tokensThinking = Math.max(0, Math.floor(input.tokensThinking ?? 0));
+  const tokensTotal = Math.max(0, Math.floor(input.tokensTotal ?? (tokensInput + tokensOutput + tokensThinking)));
+  const usageSource: NonNullable<BillingReservationInput['usageSource']> = input.usageSource === 'PROVIDER_REPORTED' || input.usageSource === 'ESTIMATED'
+    ? input.usageSource
+    : 'UNKNOWN';
   const secondsUsed = Math.max(0, Math.floor(input.secondsUsed ?? 0));
+  const providerCostUSDOverride = typeof input.providerCostUSDOverride === 'number' && Number.isFinite(input.providerCostUSDOverride)
+    ? Math.max(0, input.providerCostUSDOverride)
+    : undefined;
+  const providerExposureUSD = typeof input.providerExposureUSD === 'number' && Number.isFinite(input.providerExposureUSD)
+    ? Math.max(0, input.providerExposureUSD)
+    : undefined;
+  const providerAttemptCount = Math.max(0, Math.floor(input.providerAttemptCount ?? 0));
 
   return {
     userId,
@@ -107,8 +136,26 @@ function validateBillingReservationInput(input: BillingReservationInput) {
     planOverride: input.planOverride ?? null,
     tokensInput,
     tokensOutput,
+    tokensCached,
+    tokensThinking,
+    tokensTotal,
+    usageSource,
     secondsUsed,
+    providerCostUSDOverride,
+    providerExposureUSD,
+    providerAttemptCount,
   };
+}
+
+function getGenerationOutcome(metadata: Prisma.JsonValue | null): string | null {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return null;
+  const outcome = (metadata as Prisma.JsonObject).generationOutcome;
+  return typeof outcome === 'string' ? outcome : null;
+}
+
+function isNonCompletedGenerationOutcome(metadata: Prisma.JsonValue | null): boolean {
+  const outcome = getGenerationOutcome(metadata);
+  return outcome === 'cancelled' || outcome === 'persistence_failed' || outcome === 'provider_failed';
 }
 
 function getResetTime(scope: UsageScope): Date {
@@ -296,14 +343,36 @@ async function getBillingDecision(input: BillingReservationInput): Promise<Billi
   const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
   const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
   const windowStart = usageWindow.windowStart;
-  const used = await prisma.usageLog.count({
+
+  // For Gemini (Normal Chat/Image), count BOTH completed AND pending usage
+  // This prevents concurrent requests from bypassing budget checks
+  let used = await prisma.usageLog.count({
     where: {
       userId: validatedInput.userId,
       feature: toUsageFeature(validatedInput.feature),
-      success: true,
+      success: true, // Completed only
       createdAt: { gte: windowStart },
     },
   });
+
+  // For Gemini, also count pending (unreserved but in-flight) usage
+  if (validatedInput.feature === 'chat' || validatedInput.feature === 'image') {
+    const pending = await prisma.usageLog.count({
+      where: {
+        userId: validatedInput.userId,
+        feature: toUsageFeature(validatedInput.feature),
+        success: false, // Pending/reserved but not yet finalized
+        createdAt: { gte: windowStart },
+        metadata: {
+          not: {
+            path: ['generationOutcome'],
+            string_contains: 'cancelled',
+          },
+        },
+      },
+    });
+    used += pending; // Include pending in total usage for budget check
+  }
 
   const usageLimit = usageWindow.usageLimit;
   const remainingUsage = typeof usageLimit === 'number'
@@ -572,7 +641,13 @@ async function createUsageLedgerEntry(
         secondsUsed,
         tokensInput: input.tokensInput,
         tokensOutput: input.tokensOutput,
+        tokensCached: input.tokensCached,
+        tokensThinking: input.tokensThinking,
+        tokensTotal: input.tokensTotal,
+        usageSource: input.usageSource ?? 'UNKNOWN',
         providerCostUSD,
+        providerExposureUSD: input.providerExposureUSD ?? 0,
+        providerAttemptCount: input.providerAttemptCount ?? 0,
         userChargeUSD,
         profitUSD,
         metadata: (metadata ?? {}) as InputJsonValue,
@@ -698,6 +773,11 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           resolvedModel,
         );
       }
+
+      const budgetSubject = isNormalChatGeminiBudgetSubject(validatedInput);
+      const budgetReservation = budgetSubject
+        ? await assertAndLockGeminiDailyBudget(tx, { requestId: validatedInput.requestId ?? 'missing-request-id' })
+        : null;
 
       const { wallet, plan: walletPlan } = await resolveWalletAndPlanInTransaction(tx, validatedInput.userId, plan);
       if (!wallet) {
@@ -881,17 +961,44 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         );
       }
 
+      const reservationInput = budgetReservation
+        ? {
+            ...validatedInput,
+            tokensTotal: budgetReservation.reservationTokens,
+            usageSource: 'ESTIMATED' as const,
+            providerExposureUSD: budgetReservation.reservationCostUSD,
+            metadata: {
+              ...validatedInput.metadata,
+              budgetReservationActive: true,
+              budgetReservationCostUSD: budgetReservation.reservationCostUSD,
+              budgetReservationTokens: budgetReservation.reservationTokens,
+              budgetWindowStart: budgetReservation.windowStart.toISOString(),
+              budgetResetTime: budgetReservation.resetTime.toISOString(),
+            },
+          }
+        : validatedInput;
+      const reservationMetadata = budgetReservation
+        ? {
+            ...metadata,
+            budgetReservationActive: true,
+            budgetReservationCostUSD: budgetReservation.reservationCostUSD,
+            budgetReservationTokens: budgetReservation.reservationTokens,
+            budgetWindowStart: budgetReservation.windowStart.toISOString(),
+            budgetResetTime: budgetReservation.resetTime.toISOString(),
+          }
+        : metadata;
+      const reservedProviderCostUSD = budgetReservation ? 0 : providerCostUSD;
       const successRecord = await createUsageLedgerEntry(
         tx,
-        { ...validatedInput, pending: pendingReservation },
+        { ...reservationInput, pending: pendingReservation },
         effectivePlan,
         pendingReservation ? false : true,
         reason,
         usage,
-        providerCostUSD,
+        reservedProviderCostUSD,
         userChargeUSD,
-        profitUSD,
-        metadata,
+        userChargeUSD - reservedProviderCostUSD,
+        reservationMetadata,
       );
 
       return buildDecision(
@@ -909,13 +1016,74 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       );
     });
   } catch (error) {
-    console.error('[billingService] reserveUsage transaction failed', {
-      userId: input.userId,
+    if (error instanceof GeminiDailyBudgetExceededError) throw error;
+    if (error instanceof GeminiDailyBudgetUnavailableError) throw error;
+    if (input.provider === 'Gemini' && input.pending && (input.feature === 'chat' || input.feature === 'image')) {
+      logger.error('Gemini budget reservation transaction failed closed', {
+        requestId: input.requestId,
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+      });
+      throw new GeminiDailyBudgetUnavailableError();
+    }
+    logger.error('Billing usage reservation transaction failed', {
       requestId: input.requestId,
-      error,
+      errorName: error instanceof Error ? error.name : 'UnknownError',
     });
     throw error;
   }
+}
+
+export async function recordGeminiProviderAttempt(input: {
+  userId: string;
+  requestId: string;
+  model: string;
+}): Promise<{ attemptNumber: number; model: string }> {
+  const policy = getGeminiDailyBudgetPolicy();
+  return runTransactionWithRetries(input.userId, async (tx) => {
+    const initial = await tx.usageLog.findUnique({
+      where: { provider_requestId: { provider: 'Gemini', requestId: input.requestId } },
+      select: { id: true },
+    });
+    if (!initial) throw new Error('Gemini provider attempt requires an existing reservation.');
+
+    await tx.$queryRaw`SELECT id FROM "UsageLog" WHERE id = ${initial.id} FOR UPDATE`;
+    const reservation = await tx.usageLog.findUnique({
+      where: { id: initial.id },
+      select: { id: true, success: true, providerAttemptCount: true },
+    });
+    if (!reservation || reservation.success !== null) {
+      throw new Error('Gemini provider attempt cannot start from a finalized reservation.');
+    }
+
+    const additionalAttempt = reservation.providerAttemptCount > 0;
+    if (additionalAttempt) {
+      await assertAndLockGeminiAdditionalExposure(tx, {
+        requestId: input.requestId,
+        additionalCostUSD: policy.requestCostReservationUSD,
+        additionalTokens: policy.requestTokenReservation,
+        policy,
+      });
+    }
+
+    await tx.usageLog.update({
+      where: { id: reservation.id },
+      data: {
+        providerAttemptCount: { increment: 1 },
+        ...(additionalAttempt ? {
+          providerExposureUSD: { increment: policy.requestCostReservationUSD },
+          tokensTotal: { increment: policy.requestTokenReservation },
+        } : {}),
+      },
+    });
+    const attemptNumber = reservation.providerAttemptCount + 1;
+    logger.info('Gemini provider attempt started', {
+      requestId: input.requestId,
+      attemptNumber,
+      model: input.model,
+      fallbackAttempt: additionalAttempt,
+    });
+    return { attemptNumber, model: input.model };
+  });
 }
 
 export async function canUseChat(userId: string, amount = 1): Promise<BillingDecision> {
@@ -945,6 +1113,38 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
   }
 
   const provider = validatedInput.provider;
+  const billableOutputTokens = validatedInput.tokensOutput + validatedInput.tokensThinking;
+  const providerCostUSD = validatedInput.providerCostUSDOverride ?? (provider === 'Gemini' && validatedInput.usageSource === 'PROVIDER_REPORTED'
+    ? (() => {
+        if (!validatedInput.modelUsed || !isSupportedNormalChatModel(validatedInput.modelUsed)) {
+          throw new Error('Cannot price unsupported Gemini model usage.');
+        }
+        return calculateGeminiProviderCostUSD({
+          model: validatedInput.modelUsed,
+          inputTokens: validatedInput.tokensInput,
+          outputTokens: validatedInput.tokensOutput,
+          cachedTokens: validatedInput.tokensCached,
+          thinkingTokens: validatedInput.tokensThinking,
+        });
+      })()
+    : await calculateProviderCost({
+        feature: validatedInput.feature,
+        provider,
+        tokensInput: validatedInput.tokensInput,
+        tokensOutput: billableOutputTokens,
+        secondsUsed: validatedInput.secondsUsed,
+      }));
+  const userChargeUSD = await calculateUserCharge({
+    feature: validatedInput.feature,
+    provider,
+    tokensInput: validatedInput.tokensInput,
+    tokensOutput: billableOutputTokens,
+    secondsUsed: validatedInput.secondsUsed,
+  });
+  const profitUSD = userChargeUSD - providerCostUSD;
+  const finalizedMetadata = provider === 'Gemini'
+    ? { ...validatedInput.metadata, pricingSource: GEMINI_PRICING_SOURCE, pricingVersion: GEMINI_PRICING_VERSION }
+    : validatedInput.metadata;
 
   try {
     return await runTransactionWithRetries(validatedInput.userId, async (tx) => {
@@ -959,6 +1159,35 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
 
       if (!existing) {
         return reserveUsage({ ...validatedInput, success: true });
+      }
+
+      if (existing.success === false && isNonCompletedGenerationOutcome(existing.metadata)) {
+        const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
+        const resolvedModel = resolvePlanModel(plan, validatedInput.feature, existing.modelUsed ?? validatedInput.modelUsed);
+        const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
+        const used = await tx.usageLog.count({
+          where: {
+            userId: validatedInput.userId,
+            feature: toUsageFeature(validatedInput.feature),
+            success: true,
+            createdAt: { gte: usageWindow.windowStart },
+          },
+        });
+        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : 'chat', { modelUsed: resolvedModel });
+        const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, used, usageLimit, usageWindow.resetAt);
+        return buildDecision(
+          false,
+          'Non-completed reservation cannot be finalized.',
+          usage,
+          plan,
+          typeof usageLimit === 'number' ? Math.max(usageLimit - used, 0) : null,
+          existing.id,
+          true,
+          existing.providerCostUSD,
+          existing.userChargeUSD,
+          existing.profitUSD,
+          existing.modelUsed ?? resolvedModel,
+        );
       }
 
       if (existing.success === true) {
@@ -1045,7 +1274,22 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
 
       await tx.usageLog.update({
         where: { id: existing.id },
-        data: { success: true },
+        data: {
+          success: true,
+          modelUsed: validatedInput.modelUsed,
+          tokensInput: validatedInput.tokensInput,
+          tokensOutput: validatedInput.tokensOutput,
+          tokensCached: validatedInput.tokensCached,
+          tokensThinking: validatedInput.tokensThinking,
+          tokensTotal: validatedInput.usageSource === 'UNKNOWN' ? existing.tokensTotal : validatedInput.tokensTotal,
+          usageSource: validatedInput.usageSource,
+          providerCostUSD,
+          providerExposureUSD: validatedInput.providerExposureUSD
+            ?? (validatedInput.usageSource === 'UNKNOWN' ? existing.providerExposureUSD : 0),
+          userChargeUSD,
+          profitUSD,
+          metadata: finalizedMetadata as InputJsonValue,
+        },
       });
 
       const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
@@ -1074,9 +1318,9 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
         remainingUsage,
         existing.id,
         true,
-        existing.providerCostUSD,
-        existing.userChargeUSD,
-        existing.profitUSD,
+        providerCostUSD,
+        userChargeUSD,
+        profitUSD,
         validatedInput.modelUsed ?? plan.chatModel,
       );
     });
@@ -1088,6 +1332,126 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
     });
     throw error;
   }
+}
+
+/**
+ * Records provider expense for an aborted generation without consuming the
+ * learner's completed-message allowance. The provider/request unique key and
+ * transaction make repeated cancellation cleanup idempotent across replicas.
+ */
+async function reconcileNonCompletedUsage(
+  input: BillingReservationInput,
+  generationOutcome: 'cancelled' | 'persistence_failed' | 'provider_failed',
+): Promise<BillingDecision> {
+  const validatedInput = validateBillingReservationInput(input);
+  if (!validatedInput.requestId) {
+    throw new Error('requestId is required for cancellation reconciliation');
+  }
+
+  const provider = validatedInput.provider;
+  const providerCostUSD = validatedInput.providerCostUSDOverride ?? (provider === 'Gemini' && validatedInput.usageSource === 'PROVIDER_REPORTED'
+    ? (() => {
+        if (!validatedInput.modelUsed || !isSupportedNormalChatModel(validatedInput.modelUsed)) {
+          throw new Error('Cannot price unsupported Gemini model usage.');
+        }
+        return calculateGeminiProviderCostUSD({
+          model: validatedInput.modelUsed,
+          inputTokens: validatedInput.tokensInput,
+          outputTokens: validatedInput.tokensOutput,
+          cachedTokens: validatedInput.tokensCached,
+          thinkingTokens: validatedInput.tokensThinking,
+        });
+      })()
+    : 0);
+  const outcomeMetadata = provider === 'Gemini'
+    ? {
+        ...validatedInput.metadata,
+        generationOutcome,
+        pricingSource: GEMINI_PRICING_SOURCE,
+        pricingVersion: GEMINI_PRICING_VERSION,
+      }
+    : { ...validatedInput.metadata, generationOutcome };
+
+  return runTransactionWithRetries(validatedInput.userId, async (tx) => {
+    const existing = await tx.usageLog.findUnique({
+      where: { provider_requestId: { provider, requestId: validatedInput.requestId! } },
+    });
+    if (!existing) {
+      throw new Error('Cannot reconcile a cancellation without a usage reservation.');
+    }
+
+    const alreadyReconciled = existing.success === false && getGenerationOutcome(existing.metadata) === generationOutcome;
+    if (existing.success !== true && !alreadyReconciled) {
+      await tx.usageLog.update({
+        where: { id: existing.id },
+        data: {
+          success: false,
+          modelUsed: validatedInput.modelUsed,
+          tokensInput: validatedInput.tokensInput,
+          tokensOutput: validatedInput.tokensOutput,
+          tokensCached: validatedInput.tokensCached,
+          tokensThinking: validatedInput.tokensThinking,
+          tokensTotal: validatedInput.usageSource === 'UNKNOWN' ? existing.tokensTotal : validatedInput.tokensTotal,
+          usageSource: validatedInput.usageSource,
+          providerCostUSD,
+          providerExposureUSD: validatedInput.providerExposureUSD
+            ?? (validatedInput.usageSource === 'UNKNOWN' && existing.providerAttemptCount > 0 ? existing.providerExposureUSD : 0),
+          userChargeUSD: 0,
+          profitUSD: -providerCostUSD,
+          metadata: outcomeMetadata as InputJsonValue,
+        },
+      });
+    }
+
+    const record = alreadyReconciled || existing.success === true
+      ? existing
+      : {
+          ...existing,
+          success: false,
+          modelUsed: validatedInput.modelUsed,
+          providerCostUSD,
+          userChargeUSD: 0,
+          profitUSD: -providerCostUSD,
+        };
+    const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
+    const resolvedModel = resolvePlanModel(plan, validatedInput.feature, record.modelUsed ?? validatedInput.modelUsed);
+    const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
+    const used = await tx.usageLog.count({
+      where: {
+        userId: validatedInput.userId,
+        feature: toUsageFeature(validatedInput.feature),
+        success: true,
+        createdAt: { gte: usageWindow.windowStart },
+      },
+    });
+    const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : 'chat', { modelUsed: resolvedModel });
+    const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, used, usageLimit, usageWindow.resetAt);
+    return buildDecision(
+      existing.success === true,
+      existing.success === true ? 'Completed reservation was already finalized.' : 'Non-completed usage reconciled.',
+      usage,
+      plan,
+      typeof usageLimit === 'number' ? Math.max(usageLimit - used, 0) : null,
+      existing.id,
+      alreadyReconciled || existing.success === true,
+      record.providerCostUSD,
+      record.userChargeUSD,
+      record.profitUSD,
+      record.modelUsed ?? resolvedModel,
+    );
+  });
+}
+
+export async function reconcileCancelledUsage(input: BillingReservationInput): Promise<BillingDecision> {
+  return reconcileNonCompletedUsage(input, 'cancelled');
+}
+
+export async function reconcilePersistenceFailureUsage(input: BillingReservationInput): Promise<BillingDecision> {
+  return reconcileNonCompletedUsage(input, 'persistence_failed');
+}
+
+export async function reconcileProviderFailureUsage(input: BillingReservationInput): Promise<BillingDecision> {
+  return reconcileNonCompletedUsage(input, 'provider_failed');
 }
 
 export async function rollbackUsage(input: BillingReservationInput): Promise<BillingDecision> {
@@ -1195,8 +1559,35 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
 
       await tx.usageLog.update({
         where: { id: existing.id },
-        data: { success: false },
+        data: {
+          success: false,
+          ...(provider === 'Gemini' && existing.providerAttemptCount === 0 ? {
+            providerCostUSD: 0,
+            providerExposureUSD: 0,
+            tokensInput: 0,
+            tokensOutput: 0,
+            tokensCached: 0,
+            tokensThinking: 0,
+            tokensTotal: 0,
+            usageSource: 'UNKNOWN',
+            userChargeUSD: 0,
+            profitUSD: 0,
+            metadata: {
+              ...(existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
+                ? existing.metadata as Prisma.JsonObject
+                : {}),
+              ...validatedInput.metadata,
+              generationOutcome: 'rolled_back_before_provider',
+            } as InputJsonValue,
+          } : {}),
+        },
       });
+
+      if (provider === 'Gemini' && existing.providerAttemptCount === 0) {
+        logger.info('Gemini reservation released before provider invocation', {
+          requestId: validatedInput.requestId,
+        });
+      }
 
       const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
       const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);

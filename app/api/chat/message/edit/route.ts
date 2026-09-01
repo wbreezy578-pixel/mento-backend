@@ -3,8 +3,10 @@ import { getUserFromRequest } from '../../../../lib/auth';
 import { prisma } from '../../../../../lib/prisma';
 import logger from '../../../../../lib/logger';
 import { ensureCooldown, ensureSlidingWindow } from '../../../../../lib/rateLimiter';
+import { readJsonBodyWithLimit, RequestBodyError } from '../../../../../lib/requestBody';
 import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../../lib/aiGenerationLock';
 import { randomUUID } from 'node:crypto';
+import { buildConversationSummaryReset } from '../../../../../lib/conversationDb';
 
 const MAX_EDIT_LENGTH = 8_000;
 const EDIT_COOLDOWN_MS = 1_000;
@@ -24,9 +26,10 @@ export async function POST(req: Request) {
 
     let body: { messageId?: unknown; text?: unknown };
     try {
-      body = await req.json() as { messageId?: unknown; text?: unknown };
-    } catch {
-      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
+      body = await readJsonBodyWithLimit<{ messageId?: unknown; text?: unknown }>(req, 16 * 1024);
+    } catch (error) {
+      const bodyError = error instanceof RequestBodyError ? error : new RequestBodyError('Invalid JSON body.', 400, 'invalid_json');
+      return NextResponse.json({ error: bodyError.message, code: bodyError.code }, { status: bodyError.status, headers: { 'Cache-Control': 'no-store' } });
     }
     const { messageId, text } = body;
 
@@ -68,7 +71,7 @@ export async function POST(req: Request) {
     // Fetch the message to verify conversation ownership
     const message = await prisma.conversationMessage.findUnique({
       where: { id: normalizedMessageId },
-      include: { conversation: { select: { userId: true } } }
+      include: { conversation: { select: { userId: true, source: true } } }
     });
 
     if (!message) {
@@ -76,8 +79,8 @@ export async function POST(req: Request) {
     }
 
     // Verify user owns the conversation
-    if (message.conversation.userId !== user.id) {
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+    if (message.conversation.userId !== user.id || message.conversation.source !== 'chat') {
+      return NextResponse.json({ error: 'Message not found' }, { status: 404 });
     }
 
     // Only allow editing user messages
@@ -113,7 +116,7 @@ export async function POST(req: Request) {
       });
       await tx.conversation.update({
         where: { id: message.conversationId },
-        data: { updatedAt: new Date(), summary: null, summaryUpdatedAt: null },
+        data: { updatedAt: new Date(), ...buildConversationSummaryReset() },
       });
       return { updated: updatedMessage, deletedMessageIds: staleMessages.map((item) => item.id) };
     });
@@ -123,8 +126,7 @@ export async function POST(req: Request) {
       await releaseAIGenerationLock(message.conversationId, lockOwner).catch(() => undefined);
     }
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Internal Server Error';
     logger.error('Edit message failed', { error: err });
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: 'Unable to edit the message.', code: 'message_edit_failed' }, { status: 500, headers: { 'Cache-Control': 'no-store' } });
   }
 }

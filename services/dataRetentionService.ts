@@ -9,6 +9,9 @@ export function getConversationRetentionCutoff(now = new Date()): Date {
 export async function purgeExpiredConversations(now = new Date()): Promise<{ deletedConversations: number; cutoff: Date }> {
   const cutoff = getConversationRetentionCutoff(now);
   const deletedConversations = await prisma.$transaction(async (tx) => {
+    await tx.chatOperation.deleteMany({
+      where: { expiresAt: { lt: now }, status: { not: 'IN_PROGRESS' } },
+    });
     await tx.liveTutorSession.updateMany({
       where: { conversation: { updatedAt: { lt: cutoff } } },
       data: { conversationId: null },

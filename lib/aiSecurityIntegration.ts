@@ -85,7 +85,7 @@ export async function assessAndSecureChatRequest(
       securityContext,
       {
         riskLevel: assessment.riskLevel,
-        injectionScore: assessment.assessment.injectionDetection.score,
+        injectionScore: assessment.assessment.injectionDetection.riskScore,
         abuseScore: assessment.assessment.abuseScore.score,
         warnings: assessment.warnings,
         inputLength: userInput.length,
@@ -163,7 +163,7 @@ export async function assessAndSecureChatRequest(
       riskLevel: 'critical',
       assessment: {
         validation: { valid: false, error: 'Assessment error' },
-        injectionDetection: { hasInjection: false, score: 0, patterns: [] },
+        injectionDetection: { hasInjection: false, riskScore: 0, obfuscationRisk: 0, patterns: [], blockingRecommended: false, detectionDetails: { normalized: false, scriptTypes: [], detectedLanguage: 'unknown', characterAnomalies: [] } },
         abuseScore: {
           score: 0,
           reasons: [],
@@ -201,7 +201,7 @@ export function getSecurityMetrics(result: ChatSecurityCheckResult): Record<stri
     allowed: result.allowed,
     riskLevel: result.riskLevel,
     injectionDetected: result.assessment.injectionDetection.hasInjection,
-    injectionScore: result.assessment.injectionDetection.score,
+    injectionScore: result.assessment.injectionDetection.riskScore,
     abuseScore: result.assessment.abuseScore.score,
     warningCount: result.warnings.length,
     processingTimeMs: result.processingTimeMs,

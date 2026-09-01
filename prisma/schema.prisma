@@ -29,6 +29,7 @@ model User {
   lockedAt               DateTime?
   clerkUserId            String?                 @unique
   conversations          Conversation[]
+  chatOperations         ChatOperation[]
   conversationMessages   ConversationMessage[]
   liveTutorSession       LiveTutorSession?
   liveTutorWallet        LiveTutorWallet?
@@ -182,8 +183,14 @@ model UsageLog {
   requestId       String?
   tokensInput     Int      @default(0)
   tokensOutput    Int      @default(0)
+  tokensCached    Int      @default(0)
+  tokensThinking  Int      @default(0)
+  tokensTotal     Int      @default(0)
+  usageSource     String   @default("UNKNOWN")
   secondsUsed     Int      @default(0)
   providerCostUSD Float    @default(0)
+  providerExposureUSD Float @default(0)
+  providerAttemptCount Int  @default(0)
   userChargeUSD   Float    @default(0)
   profitUSD       Float    @default(0)
   createdAt       DateTime @default(now())
@@ -438,12 +445,38 @@ model Conversation {
   source            String                @default("chat")
   summary           String?
   summaryUpdatedAt  DateTime?
+  summaryThroughMessageId String?
+  summaryThroughCreatedAt DateTime?
+  summaryRevision   Int                   @default(0)
   user              User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages          ConversationMessage[]
   liveTutorSessions LiveTutorSession[]
   analytics         ChatAnalyticsEvent[]
+  chatOperations    ChatOperation[]
 
   @@index([userId, source, updatedAt])
+  @@index([summaryThroughCreatedAt])
+}
+
+model ChatOperation {
+  id              String        @id @default(cuid())
+  userId          String
+  clientRequestId String
+  operationType   String
+  payloadHash     String
+  conversationId  String?
+  status          String        @default("IN_PROGRESS")
+  responseText    String?
+  errorCode       String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  expiresAt       DateTime
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  conversation    Conversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, clientRequestId, operationType])
+  @@index([conversationId])
+  @@index([status, expiresAt])
 }
 
 model ChatAnalyticsEvent {

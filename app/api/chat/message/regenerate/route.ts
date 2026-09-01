@@ -7,14 +7,17 @@ import {
   enforceAIGatewayRateLimit,
   executeAIRequest,
   getClientIp,
-  buildAIRequestId,
+  requireClientAIRequestId,
   assertAIRequestNotProcessed,
+  AIGenerationCancelledError,
 } from '../../../../../lib/aiSecurityGateway';
 import { buildCorsHeaders } from '../../../../../lib/securityHeaders';
 import logger from '../../../../../lib/logger';
+import { readJsonBodyWithLimit, RequestBodyError } from '../../../../../lib/requestBody';
 import { createSafeStreamWriter } from '../../../../lib/streamUtils';
-import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../../lib/aiGenerationLock';
+import { acquireAIGenerationLock, releaseAIGenerationLock, startAIGenerationLockHeartbeat } from '../../../../../lib/aiGenerationLock';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../../lib/userSettings';
+import { buildConversationSummaryReset, getRegenerationContextForAI } from '../../../../../lib/conversationDb';
 import { createHash } from 'node:crypto';
 
 const CORS_METHODS = 'POST, OPTIONS';
@@ -26,13 +29,6 @@ export async function OPTIONS(req: Request) {
   });
 }
 
-function toGeminiMessages(messages: Array<{ role: string; content?: string | null; text?: string | null }>): GeminiMessage[] {
-  return messages.map((message) => ({
-    role: message.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: message.content ?? message.text ?? '' }],
-  }));
-}
-
 export async function POST(req: Request) {
   try {
     const user = await authenticateAIRequest(req);
@@ -41,72 +37,58 @@ export async function POST(req: Request) {
 
     let body: { messageId?: unknown; answerMode?: unknown; requestId?: unknown } | null = null;
     try {
-      body = (await req.json()) as { messageId?: unknown; answerMode?: unknown; requestId?: unknown };
-    } catch {
-      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      body = await readJsonBodyWithLimit<{ messageId?: unknown; answerMode?: unknown; requestId?: unknown }>(req, 8 * 1024);
+    } catch (error) {
+      const bodyError = error instanceof RequestBodyError ? error : new RequestBodyError('Invalid JSON body.', 400, 'invalid_json');
+      return NextResponse.json({ error: bodyError.message, code: bodyError.code }, { status: bodyError.status, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     const messageId = typeof body?.messageId === 'string' ? body.messageId.trim() : '';
     const answerMode = body?.answerMode === 'short' ? 'short' : 'detailed';
-    const requestId = typeof body?.requestId === 'string' && body.requestId.trim()
-      ? body.requestId.trim()
-      : buildAIRequestId('chat-regenerate');
+    const requestId = requireClientAIRequestId(req, body?.requestId);
     if (!messageId) {
       return NextResponse.json({ error: 'Invalid input: messageId is required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     const targetMessage = await prisma.conversationMessage.findUnique({
       where: { id: messageId },
-      include: { conversation: { select: { id: true, userId: true } } },
+      include: { conversation: { select: { id: true, userId: true, source: true } } },
     });
 
     if (!targetMessage) {
       return NextResponse.json({ error: 'Message not found' }, { status: 404, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    if (targetMessage.conversation.userId !== user.id) {
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    if (targetMessage.conversation.userId !== user.id || targetMessage.conversation.source !== 'chat') {
+      return NextResponse.json({ error: 'Message not found' }, { status: 404, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     if (targetMessage.role !== 'assistant') {
       return NextResponse.json({ error: 'Only assistant messages can be regenerated' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
+    if (targetMessage.status !== 'completed') {
+      return NextResponse.json(
+        { error: 'Only completed assistant messages can be regenerated', code: 'message_not_regenerable' },
+        { status: 409, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } },
+      );
+    }
 
     const conversationId = targetMessage.conversation.id;
-    const priorMessages = await prisma.conversationMessage.findMany({
-      where: { conversationId },
-      orderBy: { createdAt: 'asc' },
-      select: { id: true, role: true, content: true, text: true },
-    });
-
-    const targetIndex = priorMessages.findIndex((message) => message.id === messageId);
-    if (targetIndex < 0) {
-      return NextResponse.json({ error: 'Message not found in conversation' }, { status: 404, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    let regenerationContext: Awaited<ReturnType<typeof getRegenerationContextForAI>>;
+    try {
+      regenerationContext = await getRegenerationContextForAI(conversationId, messageId);
+    } catch (error) {
+      logger.warn('Regeneration context unavailable', {
+        conversationId,
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+      });
+      return NextResponse.json(
+        { error: 'This reply cannot be regenerated from its saved conversation context.', code: 'regeneration_context_unavailable' },
+        { status: 409, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } },
+      );
     }
-
-    const messagesBeforeTarget = priorMessages.slice(0, targetIndex);
-    const lastUserMessage = [...messagesBeforeTarget].reverse().find((message) => message.role === 'user');
-    const regeneratePrompt = lastUserMessage?.content ?? lastUserMessage?.text ?? '';
-
-    if (!regeneratePrompt.trim()) {
-      return NextResponse.json({ error: 'No preceding user prompt found to regenerate from' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
-    }
-
-    const contextMessages = lastUserMessage
-      ? messagesBeforeTarget.filter((message) => message.id !== lastUserMessage.id)
-      : messagesBeforeTarget;
-
-    const historyForAI = toGeminiMessages(contextMessages);
-    const modeInstruction = answerMode === 'short'
-      ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
-      : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
-    const userEntry: GeminiMessage = { role: 'user', parts: [{ text: `${regeneratePrompt.trim()}${modeInstruction}` }] };
+    const { history: historyForAI, prompt: regeneratePrompt } = regenerationContext;
     const tutorLanguage = await getTutorLanguage(user.id);
-    const contents: GeminiMessage[] = [
-      { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
-      ...historyForAI,
-      userEntry,
-    ];
     const operationPayloadHash = createHash('sha256')
       .update(messageId)
       .update('\0')
@@ -122,6 +104,8 @@ export async function POST(req: Request) {
         { status: 409, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } },
       );
     }
+    const generationLease = startAIGenerationLockHeartbeat(conversationId, generationOwnerId);
+    const generationSignal = AbortSignal.any([req.signal, generationLease.signal]);
     try {
       await assertAIRequestNotProcessed({
         userId: user.id,
@@ -131,6 +115,7 @@ export async function POST(req: Request) {
         metadata: { conversationId, operationType: 'chat.regenerate', payloadHash: operationPayloadHash, targetMessageId: messageId },
       });
     } catch (error) {
+      generationLease.stop();
       await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
       throw error;
     }
@@ -138,11 +123,12 @@ export async function POST(req: Request) {
     const stream = new ReadableStream({
       async start(controller) {
         const encoder = new TextEncoder();
-        const { enqueue, close, isStreamClosed } = createSafeStreamWriter(controller, req.signal);
+        const { enqueue, close, isStreamClosed } = createSafeStreamWriter(controller, generationSignal);
         let finalText = '';
+        let deletedMessageIds: string[] = [];
 
         try {
-          const { result: aiResponse } = await executeAIRequest({
+          await executeAIRequest({
             user,
             clientIp,
             feature: 'chat',
@@ -153,39 +139,79 @@ export async function POST(req: Request) {
             pending: true,
             securityInput: regeneratePrompt.trim(),
             securityContext: { conversationId },
-            callback: async ({ billingDecision }) => {
+            callback: async ({ billingDecision, sanitizedInput, reportUsage, reportProviderAttempt }) => {
+              await generationLease.assertOwned();
+              const safePrompt = sanitizedInput ?? regeneratePrompt.trim();
+              const modeInstruction = answerMode === 'short'
+                ? '\nAnswer in 1-3 concise sentences. Prioritize the direct answer and omit optional background.'
+                : '\nGive a thorough, structured explanation with useful context and examples where appropriate.';
+              const contents: GeminiMessage[] = [
+                { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
+                ...historyForAI,
+                { role: 'user', parts: [{ text: `${safePrompt}${modeInstruction}` }] },
+              ];
               const modelToUse = billingDecision.modelUsed ?? undefined;
-              await askGeminiStream(contents, async (token: string) => {
+              const generation = await askGeminiStream(contents, async (token: string) => {
                 if (isStreamClosed()) {
                   return;
                 }
                 finalText += token;
                 const payload = JSON.stringify({ type: 'token', token });
                 enqueue(encoder.encode(`data: ${payload}\n\n`));
-              }, modelToUse, req.signal, regeneratePrompt.trim());
-              return finalText;
+              }, modelToUse, generationSignal, safePrompt, reportUsage, async (model) => {
+                await generationLease.assertOwned();
+                return reportProviderAttempt(model);
+              });
+              if (generationLease.signal.aborted) {
+                throw generationLease.signal.reason;
+              }
+              if (generation.outcome === 'cancelled' || req.signal.aborted || isStreamClosed()) {
+                throw new AIGenerationCancelledError();
+              }
+              return generation.text;
             },
-          });
-
-          await prisma.conversationMessage.update({
-            where: { id: messageId },
-            data: {
-              content: aiResponse,
-              text: aiResponse,
-              status: 'completed',
+            beforeFinalize: async (aiResponse) => {
+              await generationLease.assertOwned();
+              deletedMessageIds = await prisma.$transaction(async (tx) => {
+                const staleMessages = await tx.conversationMessage.findMany({
+                  where: {
+                    conversationId,
+                    OR: [
+                      { createdAt: { gt: targetMessage.createdAt } },
+                      { createdAt: targetMessage.createdAt, id: { gt: messageId } },
+                    ],
+                  },
+                  select: { id: true },
+                });
+                const staleIds = staleMessages.map((entry) => entry.id);
+                if (staleIds.length > 0) {
+                  await tx.conversationMessage.deleteMany({ where: { id: { in: staleIds } } });
+                }
+                await tx.conversationMessage.update({
+                  where: { id: messageId },
+                  data: { content: aiResponse, text: aiResponse, status: 'completed' },
+                });
+                await tx.conversation.update({
+                  where: { id: conversationId },
+                  data: { updatedAt: new Date(), ...buildConversationSummaryReset() },
+                });
+                return staleIds;
+              });
             },
-          });
-
-          await prisma.conversation.update({
-            where: { id: conversationId },
-            data: { updatedAt: new Date() },
           });
 
           if (!isStreamClosed()) {
-            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
+            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done', deletedMessageIds })}\n\n`));
           }
           close();
-        } catch (_err: unknown) {
+        } catch (err: unknown) {
+          if (err instanceof AIGenerationCancelledError) {
+            if (!isStreamClosed()) {
+              enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'cancelled' })}\n\n`));
+            }
+            close();
+            return;
+          }
           const message = 'We couldn’t regenerate that reply right now. Please try again shortly.';
           // Keep the last completed answer intact. The client may show streamed
           // draft text, but failed regeneration must never destroy durable content.
@@ -195,6 +221,7 @@ export async function POST(req: Request) {
           }
           close();
         } finally {
+          generationLease.stop();
           await releaseAIGenerationLock(conversationId, generationOwnerId).catch((lockError) => {
             logger.error('Failed to release regenerate lock', { conversationId, error: String(lockError) });
           });
@@ -214,10 +241,9 @@ export async function POST(req: Request) {
     });
   } catch (err: unknown) {
     if (err instanceof AIRequestGatewayError) {
-      return NextResponse.json(err.body, { status: err.status });
+      return NextResponse.json(err.body, { status: err.status, headers: { ...buildCorsHeaders(req.headers.get('origin')), ...err.headers, 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
-    const message = err instanceof Error ? err.message : 'Internal Server Error';
     logger.error('Regenerate route failed', { error: err });
-    return NextResponse.json({ error: message }, { status: 500 });
+    return NextResponse.json({ error: 'Unable to regenerate the reply.', code: 'regeneration_failed' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

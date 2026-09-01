@@ -11,11 +11,10 @@ const app = next({ dev, hostname, port });
 const handle = app.getRequestHandler();
 
 async function startBackgroundLifecycleTasks(): Promise<void> {
-  const [{ shutdownActiveSimliSessions, recoverDurableLiveTutorSessions }, { recoverActivePaymentTransactions }, { reconcilePendingPaddleTransactions }, { runGeminiStartupHealthCheck }] = await Promise.all([
+  const [{ shutdownActiveSimliSessions, recoverDurableLiveTutorSessions }, { recoverActivePaymentTransactions }, { reconcilePendingPaddleTransactions }] = await Promise.all([
     import('./services/simliService'),
     import('./services/paymentService'),
     import('./services/paddleService'),
-    import('./services/geminiService'),
   ]);
 
   registerShutdownTask(shutdownActiveSimliSessions);
@@ -23,9 +22,6 @@ async function startBackgroundLifecycleTasks(): Promise<void> {
   registerShutdownTask(shutdownRealtimeRedis);
   void recoverDurableLiveTutorSessions().catch((error) => {
     console.warn('[startup] Durable live-tutor recovery failed after server started.', error);
-  });
-  void runGeminiStartupHealthCheck().catch((error) => {
-    console.warn('[startup] Gemini health check failed after server started.', error);
   });
   void reconcilePendingPaddleTransactions().catch((error) => {
     console.warn('[startup] Pending Paddle transaction reconciliation failed.', error);

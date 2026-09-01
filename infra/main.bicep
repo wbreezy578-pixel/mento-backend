@@ -249,6 +249,38 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
               value: 'true'
             }
             {
+              name: 'RATE_WINDOW_SECONDS'
+              value: '60'
+            }
+            {
+              name: 'RATE_LIMIT_PER_USER'
+              value: '30'
+            }
+            {
+              name: 'RATE_LIMIT_PER_IP'
+              value: '300'
+            }
+            {
+              name: 'MESSAGE_COOLDOWN_MS'
+              value: '2000'
+            }
+            {
+              name: 'AI_DAILY_TOKEN_LIMIT'
+              value: '1000000'
+            }
+            {
+              name: 'AI_DAILY_COST_LIMIT_USD'
+              value: '10'
+            }
+            {
+              name: 'AI_GEMINI_REQUEST_COST_RESERVATION_USD'
+              value: '0.5'
+            }
+            {
+              name: 'AI_GEMINI_REQUEST_TOKEN_RESERVATION'
+              value: '100000'
+            }
+            {
               name: 'GEMINI_API_KEY'
               secretRef: 'gemini-api-key'
             }

@@ -24,11 +24,11 @@ const PRODUCT_CATALOG: Record<NativeStoreProductId, {
 type GoogleSubscriptionPurchase = {
   acknowledgementState?: string;
   subscriptionState?: string;
-  latestOrderId?: string;
   startTime?: string;
   lineItems?: Array<{
     productId?: string;
     expiryTime?: string;
+    latestSuccessfulOrderId?: string;
     autoRenewingPlan?: { autoRenewEnabled?: boolean };
   }>;
 };
@@ -96,6 +96,32 @@ function tokenKey(token: string): string {
   return createHash('sha256').update(token).digest('hex');
 }
 
+const GOOGLE_SUBSCRIPTION_STATUS: Record<string, CanonicalEntitlementStatus> = {
+  SUBSCRIPTION_STATE_ACTIVE: 'ACTIVE',
+  SUBSCRIPTION_STATE_IN_GRACE_PERIOD: 'GRACE_PERIOD',
+  SUBSCRIPTION_STATE_CANCELED: 'CANCELLED',
+  SUBSCRIPTION_STATE_ON_HOLD: 'ON_HOLD',
+  SUBSCRIPTION_STATE_PAUSED: 'ON_HOLD',
+  SUBSCRIPTION_STATE_EXPIRED: 'EXPIRED',
+};
+
+function getGoogleSubscriptionStatus(subscriptionState?: string): CanonicalEntitlementStatus {
+  const status = GOOGLE_SUBSCRIPTION_STATUS[subscriptionState ?? ''];
+  if (!status) throw new Error('Google Play returned an unknown subscription state.');
+  return status;
+}
+
+function getGoogleSubscriptionTransactionId(
+  purchaseToken: string,
+  startTime: string | undefined,
+  expiryTime: string | undefined,
+  latestSuccessfulOrderId: string | undefined,
+): string {
+  const orderId = latestSuccessfulOrderId?.trim();
+  if (orderId) return orderId;
+  return `google-play-period:${tokenKey(purchaseToken)}:${tokenKey(`${startTime ?? ''}:${expiryTime ?? ''}`)}`;
+}
+
 function parseDate(value?: string): Date | null {
   if (!value) return null;
   const date = new Date(value);
@@ -149,14 +175,32 @@ export async function verifyGooglePlayPurchase(input: {
     const lineItem = verified.lineItems?.find((item) => item.productId === productId);
     if (!lineItem) throw new Error('Google Play returned a different subscription product.');
     const expiresAt = parseDate(lineItem.expiryTime);
-    const activeStates = new Set(['SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD', 'SUBSCRIPTION_STATE_CANCELED']);
-    const active = activeStates.has(verified.subscriptionState ?? '') && Boolean(expiresAt && expiresAt.getTime() > Date.now());
+    const gplayStatus = getGoogleSubscriptionStatus(verified.subscriptionState);
+    const subscriptionTransactionId = getGoogleSubscriptionTransactionId(
+      purchaseToken,
+      verified.startTime,
+      lineItem.expiryTime,
+      lineItem.latestSuccessfulOrderId,
+    );
+    const active = ['ACTIVE', 'GRACE_PERIOD', 'CANCELLED'].includes(gplayStatus)
+      && Boolean(expiresAt && expiresAt.getTime() > Date.now());
     if (!active) {
       await prisma.storePurchase.updateMany({
         where: { provider: 'GOOGLE_PLAY', purchaseToken, userId: input.userId },
         data: { status: verified.subscriptionState ?? 'UNKNOWN', expiresAt, autoRenewing: lineItem.autoRenewingPlan?.autoRenewEnabled ?? null, rawPayload: verified as Prisma.InputJsonObject, lastVerifiedAt: new Date() },
       });
-      await removeNativeSubscriptionEntitlement(input.userId);
+      await applyVerifiedEntitlementEvent({
+        userId: input.userId,
+        provider: 'GOOGLE_PLAY',
+        externalEventId: `google-play:${subscriptionTransactionId}:${verified.subscriptionState}:verification`,
+        externalTransactionId: subscriptionTransactionId,
+        eventType: 'subscription_verification',
+        plan: 'PRO',
+        status: gplayStatus,
+        periodStart: parseDate(verified.startTime),
+        periodEnd: expiresAt,
+        occurredAt: new Date(),
+      });
       throw new Error('The Google Play subscription is not active.');
     }
 
@@ -165,11 +209,11 @@ export async function verifyGooglePlayPurchase(input: {
       provider: 'GOOGLE_PLAY',
       type: 'SUBSCRIPTION',
       amountUsd: product.amountUsd,
-      providerTransactionId: verified.latestOrderId,
+      providerTransactionId: subscriptionTransactionId,
       providerSubscriptionId: tokenKey(purchaseToken),
       // Google keeps the purchase token for the subscription lifetime but issues a
       // new order for renewals. Key by order so every renewal reaches the ledger.
-      idempotencyKey: `google-play:${verified.latestOrderId ?? tokenKey(purchaseToken)}`,
+      idempotencyKey: `google-play:${subscriptionTransactionId}`,
       metadata: { productId, store: 'google_play' },
       description: 'Mento Pro monthly subscription',
     });
@@ -179,7 +223,7 @@ export async function verifyGooglePlayPurchase(input: {
       transactionId: payment.id,
       provider: 'GOOGLE_PLAY',
       status: 'SUCCEEDED',
-      providerTransactionId: verified.latestOrderId,
+      providerTransactionId: subscriptionTransactionId,
       providerSubscriptionId: tokenKey(purchaseToken),
       providerPayload: verified as Prisma.InputJsonObject,
     });
@@ -193,29 +237,24 @@ export async function verifyGooglePlayPurchase(input: {
       where: { provider_purchaseToken: { provider: 'GOOGLE_PLAY', purchaseToken } },
       create: {
         userId: input.userId, paymentTransactionId: payment.id, provider: 'GOOGLE_PLAY', productId,
-        purchaseToken, transactionId: verified.latestOrderId, originalTransactionId: tokenKey(purchaseToken),
+        purchaseToken, transactionId: subscriptionTransactionId, originalTransactionId: tokenKey(purchaseToken),
         purchaseType: 'SUBSCRIPTION', status: verified.subscriptionState ?? 'UNKNOWN', purchasedAt: parseDate(verified.startTime),
         expiresAt, autoRenewing: lineItem.autoRenewingPlan?.autoRenewEnabled ?? null, acknowledged: true,
         environment: 'PRODUCTION', rawPayload: verified as Prisma.InputJsonObject,
       },
       update: {
-        userId: input.userId, paymentTransactionId: payment.id, transactionId: verified.latestOrderId,
+        userId: input.userId, paymentTransactionId: payment.id, transactionId: subscriptionTransactionId,
         status: verified.subscriptionState ?? 'UNKNOWN', expiresAt,
         autoRenewing: lineItem.autoRenewingPlan?.autoRenewEnabled ?? null, acknowledged: true,
         rawPayload: verified as Prisma.InputJsonObject, lastVerifiedAt: new Date(),
       },
     });
 
-    // Route Google Play subscription entitlement change through canonical boundary (Phase 4B fix)
-    const gplayStatus: CanonicalEntitlementStatus =
-      verified.subscriptionState === 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD' ? 'GRACE_PERIOD' :
-      verified.subscriptionState === 'SUBSCRIPTION_STATE_CANCELED' ? 'CANCELLED' : 'ACTIVE';
-
     await applyVerifiedEntitlementEvent({
       userId: input.userId,
       provider: 'GOOGLE_PLAY',
-      externalEventId: `${tokenKey(purchaseToken)}:verification`,
-      externalTransactionId: verified.latestOrderId,
+      externalEventId: `google-play:${subscriptionTransactionId}:${verified.subscriptionState}:verification`,
+      externalTransactionId: subscriptionTransactionId,
       eventType: 'subscription_verification',
       plan: 'PRO',
       status: gplayStatus,

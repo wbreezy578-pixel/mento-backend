@@ -57,9 +57,11 @@ export default defineConfig({
       "services/liveTutorBillingPolicy.test.ts",
       "services/accountDeletionPolicy.test.ts",
       "services/accountDeletionService.test.ts",
+      "services/nativeStoreService.googlePlay.test.ts",
       "services/transactionalEmailService.test.ts",
       "services/userAccountService.oauth.test.ts",
       "services/supabaseOAuthService.test.ts",
+      "app/api/payments/mobile/google-rtdn/route.test.ts",
     ],
     exclude: [
       "node_modules/**",

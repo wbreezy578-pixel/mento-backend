@@ -1,9 +1,7 @@
 import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../lib/auth';
 import logger from '../../../lib/logger';
-import { canUseChat, canGenerateImage, canUseLiveTutor } from '../../../services/billingService';
-import { getEffectivePlanForUser } from '../../../services/planService';
-import { getWalletSummary } from '../../../services/walletService';
+import { getEntitlementSnapshot } from '../../../services/entitlementService';
 
 export async function GET(req: Request) {
   try {
@@ -12,39 +10,32 @@ export async function GET(req: Request) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const [chatDecision, imageDecision, liveTutorDecision, walletSummary, plan] = await Promise.all([
-      canUseChat(user.id),
-      canGenerateImage(user.id),
-      canUseLiveTutor(user.id),
-      getWalletSummary(user.id),
-      getEffectivePlanForUser(user.id),
-    ]);
-
-    const resetTime = chatDecision.resetTime ?? imageDecision.resetTime ?? liveTutorDecision.resetTime ?? null;
-    const upgradeAvailable = chatDecision.upgradeAvailable || imageDecision.upgradeAvailable || liveTutorDecision.upgradeAvailable;
+    const snapshot = await getEntitlementSnapshot(user.id);
+    const totalLiveSeconds = snapshot.liveTutor.includedSecondsRemaining + snapshot.liveTutor.topUpSecondsRemaining;
 
     return NextResponse.json({
-      currentPlan: plan.name,
-      messagesRemaining: chatDecision.remainingUsage ?? null,
-      imagesRemaining: imageDecision.remainingUsage ?? null,
-      liveTutorMinutes: walletSummary.liveTutorMinutesBalance,
-      resetTime,
-      upgradeAvailable,
+      currentPlan: snapshot.plan,
+      entitlementStatus: snapshot.status,
+      entitlementPeriodEnd: snapshot.periodEnd,
+      messagesRemaining: Math.min(snapshot.normalChat.dailyRemaining, snapshot.normalChat.monthlyRemaining),
+      messagesRemainingDaily: snapshot.normalChat.dailyRemaining,
+      messagesRemainingMonthly: snapshot.normalChat.monthlyRemaining,
+      imagesRemaining: snapshot.images.dailyRemaining,
+      liveTutorMinutes: Math.floor(totalLiveSeconds / 60),
+      includedLiveTutorMinutes: Math.floor(snapshot.liveTutor.includedSecondsRemaining / 60),
+      topUpLiveTutorMinutes: Math.floor(snapshot.liveTutor.topUpSecondsRemaining / 60),
+      resetTime: snapshot.normalChat.dailyResetAt,
+      upgradeAvailable: snapshot.plan !== 'PRO',
       features: {
-        chatModel: plan.chatModel,
-        imageModel: plan.features.imageModel ?? plan.chatModel,
-        liveTutorEnabled: plan.liveTutorEnabled,
-        fairUseEnabled: plan.fairUseEnabled || plan.features.fairUseEnabled === true,
-        imageDailyLimit: plan.imageDailyLimit,
-        messageLimit: plan.messageLimit,
-        imageLimit: plan.imageLimit,
-        fairUseChatLimit: plan.features.fairUseChatLimit ?? null,
-        fairUseImageLimit: plan.features.fairUseImageLimit ?? null,
+        chatModel: snapshot.normalChat.modelPolicy,
+        imageModel: snapshot.normalChat.modelPolicy,
+        liveTutorEnabled: snapshot.liveTutor.allowed,
+        fairUseEnabled: true,
+        maxLiveTutorSessionSeconds: snapshot.liveTutor.maxSessionSeconds,
       },
     });
   } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : 'Internal Server Error';
-    logger.error('Wallet route failed', { error: message });
-    return NextResponse.json({ error: message }, { status: 500 });
+    logger.error('Wallet route failed', { errorName: error instanceof Error ? error.name : 'UnknownError' });
+    return NextResponse.json({ error: 'Product access is temporarily unavailable.', code: 'entitlement_unavailable', retryable: true }, { status: 503 });
   }
 }

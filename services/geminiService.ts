@@ -128,7 +128,12 @@ export function getModelCandidatesForKind(kind: GeminiModelKind, modelOverride?:
   const explicitOverride = modelOverride?.trim();
   const configuredModel = getConfiguredModelName(kind);
   const allowlist = new Set<string>(Object.keys(NORMAL_CHAT_GEMINI_MODELS));
-  const fallbackModels = [configuredModel, 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'].filter((candidate) => allowlist.has(candidate));
+  const requestedTier = kind === 'image' && explicitOverride && isSupportedNormalChatModel(explicitOverride)
+    ? NORMAL_CHAT_GEMINI_MODELS[explicitOverride].tier
+    : null;
+  const fallbackModels = [configuredModel, 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-2.5-flash-lite']
+    .filter((candidate) => allowlist.has(candidate))
+    .filter((candidate) => requestedTier !== 'flash-lite' || NORMAL_CHAT_GEMINI_MODELS[candidate as NormalChatGeminiModel].tier === 'flash-lite');
   const candidates = explicitOverride
     ? [explicitOverride, ...fallbackModels.filter((candidate) => candidate && candidate !== explicitOverride)]
     : fallbackModels;

@@ -45,6 +45,8 @@ export default defineConfig({
       "services/contextBudgetManager.test.ts",
       "services/chatService.test.ts",
       "services/chatOperationService.test.ts",
+      "services/productPolicy.test.ts",
+      "services/entitlementFoundation.test.ts",
       "services/liveTutorAudioProtocol.test.ts",
       "services/liveTutorVoiceFoundation.test.ts",
       "services/liveTutorVoiceGateway.test.ts",

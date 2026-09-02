@@ -3,12 +3,14 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { ensureUserBillingSetup } from './economicsService';
 import { ensureDefaultPlans } from './planService';
+import { applyVerifiedEntitlementEvent } from './entitlementService';
 import logger from '../lib/logger';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
 import { trackShutdownOperation } from '../lib/crashRecovery';
 import { getPaddleNotificationWebhookSecret, getPaddleTopUp50PriceId, getPaddleTopUp100PriceId } from '../lib/env';
 import { getPaddleInstance } from '../lib/paddle';
 import '../lib/metrics';
+import { getProductPolicy } from './productPolicy';
 
 export type PaymentProvider = 'MPESA' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE' | 'PADDLE';
 export type PaymentType = 'SUBSCRIPTION' | 'TOP_UP';
@@ -388,22 +390,24 @@ async function finalizePaymentInternal(input: {
       await ensureDefaultPlans();
 
       if (current.type === 'SUBSCRIPTION') {
-        const proPlan = await tx.plan.findUnique({ where: { name: 'PRO' } });
-        if (!proPlan) {
-          throw new Error('PRO plan is unavailable');
-        }
-        await tx.userWallet.update({
-          where: { userId: current.userId },
-          data: {
-            planId: proPlan.id,
-            subscriptionStatus: 'active',
-          },
-        });
+        // Phase 4C: Subscription entitlement state (plan, status, periods, entitlementUpdatedAt)
+        // is now handled solely by applyVerifiedEntitlementEvent() to avoid race conditions.
+        // Finalization is payment-only: it records the transaction success.
+        // The provider adapter (caller) invokes applyVerifiedEntitlementEvent() with
+        // verified provider state (subscription periods, status from provider API).
+        // This ensures canonical entitlement authority is not split between
+        // finalization and applyVerifiedEntitlementEvent().
 
         const liveTutorWallet = await tx.liveTutorWallet.findUnique({ where: { userId: current.userId } });
         if (liveTutorWallet) {
-          await tx.liveTutorWallet.update({ where: { userId: current.userId }, data: { minutesBalance: { increment: 200 } } });
-          logger.info('Granted 200 live tutor minutes for completed Pro transaction', { userId: current.userId, transactionId: current.id });
+          const includedSeconds = getProductPolicy('PRO').liveTutor.includedSecondsPerPeriod;
+          const updated = await tx.liveTutorWallet.update({ where: { userId: current.userId }, data: { minutesBalance: Math.floor((includedSeconds + liveTutorWallet.topUpSeconds) / 60), includedSeconds } });
+          await tx.liveTutorMinuteLedger.create({ data: {
+            userId: current.userId, walletId: updated.id, idempotencyKey: `subscription:${current.provider}:${current.id}`,
+            entryType: 'SUBSCRIPTION_PERIOD_RESET', source: current.provider,
+            includedSecondsAfter: updated.includedSeconds, topUpSecondsAfter: updated.topUpSeconds,
+          } });
+          logger.info('Reset included Live Tutor allowance for completed Pro transaction', { userId: current.userId, transactionId: current.id, includedSeconds });
         }
       }
 
@@ -452,10 +456,16 @@ async function finalizePaymentInternal(input: {
         if (topUpMinutes && topUpMinutes > 0) {
           const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: current.userId } });
           if (wallet) {
-            await tx.liveTutorWallet.update({
+            const updated = await tx.liveTutorWallet.update({
               where: { userId: current.userId },
-              data: { minutesBalance: { increment: topUpMinutes } },
+              data: { minutesBalance: { increment: topUpMinutes }, topUpSeconds: { increment: topUpMinutes * 60 } },
             });
+            await tx.liveTutorMinuteLedger.create({ data: {
+              userId: current.userId, walletId: updated.id, idempotencyKey: `topup:${current.provider}:${current.id}`,
+              entryType: 'TOP_UP_CREDIT', source: current.provider, topUpSecondsDelta: topUpMinutes * 60,
+              includedSecondsAfter: updated.includedSeconds, topUpSecondsAfter: updated.topUpSeconds,
+              expiresAt: null,
+            } });
             logger.info('Granted live tutor minutes from top-up', {
               userId: current.userId,
               minutes: topUpMinutes,
@@ -630,7 +640,7 @@ export async function refundPaymentByProviderTransaction(
   const existing = await prisma.paymentTransaction.findUnique({ where: { providerTransactionId } });
   if (!existing || !existing.userId) return false;
 
-  return prisma.$transaction(async (tx) => {
+  const refundSuccess = await prisma.$transaction(async (tx) => {
     const fullRefund = options?.full !== false;
     const amountMinor = Math.min(existing.amountMinor, Math.max(0, options?.amountMinor ?? existing.amountMinor));
     if (amountMinor === 0) return false;
@@ -650,14 +660,10 @@ export async function refundPaymentByProviderTransaction(
     const metadata = asJsonObject(existing.metadata);
     let minutesToRevoke = 0;
     if (fullRefund && existing.type === 'SUBSCRIPTION') {
-      minutesToRevoke = 200;
-      const freePlan = await tx.plan.findUnique({ where: { name: 'FREE' } });
-      if (freePlan) {
-        await tx.userWallet.update({
-          where: { userId: existing.userId! },
-          data: { planId: freePlan.id, subscriptionStatus: 'refunded', subscriptionExpiresAt: new Date() },
-        });
-      }
+      minutesToRevoke = Math.ceil(getProductPolicy('PRO').liveTutor.includedSecondsPerPeriod / 60);
+      // Phase 4C: Subscription refund entitlement state (plan downgrade, status revocation)
+      // is now handled by applyVerifiedEntitlementEvent() after this transaction succeeds.
+      // Finalization is payment-only: it records the refund in payment ledger and updates receipt.
     } else if (fullRefund && metadata.sku === 'topup_50') {
       minutesToRevoke = 50;
     } else if (fullRefund && metadata.sku === 'topup_100') {
@@ -669,7 +675,9 @@ export async function refundPaymentByProviderTransaction(
       if (wallet) {
         await tx.liveTutorWallet.update({
           where: { userId: existing.userId! },
-          data: { minutesBalance: Math.max(0, wallet.minutesBalance - minutesToRevoke) },
+          data: fullRefund && existing.type === 'SUBSCRIPTION'
+            ? { minutesBalance: Math.max(0, wallet.minutesBalance - minutesToRevoke), includedSeconds: 0 }
+            : { minutesBalance: Math.max(0, wallet.minutesBalance - minutesToRevoke), topUpSeconds: Math.max(0, wallet.topUpSeconds - minutesToRevoke * 60) },
         });
       }
     }
@@ -693,6 +701,24 @@ export async function refundPaymentByProviderTransaction(
     await tx.paymentReceipt.updateMany({ where: { transactionId: existing.id }, data: { status: fullRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED' } });
     return true;
   });
+
+  // Phase 4C: Route subscription refund through canonical entitlement boundary
+  if (refundSuccess && options?.full !== false && existing.type === 'SUBSCRIPTION' && existing.providerTransactionId) {
+    await applyVerifiedEntitlementEvent({
+      userId: existing.userId,
+      provider: 'PADDLE',
+      externalEventId: `${existing.providerTransactionId}:refund:${options?.adjustmentId || 'full'}`,
+      externalTransactionId: existing.providerTransactionId,
+      eventType: 'subscription_refund',
+      plan: 'FREE',
+      status: 'REVOKED',
+      periodStart: null,
+      periodEnd: null,
+      occurredAt: new Date(),
+    });
+  }
+
+  return refundSuccess;
 }
 
 export async function verifyWebhookSignature(input: { payload: string; signature: string; provider: PaymentProvider }): Promise<boolean> {

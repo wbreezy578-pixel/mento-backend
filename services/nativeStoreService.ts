@@ -5,6 +5,7 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { getRequiredEnv } from '../lib/env';
 import { finalizePayment, startPayment } from './paymentService';
+import { applyVerifiedEntitlementEvent, type CanonicalEntitlementStatus } from './entitlementService';
 import { isIdempotentProviderCancellationError } from './accountDeletionPolicy';
 
 export type NativeStoreProductId = 'mento_pro_monthly' | 'mento_live_tutor_50' | 'mento_live_tutor_100';
@@ -204,6 +205,25 @@ export async function verifyGooglePlayPurchase(input: {
         rawPayload: verified as Prisma.InputJsonObject, lastVerifiedAt: new Date(),
       },
     });
+
+    // Route Google Play subscription entitlement change through canonical boundary (Phase 4B fix)
+    const gplayStatus: CanonicalEntitlementStatus =
+      verified.subscriptionState === 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD' ? 'GRACE_PERIOD' :
+      verified.subscriptionState === 'SUBSCRIPTION_STATE_CANCELED' ? 'CANCELLED' : 'ACTIVE';
+
+    await applyVerifiedEntitlementEvent({
+      userId: input.userId,
+      provider: 'GOOGLE_PLAY',
+      externalEventId: `${tokenKey(purchaseToken)}:verification`,
+      externalTransactionId: verified.latestOrderId,
+      eventType: 'subscription_verification',
+      plan: 'PRO',
+      status: gplayStatus,
+      periodStart: parseDate(verified.startTime),
+      periodEnd: expiresAt,
+      occurredAt: new Date(),
+    });
+
     return { active: true, productId, status: verified.subscriptionState ?? 'UNKNOWN', transactionId: payment.id };
   }
 
@@ -303,7 +323,34 @@ export async function processGooglePlayRtdn(encodedData: string): Promise<{ hand
         const minutes = isNativeStoreProductId(existing.productId) ? PRODUCT_CATALOG[existing.productId].minutes ?? 0 : 0;
         if (minutes > 0) {
           const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: existing.userId! } });
-          if (wallet) await tx.liveTutorWallet.update({ where: { userId: existing.userId! }, data: { minutesBalance: Math.max(0, wallet.minutesBalance - minutes) } });
+          if (wallet) {
+            // Fix Phase 4B: Atomically decrement both topUpSeconds AND minutesBalance
+            const refundableSeconds = Math.min(wallet.topUpSeconds, minutes * 60);
+            const newTopUpSeconds = Math.max(0, wallet.topUpSeconds - refundableSeconds);
+            const totalSecondsAfter = wallet.includedSeconds + newTopUpSeconds;
+
+            const updated = await tx.liveTutorWallet.update({
+              where: { userId: existing.userId! },
+              data: {
+                topUpSeconds: newTopUpSeconds,
+                minutesBalance: Math.floor(totalSecondsAfter / 60),
+              },
+            });
+
+            // Audit trail: log the refund in ledger
+            await tx.liveTutorMinuteLedger.create({
+              data: {
+                userId: existing.userId!,
+                walletId: wallet.id,
+                idempotencyKey: `google-play-refund:${existing.purchaseToken}:${existing.paymentTransactionId}`,
+                entryType: 'TOP_UP_REFUND',
+                source: 'GOOGLE_PLAY',
+                topUpSecondsDelta: -refundableSeconds,
+                topUpSecondsAfter: updated.topUpSeconds,
+                includedSecondsAfter: updated.includedSeconds,
+              },
+            });
+          }
         }
       });
     }
@@ -384,6 +431,21 @@ export async function verifyAppleStorePurchase(input: {
     },
     update: { userId: input.userId, paymentTransactionId: payment.id, status: 'ACTIVE', expiresAt, rawPayload: decoded as Prisma.InputJsonObject, lastVerifiedAt: new Date() },
   });
+  if (product.type === 'SUBSCRIPTION') {
+    // Route Apple subscription entitlement change through canonical boundary (Phase 4B fix)
+    await applyVerifiedEntitlementEvent({
+      userId: input.userId,
+      provider: 'APPLE_APP_STORE',
+      externalEventId: `${decoded.transactionId}:verification`,
+      externalTransactionId: decoded.originalTransactionId,
+      eventType: 'subscription_verification',
+      plan: 'PRO',
+      status: 'ACTIVE',
+      periodStart: decoded.purchaseDate ? new Date(decoded.purchaseDate) : new Date(),
+      periodEnd: expiresAt,
+      occurredAt: new Date(),
+    });
+  }
   return { active: true, productId, status: 'ACTIVE', transactionId: payment.id };
 }
 
@@ -441,7 +503,34 @@ export async function processAppleStoreNotification(signedPayload: string): Prom
         const minutes = PRODUCT_CATALOG[existing.productId].minutes ?? 0;
         if (minutes > 0) {
           const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: existing.userId! } });
-          if (wallet) await tx.liveTutorWallet.update({ where: { userId: existing.userId! }, data: { minutesBalance: Math.max(0, wallet.minutesBalance - minutes) } });
+          if (wallet) {
+            // Fix Phase 4B: Atomically decrement both topUpSeconds AND minutesBalance
+            const refundableSeconds = Math.min(wallet.topUpSeconds, minutes * 60);
+            const newTopUpSeconds = Math.max(0, wallet.topUpSeconds - refundableSeconds);
+            const totalSecondsAfter = wallet.includedSeconds + newTopUpSeconds;
+
+            const updated = await tx.liveTutorWallet.update({
+              where: { userId: existing.userId! },
+              data: {
+                topUpSeconds: newTopUpSeconds,
+                minutesBalance: Math.floor(totalSecondsAfter / 60),
+              },
+            });
+
+            // Audit trail: log the refund in ledger
+            await tx.liveTutorMinuteLedger.create({
+              data: {
+                userId: existing.userId!,
+                walletId: wallet.id,
+                idempotencyKey: `apple-refund:${existing.transactionId}:${existing.paymentTransactionId}`,
+                entryType: 'TOP_UP_REFUND',
+                source: 'APPLE_APP_STORE',
+                topUpSecondsDelta: -refundableSeconds,
+                topUpSecondsAfter: updated.topUpSeconds,
+                includedSecondsAfter: updated.includedSeconds,
+              },
+            });
+          }
         }
       }
     });

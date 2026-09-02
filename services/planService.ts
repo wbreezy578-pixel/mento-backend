@@ -1,6 +1,6 @@
 import type { InputJsonValue, JsonValue } from '@prisma/client/runtime/library';
-import { AI_CONFIG } from '../app/lib/aiConfig';
 import { prisma } from '../lib/prisma';
+import { getProductPolicy } from './productPolicy';
 
 export type BillingPlanName = 'FREE' | 'PRO';
 
@@ -43,50 +43,55 @@ export class PlanServiceError extends Error {
   }
 }
 
+const freePolicy = getProductPolicy('FREE');
+const proPolicy = getProductPolicy('PRO');
+
 const DEFAULT_PLAN_DEFINITIONS: PlanDefinition[] = [
   {
     name: 'FREE',
     price: 0,
     messageLimit: null,
     imageLimit: null,
-    chatModel: AI_CONFIG.CHAT_MODEL,
+    chatModel: freePolicy.normalChat.model,
     fairUseEnabled: true,
     imageDailyLimit: 3,
     priority: 0,
     liveTutorEnabled: false,
     features: {
-      chatModel: AI_CONFIG.CHAT_MODEL,
-      imageModel: AI_CONFIG.IMAGE_MODEL,
-      availableModels: [AI_CONFIG.CHAT_MODEL],
-      chatWindowMinutes: 180,
-      chatWindowLimit: 100,
-      fairUseChatLimit: 100,
-      fairUseImageLimit: 3,
-      imageDailyLimit: 3,
+      chatModel: freePolicy.normalChat.model,
+      imageModel: freePolicy.normalChat.model,
+      availableModels: [...freePolicy.normalChat.allowedModels],
+      chatDailyLimit: freePolicy.normalChat.dailyCompletedMessages,
+      chatMonthlyLimit: freePolicy.normalChat.monthlyCompletedMessages,
+      fairUseChatLimit: freePolicy.normalChat.dailyCompletedMessages,
+      fairUseImageLimit: freePolicy.normalChat.imageQuestionsPerDay,
+      imageDailyLimit: freePolicy.normalChat.imageQuestionsPerDay,
       liveTutorEnabled: false,
     },
   },
   {
     name: 'PRO',
-    price: 15,
+    price: proPolicy.priceMonthlyUSD,
     messageLimit: null,
     imageLimit: null,
-    chatModel: AI_CONFIG.CHAT_MODEL,
+    chatModel: proPolicy.normalChat.model,
     fairUseEnabled: true,
-    imageDailyLimit: 0,
+    imageDailyLimit: proPolicy.normalChat.imageQuestionsPerDay,
     priority: 1,
     liveTutorEnabled: true,
     features: {
-      chatModel: AI_CONFIG.CHAT_MODEL,
-      imageModel: AI_CONFIG.IMAGE_MODEL,
-      availableModels: [AI_CONFIG.CHAT_MODEL, AI_CONFIG.IMAGE_MODEL],
-      chatWindowMinutes: 180,
-      chatWindowLimit: 200,
-      proChatDailyLimit: 100,
-      fairUseChatLimit: 200,
-      fairUseImageLimit: null,
-      imageDailyLimit: null,
+      chatModel: proPolicy.normalChat.model,
+      imageModel: proPolicy.normalChat.model,
+      availableModels: [...proPolicy.normalChat.allowedModels],
+      chatDailyLimit: proPolicy.normalChat.dailyCompletedMessages,
+      chatMonthlyLimit: proPolicy.normalChat.monthlyCompletedMessages,
+      proChatDailyLimit: proPolicy.normalChat.dailyCompletedMessages,
+      fairUseChatLimit: proPolicy.normalChat.dailyCompletedMessages,
+      fairUseImageLimit: proPolicy.normalChat.imageQuestionsPerDay,
+      imageDailyLimit: proPolicy.normalChat.imageQuestionsPerDay,
       liveTutorEnabled: true,
+      includedLiveTutorSeconds: proPolicy.liveTutor.includedSecondsPerPeriod,
+      liveTutorMaxSessionSeconds: proPolicy.liveTutor.maxSessionSeconds,
     },
   },
 ];
@@ -269,12 +274,22 @@ export async function getProPlan(): Promise<PlanRecord> {
   return plan;
 }
 
-export function isSubscriptionActive(status: string | null | undefined, expiresAt?: Date | string | null): boolean {
+export function isSubscriptionActive(
+  status: string | null | undefined,
+  expiresAt?: Date | string | null,
+  startsAt?: Date | string | null,
+  now = new Date(),
+): boolean {
   const normalizedStatus = String(status ?? '').toLowerCase();
-  if ((normalizedStatus === 'active' || normalizedStatus === 'trialing') && !expiresAt) return true;
-  if ((normalizedStatus === 'active' || normalizedStatus === 'trialing' || normalizedStatus === 'canceled' || normalizedStatus === 'cancelled') && expiresAt) {
+  const accessStatuses = new Set(['active', 'trialing', 'grace_period', 'grace', 'canceled', 'cancelled']);
+  if (accessStatuses.has(normalizedStatus) && expiresAt && startsAt) {
     const expiration = typeof expiresAt === 'string' ? new Date(expiresAt) : expiresAt;
-    return expiration instanceof Date && !Number.isNaN(expiration.getTime()) && expiration > new Date();
+    const start = typeof startsAt === 'string' ? new Date(startsAt) : startsAt;
+    return expiration instanceof Date
+      && !Number.isNaN(expiration.getTime())
+      && expiration > now
+      && !Number.isNaN(start.getTime())
+      && start <= now;
   }
 
   return false;
@@ -307,7 +322,11 @@ export async function getEffectivePlanForUser(userId: string): Promise<PlanRecor
     return getFreePlan();
   }
 
-  if (isSubscriptionActive(wallet.subscriptionStatus as string, wallet.subscriptionExpiresAt)) {
+  if (isSubscriptionActive(
+    wallet.subscriptionStatus as string,
+    wallet.subscriptionExpiresAt,
+    wallet.subscriptionPeriodStart ?? wallet.subscriptionStartedAt,
+  )) {
     return toPlanRecord(wallet.plan);
   }
 
@@ -324,26 +343,11 @@ export function getEffectiveLimit(
       return plan.messageLimit;
     }
 
-    const normalizedModel = typeof options?.modelUsed === 'string' ? options.modelUsed.toLowerCase() : null;
-    if (normalizedModel?.includes('pro')) {
-      const proLimit = toNumber(plan.features.proChatDailyLimit);
-      return proLimit ?? null;
-    }
-
-    const windowLimit = toNumber(plan.features.chatWindowLimit);
-    if (windowLimit !== null) {
-      return windowLimit;
-    }
-
-    const fairUseLimit = toNumber(plan.features.fairUseChatLimit);
-    return fairUseLimit ?? null;
+    void options;
+    return toNumber(plan.features.chatDailyLimit) ?? toNumber(plan.features.fairUseChatLimit);
   }
 
   if (feature === 'image') {
-    if (plan.name === 'PRO') {
-      return null; // Unlimited image analysis for Pro users
-    }
-
     if (typeof plan.imageLimit === 'number') {
       return plan.imageLimit;
     }

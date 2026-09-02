@@ -13,6 +13,7 @@ import {
   GeminiDailyBudgetUnavailableError,
 } from '../services/geminiDailyBudget';
 import { buildGeminiAttemptAccounting, type GeminiAttemptUsage } from '../services/geminiAttemptAccounting';
+import { recordEntitlementTelemetry } from '../services/entitlementService';
 
 export class AIRequestGatewayError extends Error {
   status: number;
@@ -484,9 +485,12 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
     });
   }
   if (!billingDecision.allowed) {
-    throw new AIRequestGatewayError(402, {
-      error: billingDecision.reason,
-      billing: billingDecision,
+    recordEntitlementTelemetry(options.feature === 'chat' ? 'chat_allowance_exhausted' : options.feature === 'live_tutor' ? 'live_allowance_exhausted' : 'entitlement_denied', { userId, feature: options.feature });
+    throw new AIRequestGatewayError(429, {
+      error: 'Your current Mento usage allowance has been reached.',
+      code: 'product_allowance_exhausted',
+      retryable: false,
+      resetTime: billingDecision.resetTime,
     });
   }
 

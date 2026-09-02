@@ -40,6 +40,8 @@ model User {
   paymentLedgerEntries   PaymentLedgerEntry[]
   paymentReceipts        PaymentReceipt[]
   paymentTransactions    PaymentTransaction[]
+  entitlementEvents      EntitlementEvent[]
+  liveTutorMinuteEntries LiveTutorMinuteLedger[]
   storePurchases         StorePurchase[]
   securityEvents         SecurityEvent[]
   sessions               Session[]
@@ -71,15 +73,15 @@ model SupportReport {
 }
 
 model ConsentRecord {
-  id              String   @id @default(cuid())
+  id              String    @id @default(cuid())
   userId          String
   privacyVersion  String
   termsVersion    String
   aiNoticeVersion String
-  source          String   @default("android")
-  acceptedAt      DateTime @default(now())
+  source          String    @default("android")
+  acceptedAt      DateTime  @default(now())
   revokedAt       DateTime?
-  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, privacyVersion, termsVersion, aiNoticeVersion])
   @@index([userId, acceptedAt])
@@ -101,24 +103,32 @@ model Notification {
   externalId String?
   user       User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId, createdAt])
   @@unique([userId, externalId])
+  @@index([userId, createdAt])
 }
 
 model UserWallet {
-  id                    String    @id @default(cuid())
-  userId                String    @unique
-  subscriptionStatus    String    @default("active")
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
-  planId                String
-  paddleCustomerId      String?   @unique
-  paddlePriceId         String?
-  paddleSubscriptionId  String?   @unique
-  subscriptionExpiresAt DateTime?
-  paddleLastEventAt     DateTime?
-  plan                  Plan      @relation(fields: [planId], references: [id])
-  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                      String    @id @default(cuid())
+  userId                  String    @unique
+  subscriptionStatus      String    @default("active")
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+  planId                  String
+  paddleCustomerId        String?   @unique
+  paddlePriceId           String?
+  paddleSubscriptionId    String?   @unique
+  subscriptionExpiresAt   DateTime?
+  subscriptionStartedAt   DateTime?
+  subscriptionPeriodStart DateTime?
+  entitlementSource       String    @default("SYSTEM")
+  entitlementExternalId   String?
+  entitlementUpdatedAt    DateTime?
+  paddleLastEventAt       DateTime?
+  plan                    Plan      @relation(fields: [planId], references: [id])
+  user                    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([entitlementSource, entitlementExternalId])
+  @@index([subscriptionStatus, subscriptionExpiresAt])
 }
 
 model Plan {
@@ -139,12 +149,59 @@ model Plan {
 }
 
 model LiveTutorWallet {
-  id             String   @id @default(cuid())
-  userId         String   @unique
-  minutesBalance Int      @default(0)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                  String                  @id @default(cuid())
+  userId              String                  @unique
+  minutesBalance      Int                     @default(0)
+  includedSeconds     Int                     @default(0)
+  topUpSeconds        Int                     @default(0)
+  includedPeriodStart DateTime?
+  includedPeriodEnd   DateTime?
+  createdAt           DateTime                @default(now())
+  updatedAt           DateTime                @updatedAt
+  user                User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ledgerEntries       LiveTutorMinuteLedger[]
+}
+
+model EntitlementEvent {
+  id                    String    @id @default(cuid())
+  userId                String
+  provider              String
+  externalEventId       String
+  externalTransactionId String?
+  eventType             String
+  planName              String
+  status                String
+  periodStart           DateTime?
+  periodEnd             DateTime?
+  occurredAt            DateTime
+  metadata              Json?
+  createdAt             DateTime  @default(now())
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, externalEventId])
+  @@index([userId, occurredAt])
+  @@index([provider, externalTransactionId])
+}
+
+model LiveTutorMinuteLedger {
+  id                   String          @id @default(cuid())
+  userId               String
+  walletId             String
+  idempotencyKey       String          @unique
+  entryType            String
+  source               String
+  includedSecondsDelta Int             @default(0)
+  topUpSecondsDelta    Int             @default(0)
+  includedSecondsAfter Int
+  topUpSecondsAfter    Int
+  expiresAt            DateTime?
+  metadata             Json?
+  createdAt            DateTime        @default(now())
+  user                 User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  wallet               LiveTutorWallet @relation(fields: [walletId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([walletId, createdAt])
 }
 
 model LiveTutorSession {
@@ -176,29 +233,29 @@ model LiveTutorSession {
 }
 
 model UsageLog {
-  id              String   @id @default(cuid())
-  userId          String
-  feature         String
-  provider        String
-  requestId       String?
-  tokensInput     Int      @default(0)
-  tokensOutput    Int      @default(0)
-  tokensCached    Int      @default(0)
-  tokensThinking  Int      @default(0)
-  tokensTotal     Int      @default(0)
-  usageSource     String   @default("UNKNOWN")
-  secondsUsed     Int      @default(0)
-  providerCostUSD Float    @default(0)
-  providerExposureUSD Float @default(0)
-  providerAttemptCount Int  @default(0)
-  userChargeUSD   Float    @default(0)
-  profitUSD       Float    @default(0)
-  createdAt       DateTime @default(now())
-  metadata        Json?
-  modelUsed       String?
-  planName        String?
-  success         Boolean? @default(true)
-  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id                   String   @id @default(cuid())
+  userId               String
+  feature              String
+  provider             String
+  requestId            String?
+  tokensInput          Int      @default(0)
+  tokensOutput         Int      @default(0)
+  tokensCached         Int      @default(0)
+  tokensThinking       Int      @default(0)
+  tokensTotal          Int      @default(0)
+  usageSource          String   @default("UNKNOWN")
+  secondsUsed          Int      @default(0)
+  providerCostUSD      Float    @default(0)
+  providerExposureUSD  Float    @default(0)
+  providerAttemptCount Int      @default(0)
+  userChargeUSD        Float    @default(0)
+  profitUSD            Float    @default(0)
+  createdAt            DateTime @default(now())
+  metadata             Json?
+  modelUsed            String?
+  planName             String?
+  success              Boolean? @default(true)
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([provider, requestId])
   @@index([userId, createdAt])
@@ -247,9 +304,9 @@ model Session {
   expiresAt           DateTime
   revokedAt           DateTime?
   replacedBySessionId String?
-  familyId             String
-  parentSessionId      String?
-  absoluteExpiresAt    DateTime
+  familyId            String
+  parentSessionId     String?
+  absoluteExpiresAt   DateTime
   user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, revokedAt])
@@ -268,19 +325,19 @@ model SecurityEvent {
 }
 
 model AccountDeletionJob {
-  id                    String    @id @default(cuid())
-  userId                String    @unique
-  supabaseUserId        String?
-  paddleSubscriptionId  String?
-  status                String    @default("PENDING")
-  attempts              Int       @default(0)
-  lastError             String?
-  paddleCanceledAt      DateTime?
-  googlePlayCanceledAt  DateTime?
-  supabaseDeletedAt     DateTime?
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
-  completedAt           DateTime?
+  id                   String    @id @default(cuid())
+  userId               String    @unique
+  supabaseUserId       String?
+  paddleSubscriptionId String?
+  status               String    @default("PENDING")
+  attempts             Int       @default(0)
+  lastError            String?
+  paddleCanceledAt     DateTime?
+  googlePlayCanceledAt DateTime?
+  supabaseDeletedAt    DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  completedAt          DateTime?
 
   @@index([status, updatedAt])
 }
@@ -436,23 +493,23 @@ model PricingConfig {
 }
 
 model Conversation {
-  id                String                @id @default(cuid())
-  userId            String
-  title             String?
-  pinned            Boolean               @default(false)
-  createdAt         DateTime              @default(now())
-  updatedAt         DateTime              @updatedAt
-  source            String                @default("chat")
-  summary           String?
-  summaryUpdatedAt  DateTime?
+  id                      String                @id @default(cuid())
+  userId                  String
+  title                   String?
+  pinned                  Boolean               @default(false)
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
+  source                  String                @default("chat")
+  summary                 String?
+  summaryUpdatedAt        DateTime?
   summaryThroughMessageId String?
   summaryThroughCreatedAt DateTime?
-  summaryRevision   Int                   @default(0)
-  user              User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  messages          ConversationMessage[]
-  liveTutorSessions LiveTutorSession[]
-  analytics         ChatAnalyticsEvent[]
-  chatOperations    ChatOperation[]
+  summaryRevision         Int                   @default(0)
+  user                    User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages                ConversationMessage[]
+  liveTutorSessions       LiveTutorSession[]
+  analytics               ChatAnalyticsEvent[]
+  chatOperations          ChatOperation[]
 
   @@index([userId, source, updatedAt])
   @@index([summaryThroughCreatedAt])
@@ -511,9 +568,9 @@ model ConversationMessage {
   conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([conversationId, requestId, role])
   @@index([conversationId, createdAt])
   @@index([userId])
-  @@unique([conversationId, requestId, role])
 }
 
 enum NotificationCategory {

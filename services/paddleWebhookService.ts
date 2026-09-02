@@ -2,6 +2,7 @@ import { getPaddleNotificationWebhookSecret } from '../lib/env';
 import { getPaddleInstance } from '../lib/paddle';
 import { prisma } from '../lib/prisma';
 import logger from '../lib/logger';
+import { applyVerifiedEntitlementEvent, type CanonicalEntitlementStatus } from './entitlementService';
 import { finalizePayment, refundPaymentByProviderTransaction } from './paymentService';
 
 // Paddle SDK event entities vary by event type and are normalized at runtime below.
@@ -167,27 +168,51 @@ async function processSubscriptionEvent(event: PaddleBillingEvent): Promise<void
 
   const billingPeriod = asObject(data.currentBillingPeriod ?? data.current_billing_period);
   const periodEndRaw = firstString(billingPeriod.endsAt, billingPeriod.ends_at);
+  const periodStartRaw = firstString(billingPeriod.startsAt, billingPeriod.starts_at);
   const status = firstString(data.status).toLowerCase();
-  const activeStatus = status === 'active' || status === 'trialing' ? status : status || 'inactive';
   const items = Array.isArray(data.items) ? data.items : [];
   const priceId = firstString(items[0]?.price?.id, items[0]?.price_id);
-  await assertPaddleOwnership(
-    wallet.userId,
-    firstString(data.customerId, data.customer_id),
-    firstString(data.id),
-  );
+  const subscriptionId = firstString(data.id);
+  const customerId = firstString(data.customerId, data.customer_id);
 
+  await assertPaddleOwnership(wallet.userId, customerId, subscriptionId);
+
+  // Map Paddle status to canonical entitlement status
+  const canonicalStatus: CanonicalEntitlementStatus =
+    status === 'active' || status === 'trialing' ? 'ACTIVE' :
+    status === 'past_due' ? 'ON_HOLD' :
+    status === 'paused' ? 'ON_HOLD' :
+    status === 'canceled' ? 'CANCELLED' : 'EXPIRED';
+
+  const periodStart = periodStartRaw ? new Date(periodStartRaw) : occurredAt;
+  const periodEnd = periodEndRaw ? new Date(periodEndRaw) :
+    status === 'canceled' ? occurredAt : null;
+
+  // Route subscription entitlement change through canonical boundary (Phase 4B fix)
+  await applyVerifiedEntitlementEvent({
+    userId: wallet.userId,
+    provider: 'PADDLE',
+    externalEventId: `${subscriptionId}:${event.eventType}`,
+    externalTransactionId: subscriptionId,
+    eventType: event.eventType,
+    plan: 'PRO',
+    status: canonicalStatus,
+    periodStart: status === 'active' || status === 'trialing' ? periodStart : null,
+    periodEnd: status === 'active' || status === 'trialing' ? periodEnd : null,
+    occurredAt,
+  });
+
+  // Preserve Paddle payment bookkeeping (customer/subscription/price IDs)
+  // These are separate from canonical entitlement state
   await prisma.userWallet.updateMany({
     where: {
       userId: wallet.userId,
       OR: [{ paddleLastEventAt: null }, { paddleLastEventAt: { lt: occurredAt } }],
     },
     data: {
-      paddleCustomerId: firstString(data.customerId, data.customer_id) || undefined,
-      paddleSubscriptionId: firstString(data.id) || undefined,
+      paddleCustomerId: customerId || undefined,
+      paddleSubscriptionId: subscriptionId || undefined,
       paddlePriceId: priceId || undefined,
-      subscriptionStatus: activeStatus,
-      subscriptionExpiresAt: periodEndRaw ? new Date(periodEndRaw) : status === 'canceled' ? occurredAt : undefined,
       paddleLastEventAt: occurredAt,
     },
   });

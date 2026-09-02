@@ -9,6 +9,8 @@ import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/mon
 import logger from '../lib/logger';
 import '../lib/metrics';
 import { canStartLiveTutorSession } from './liveTutorBillingPolicy';
+import { evaluateCompletedAllowance, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolvePolicyModel } from './productPolicy';
+import { allocateLiveTutorConsumption } from './entitlementService';
 import { calculateGeminiProviderCostUSD, GEMINI_PRICING_SOURCE, GEMINI_PRICING_VERSION, isSupportedNormalChatModel } from './geminiPricing';
 import {
   assertAndLockGeminiDailyBudget,
@@ -241,39 +243,21 @@ function toNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function normalizePlanModelName(model: string | null | undefined): string {
-  return typeof model === 'string' && model.trim() ? model.trim().toLowerCase() : '';
-}
-
-
 function resolvePlanModel(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tutor', requestedModel?: string | null): string {
-  const fallbackModel = feature === 'image' ? (plan.features.imageModel as string | undefined) ?? plan.chatModel : plan.chatModel;
-  const requested = typeof requestedModel === 'string' && requestedModel.trim() ? requestedModel.trim() : null;
-  const allowedModels = Array.isArray(plan.features.availableModels)
-    ? plan.features.availableModels.filter((value): value is string => typeof value === 'string' && value.trim() !== '')
-    : [];
-
-  if (requested) {
-    const requestedNormalized = normalizePlanModelName(requested);
-    const isAllowed = allowedModels.length === 0 || allowedModels.some((candidate) => normalizePlanModelName(candidate) === requestedNormalized);
-    if (isAllowed) {
-      return requested;
-    }
-  }
-
-  return fallbackModel;
+  void feature;
+  return resolvePolicyModel(plan.name, requestedModel);
 }
 
 function getUsageWindow(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tutor', modelUsed?: string | null, scope: UsageScope = 'day') {
   const now = new Date();
+  const policy = getProductPolicy(plan.name);
 
   if (feature === 'image') {
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const nextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+    const day = getUtcDayWindow(now);
     return {
-      windowStart: startOfDay,
-      resetAt: nextDay,
-      usageLimit: getEffectiveLimit(plan, 'image', { modelUsed }),
+      windowStart: day.start,
+      resetAt: day.end,
+      usageLimit: policy.normalChat.imageQuestionsPerDay,
     };
   }
 
@@ -285,25 +269,12 @@ function getUsageWindow(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tuto
     };
   }
 
-  const resolvedModel = resolvePlanModel(plan, 'chat', modelUsed);
-  const normalizedModel = normalizePlanModelName(resolvedModel);
-  const proDailyLimit = toNumber(plan.features.proChatDailyLimit);
-  if (normalizedModel.includes('pro') && typeof proDailyLimit === 'number') {
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const nextDay = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-    return {
-      windowStart: startOfDay,
-      resetAt: nextDay,
-      usageLimit: proDailyLimit,
-    };
-  }
-
-  const windowMinutes = toNumber(plan.features.chatWindowMinutes) ?? 180;
-  const windowLimit = getEffectiveLimit(plan, 'chat', { modelUsed: resolvedModel });
+  void modelUsed;
+  const day = getUtcDayWindow(now);
   return {
-    windowStart: new Date(now.getTime() - windowMinutes * 60 * 1000),
-    resetAt: new Date(now.getTime() + windowMinutes * 60 * 1000),
-    usageLimit: windowLimit,
+    windowStart: day.start,
+    resetAt: day.end,
+    usageLimit: policy.normalChat.dailyCompletedMessages,
   };
 }
 
@@ -520,7 +491,7 @@ async function resolveWalletAndPlanInTransaction(
   tx: Prisma.TransactionClient,
   userId: string,
   fallbackPlan: PlanRecord,
-): Promise<{ wallet: { id: string; userId: string; planId: string; planName: string; subscriptionStatus: string } | null; plan: PlanRecord }> {
+): Promise<{ wallet: { id: string; userId: string; planId: string; planName: string; subscriptionStatus: string; subscriptionStartedAt: Date | null; subscriptionPeriodStart: Date | null; subscriptionExpiresAt: Date | null } | null; plan: PlanRecord }> {
   const existingWallet = await tx.userWallet.findUnique({
     where: { userId },
     include: { plan: true },
@@ -542,7 +513,11 @@ async function resolveWalletAndPlanInTransaction(
     features: wallet.plan.features as Record<string, unknown>,
   } as PlanRecord : fallbackPlan;
 
-  const effectivePlan = isSubscriptionActive(wallet.subscriptionStatus as string, wallet.subscriptionExpiresAt)
+  const effectivePlan = isSubscriptionActive(
+    wallet.subscriptionStatus as string,
+    wallet.subscriptionExpiresAt,
+    wallet.subscriptionPeriodStart ?? wallet.subscriptionStartedAt,
+  )
     ? planRecord
     : await getFreePlan();
 
@@ -553,6 +528,9 @@ async function resolveWalletAndPlanInTransaction(
       planId: wallet.planId,
       planName: wallet.plan.name,
       subscriptionStatus: wallet.subscriptionStatus,
+      subscriptionStartedAt: wallet.subscriptionStartedAt,
+      subscriptionPeriodStart: wallet.subscriptionPeriodStart,
+      subscriptionExpiresAt: wallet.subscriptionExpiresAt,
     },
     plan: effectivePlan,
   };
@@ -595,6 +573,25 @@ async function lockWalletRow(tx: Prisma.TransactionClient, userId: string): Prom
 
 async function lockLiveTutorWalletRow(tx: Prisma.TransactionClient, userId: string): Promise<void> {
   await tx.$queryRaw`SELECT id FROM "LiveTutorWallet" WHERE "userId" = ${userId} FOR UPDATE`;
+}
+
+async function consumeLiveTutorBalance(
+  tx: Prisma.TransactionClient,
+  wallet: { id: string; userId: string; includedSeconds: number; topUpSeconds: number },
+  seconds: number,
+  idempotencyKey: string,
+) {
+  const { includedUsed, topUpUsed } = allocateLiveTutorConsumption(wallet.includedSeconds, wallet.topUpSeconds, seconds);
+  const updated = await tx.liveTutorWallet.update({ where: { userId: wallet.userId }, data: {
+    includedSeconds: { decrement: includedUsed },
+    topUpSeconds: { decrement: topUpUsed },
+    minutesBalance: Math.floor((wallet.includedSeconds + wallet.topUpSeconds - seconds) / SECONDS_PER_MINUTE),
+  } });
+  await tx.liveTutorMinuteLedger.create({ data: {
+    userId: wallet.userId, walletId: wallet.id, idempotencyKey,
+    entryType: 'CONSUMPTION', source: 'SYSTEM', includedSecondsDelta: -includedUsed, topUpSecondsDelta: -topUpUsed,
+    includedSecondsAfter: updated.includedSeconds, topUpSecondsAfter: updated.topUpSeconds,
+  } });
 }
 
 function sleep(ms: number): Promise<void> {
@@ -735,7 +732,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           })
         : null;
 
-      const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
+      let resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
       const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
       const windowStart = usageWindow.windowStart;
       const resetAt = usageWindow.resetAt;
@@ -785,6 +782,10 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       }
 
       const effectivePlan = walletPlan;
+      // Entitlement may change between the preflight read and this locked
+      // transaction. Bind the provider model to the authoritative in-transaction
+      // plan so a concurrent revocation cannot retain a Pro-only Flash model.
+      resolvedModel = resolvePlanModel(effectivePlan, validatedInput.feature, validatedInput.modelUsed);
       const usageLimit = validatedInput.feature === 'live_tutor'
         ? null
         : getEffectiveLimit(effectivePlan, validatedInput.feature === 'image' ? 'image' : 'chat', { modelUsed: resolvedModel });
@@ -866,10 +867,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         );
 
         if (!pendingReservation) {
-          await tx.liveTutorWallet.update({
-            where: { userId: validatedInput.userId },
-            data: { minutesBalance: { decrement: Math.ceil(validatedInput.amount / SECONDS_PER_MINUTE) } },
-          });
+          await consumeLiveTutorBalance(tx, liveTutorWallet, validatedInput.amount, `usage:${validatedInput.provider}:${successRecord.id}`);
         }
 
         return buildDecision(
@@ -889,25 +887,48 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
 
       await lockWalletRow(tx, validatedInput.userId);
       const pendingCutoff = new Date(Date.now() - 5 * 60 * 1000);
+      const usageWhere = {
+        userId: validatedInput.userId,
+        feature: toUsageFeature(validatedInput.feature),
+        OR: [
+          { success: true },
+          { success: null, createdAt: { gte: pendingCutoff } },
+        ],
+      } satisfies Prisma.UsageLogWhereInput;
       const used = await tx.usageLog.count({
         where: {
-          userId: validatedInput.userId,
-          feature: toUsageFeature(validatedInput.feature),
-          OR: [
-            { success: true },
-            { success: null, createdAt: { gte: pendingCutoff } },
-          ],
+          ...usageWhere,
           createdAt: { gte: windowStart },
         },
       });
 
       const pendingReservation = validatedInput.pending === true;
-      const remainingUsage = typeof usageLimit === 'number'
-        ? Math.max(usageLimit - used - (pendingReservation ? 0 : validatedInput.amount), 0)
+      const policy = getProductPolicy(effectivePlan.name);
+      const freeMonth = getFreeMonthlyWindow();
+      const monthlyStart = effectivePlan.name === 'PRO' && wallet.subscriptionPeriodStart
+        ? wallet.subscriptionPeriodStart
+        : freeMonth.start;
+      const monthlyEnd = effectivePlan.name === 'PRO' && wallet.subscriptionExpiresAt
+        ? wallet.subscriptionExpiresAt
+        : freeMonth.end;
+      const monthlyLimit = validatedInput.feature === 'chat' ? policy.normalChat.monthlyCompletedMessages : null;
+      const monthlyUsed = monthlyLimit === null ? 0 : await tx.usageLog.count({
+        where: { ...usageWhere, createdAt: { gte: monthlyStart, lt: monthlyEnd } },
+      });
+      const allowance = validatedInput.feature === 'chat' && typeof usageLimit === 'number' && monthlyLimit !== null
+        ? evaluateCompletedAllowance({ dailyUsed: used, monthlyUsed, dailyLimit: usageLimit, monthlyLimit, requested: validatedInput.amount })
         : null;
-      const allowed = typeof usageLimit === 'number'
-        ? used + validatedInput.amount <= usageLimit
-        : true;
+      const dailyRemaining = allowance?.dailyRemaining ?? (typeof usageLimit === 'number'
+        ? Math.max(usageLimit - used - (pendingReservation ? 0 : validatedInput.amount), 0)
+        : null);
+      const monthlyRemaining = allowance?.monthlyRemaining ?? (monthlyLimit === null
+        ? null
+        : Math.max(monthlyLimit - monthlyUsed - (pendingReservation ? 0 : validatedInput.amount), 0));
+      const remainingUsage = dailyRemaining === null ? monthlyRemaining
+        : monthlyRemaining === null ? dailyRemaining
+        : Math.min(dailyRemaining, monthlyRemaining);
+      const allowed = allowance?.allowed ?? ((typeof usageLimit !== 'number' || used + validatedInput.amount <= usageLimit)
+        && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit));
       const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
       const reason = pendingReservation
         ? 'Usage reservation pending.'
@@ -929,6 +950,9 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         scope: validatedInput.scope,
         windowStart: windowStart.toISOString(),
         resetAt: resetAt.toISOString(),
+        monthlyWindowStart: monthlyStart.toISOString(),
+        monthlyResetAt: monthlyEnd.toISOString(),
+        monthlyLimit,
         reason,
       };
 
@@ -1234,10 +1258,7 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
             minutesBalance: 0,
           },
         });
-        await tx.liveTutorWallet.update({
-          where: { userId: validatedInput.userId },
-          data: { minutesBalance: { decrement: Math.ceil(validatedInput.amount / SECONDS_PER_MINUTE) } },
-        });
+        await consumeLiveTutorBalance(tx, liveTutorWallet, validatedInput.amount, `usage:${provider}:${existing.id}`);
         await tx.usageLog.update({
           where: { id: existing.id },
           data: { success: true },

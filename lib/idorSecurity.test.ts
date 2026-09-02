@@ -131,7 +131,7 @@ describe('IDOR ownership boundaries', () => {
     expect(source('app/api/chat/message/delete/route.ts')).toMatch(/conversation\.userId !== user\.id/);
     expect(source('app/api/chat/message/feedback/route.ts')).toMatch(/conversation\.userId !== user\.id/);
     expect(source('app/api/chat/message/regenerate/route.ts')).toMatch(/conversation\.userId !== user\.id/);
-    expect(source('app/api/wallet/route.ts')).toMatch(/getWalletSummary\(user\.id\)/);
+    expect(source('app/api/wallet/route.ts')).toMatch(/getEntitlementSnapshot\(user\.id\)/);
     expect(source('app/api/wallet/history/route.ts')).toMatch(/getWalletHistory\(user\.id\)/);
     expect(source('app/api/wallet/usage/route.ts')).toMatch(/getWalletUsage\(user\.id\)/);
     expect(source('app/api/wallet/summary/route.ts')).toMatch(/const userId = user\.id/);

@@ -16,6 +16,12 @@ test('getModelCandidatesForKind rejects models outside the supported allowlist',
   );
 });
 
+test('Flash-Lite image policy cannot fall back to a Flash model', () => {
+  const candidates = getModelCandidatesForKind('image', 'gemini-3.5-flash-lite');
+  assert.equal(candidates[0], 'gemini-3.5-flash-lite');
+  assert.equal(candidates.some((model) => model === 'gemini-3.5-flash' || model === 'gemini-2.5-flash'), false);
+});
+
 test('normal chat telemetry distinguishes requested and actual fallback models', () => {
   assert.deepEqual(
     buildNormalChatModelTelemetry('gemini-3.5-flash', 'gemini-3.1-flash-lite', 'model_overloaded'),

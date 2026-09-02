@@ -10,7 +10,7 @@ import { isIdempotentProviderCancellationError } from './accountDeletionPolicy';
 
 export type NativeStoreProductId = 'mento_pro_monthly' | 'mento_live_tutor_50' | 'mento_live_tutor_100';
 
-const PACKAGE_NAME = 'com.breezy.mento';
+const PACKAGE_NAME = 'com.trymentoapp.mento';
 const PRODUCT_CATALOG: Record<NativeStoreProductId, {
   type: 'SUBSCRIPTION' | 'TOP_UP';
   amountUsd: number;

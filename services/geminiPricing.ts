@@ -42,8 +42,7 @@ export const GEMINI_PRICING_VERSION = '2026-08-31';
 export type NormalChatGeminiModel = keyof typeof NORMAL_CHAT_GEMINI_MODELS;
 
 export const NORMAL_CHAT_COST_AWARE_FALLBACKS: readonly NormalChatGeminiModel[] = [
-  'gemini-3.5-flash-lite',
-  'gemini-3.1-flash-lite',
+  'gemini-2.5-flash',
 ];
 
 export function isSupportedNormalChatModel(model: string): model is NormalChatGeminiModel {

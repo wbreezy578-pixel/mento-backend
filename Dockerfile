@@ -10,7 +10,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --ignore-scripts
 
 COPY . .
-RUN npx prisma generate
+RUN ./node_modules/.bin/prisma generate
 RUN DATABASE_URL=postgresql://build:build@localhost:5432/build \
 	DIRECT_URL=postgresql://build:build@localhost:5432/build \
 	JWT_SECRET=build-only-placeholder-not-a-runtime-secret \

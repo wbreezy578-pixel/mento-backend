@@ -3,7 +3,7 @@
 // =======================================
 
 export const AI_CONFIG = {
-  CHAT_MODEL: "gemini-3.5-flash",
+  CHAT_MODEL: "gemini-3.5-flash-lite",
   IMAGE_MODEL: "gemini-3.5-flash",
   LIVE_TUTOR_MODEL: "gemini-3.5-flash",
   TITLE_MODEL: "gemini-3.5-flash",

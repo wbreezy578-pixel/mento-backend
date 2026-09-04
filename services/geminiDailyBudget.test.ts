@@ -50,6 +50,8 @@ describe('Gemini provider-wide daily budget', () => {
     });
     expect(result).toMatchObject({ reservationCostUSD: 0.5, reservationTokens: 100 });
     expect(tx.$queryRaw).toHaveBeenCalledOnce();
+    expect(tx.$queryRaw.mock.calls[0][0].join('')).toContain('pg_advisory_xact_lock');
+    expect(tx.$queryRaw.mock.calls[0][0].join('')).toContain('::text');
   });
 
   it('blocks before the provider when projected spend exceeds the boundary', async () => {

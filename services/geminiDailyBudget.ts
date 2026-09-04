@@ -111,7 +111,7 @@ export async function assertAndLockGeminiAdditionalExposure(
   const window = getGeminiDailyBudgetWindow(input.now);
 
   try {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(CAST(${GEMINI_DAILY_BUDGET_LOCK_KEY} AS bigint))`;
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(CAST(${GEMINI_DAILY_BUDGET_LOCK_KEY} AS bigint))::text`;
     const spend = await tx.usageLog.aggregate({
       where: {
         provider: 'Gemini',
@@ -171,9 +171,17 @@ export async function assertAndLockGeminiAdditionalExposure(
     };
   } catch (error) {
     if (error instanceof GeminiDailyBudgetExceededError) throw error;
+    const diagnostic = typeof error === 'object' && error !== null
+      ? error as { name?: unknown; code?: unknown; message?: unknown; meta?: unknown }
+      : undefined;
     logger.error('Gemini daily budget infrastructure unavailable', {
       requestId: input.requestId,
-      errorName: error instanceof Error ? error.name : 'UnknownError',
+      error: {
+        name: typeof diagnostic?.name === 'string' ? diagnostic.name : 'UnknownError',
+        code: typeof diagnostic?.code === 'string' ? diagnostic.code : undefined,
+        message: typeof diagnostic?.message === 'string' ? diagnostic.message : String(error),
+        meta: diagnostic?.meta,
+      },
     });
     throw new GeminiDailyBudgetUnavailableError();
   }

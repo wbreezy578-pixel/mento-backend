@@ -30,15 +30,12 @@ describe('normalizePcmForSimli', () => {
 });
 
 describe('splitPcmIntoSimliFrames', () => {
-  it('splits provider bursts into Simli-preferred frames with only a short final frame', () => {
-    const pcm = new Uint8Array(SIMLI_PCM_FRAME_BYTES * 3 + 320);
+  it('splits 6,000-byte provider bursts into 640-byte streamable frames', () => {
+    const pcm = new Uint8Array(6_000);
     const frames = splitPcmIntoSimliFrames(pcm);
 
-    expect(frames.map((frame) => frame.byteLength)).toEqual([
-      SIMLI_PCM_FRAME_BYTES,
-      SIMLI_PCM_FRAME_BYTES,
-      SIMLI_PCM_FRAME_BYTES,
-      320,
-    ]);
+    expect(frames).toHaveLength(10);
+    expect(frames.slice(0, 9).every((frame) => frame.byteLength === SIMLI_PCM_FRAME_BYTES)).toBe(true);
+    expect(frames[9].byteLength).toBe(240);
   });
 });

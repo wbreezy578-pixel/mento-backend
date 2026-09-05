@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import next from 'next';
 import { registerShutdownTask } from './lib/crashRecovery';
 import { attachLiveTutorVoiceGateway } from './services/liveTutorVoiceGateway';
-import { shutdownRealtimeRedis } from './lib/realtimeRedis';
+import { assertRealtimeRedisReadyForProduction, shutdownRealtimeRedis } from './lib/realtimeRedis';
 
 const dev = process.argv.includes('--dev') || process.env.NODE_ENV !== 'production';
 const hostname = process.env.HOSTNAME ?? '0.0.0.0';
@@ -28,7 +28,8 @@ async function startBackgroundLifecycleTasks(): Promise<void> {
   });
 }
 
-app.prepare().then(() => {
+app.prepare().then(async () => {
+  await assertRealtimeRedisReadyForProduction();
   const server = createServer((request, response) => handle(request, response));
   const shutdownVoiceGateway = attachLiveTutorVoiceGateway(server);
   registerShutdownTask(shutdownVoiceGateway);

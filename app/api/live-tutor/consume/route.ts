@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { closeRealtimeSession, completeSimliSessionLifecycle, markSessionActivity } from '../../../../services/simliService';
+import { classifyLiveTutorFinalizationTiming, closeRealtimeSession, completeSimliSessionLifecycle, markSessionActivity } from '../../../../services/simliService';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -66,6 +66,7 @@ export async function POST(req: Request) {
       });
       await completeSimliSessionLifecycle(streamId, {
         status: status as 'completed' | 'failed' | 'disconnected',
+        timing: classifyLiveTutorFinalizationTiming(reason),
         secondsUsed: seconds,
         reason,
       }, user.id);

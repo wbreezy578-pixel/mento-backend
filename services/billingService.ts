@@ -2,7 +2,7 @@ import type { Prisma } from '@prisma/client';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 import type { InputJsonValue } from '@prisma/client/runtime/library';
 import { prisma } from '../lib/prisma';
-import { ensureDefaultPlans, getPlanForUser, getEffectivePlanForUser, getEffectiveLimit, getFreePlan, isSubscriptionActive, type PlanRecord } from './planService';
+import { ensureDefaultPlans, getPlanForUser, getEffectivePlanForUser, getEffectiveLimit, isSubscriptionActive, type PlanRecord } from './planService';
 import { calculateProviderCost, calculateUserCharge, calculateProfit } from './economicsService';
 import type { UsageScope, UsageFeature, UsageSnapshot } from './usageService';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
@@ -497,7 +497,17 @@ async function resolveWalletAndPlanInTransaction(
     include: { plan: true },
   });
 
-  const wallet = existingWallet ?? await createOrFindUserWallet(tx, userId, fallbackPlan);
+  const wallet = existingWallet ?? await (async () => {
+    const currentFallbackPlan = await tx.plan.findUnique({
+      where: { name: fallbackPlan.name },
+      select: { id: true },
+    });
+    return createOrFindUserWallet(
+      tx,
+      userId,
+      currentFallbackPlan ? { ...fallbackPlan, id: currentFallbackPlan.id } : fallbackPlan,
+    );
+  })();
 
   const planRecord = wallet.plan ? {
     id: wallet.plan.id,
@@ -519,7 +529,7 @@ async function resolveWalletAndPlanInTransaction(
     wallet.subscriptionPeriodStart ?? wallet.subscriptionStartedAt,
   )
     ? planRecord
-    : await getFreePlan();
+    : fallbackPlan;
 
   return {
     wallet: {
@@ -692,10 +702,12 @@ async function createUsageLedgerEntry(
 
 export async function reserveUsage(input: BillingReservationInput): Promise<BillingDecision> {
   const validatedInput = validateBillingReservationInput(input);
-  const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
-  const resolvedModel = validatedInput.modelUsed ?? plan.chatModel;
-
-  await ensureDefaultPlans();
+  const defaultPlans = await ensureDefaultPlans();
+  const fallbackPlan = validatedInput.planOverride
+    ?? defaultPlans.find((candidate) => candidate.name === 'FREE');
+  if (!fallbackPlan) {
+    throw new Error('The FREE plan could not be resolved for wallet initialization.');
+  }
 
   const providerCostUSD = await calculateProviderCost({
     feature: validatedInput.feature,
@@ -721,6 +733,18 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
 
   try {
     return await runTransactionWithRetries(validatedInput.userId, async (tx) => {
+      if (validatedInput.feature !== 'live_tutor') {
+        await lockWalletRow(tx, validatedInput.userId);
+      }
+      const { wallet, plan: effectivePlan } = await resolveWalletAndPlanInTransaction(tx, validatedInput.userId, fallbackPlan);
+      if (!wallet) {
+        throw new Error('Failed to initialize billing wallet');
+      }
+
+      let resolvedModel = resolvePlanModel(effectivePlan, validatedInput.feature, validatedInput.modelUsed);
+      const usageWindow = getUsageWindow(effectivePlan, validatedInput.feature, resolvedModel, validatedInput.scope);
+      const windowStart = usageWindow.windowStart;
+      const resetAt = usageWindow.resetAt;
       const existing = validatedInput.requestId
         ? await tx.usageLog.findUnique({
             where: {
@@ -732,11 +756,6 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           })
         : null;
 
-      let resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
-      const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
-      const windowStart = usageWindow.windowStart;
-      const resetAt = usageWindow.resetAt;
-
       if (existing) {
         const used = await tx.usageLog.count({
           where: {
@@ -747,7 +766,6 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           },
         });
 
-        const effectivePlan = plan;
         const usageLimit = validatedInput.feature === 'live_tutor'
           ? null
           : getEffectiveLimit(effectivePlan, validatedInput.feature === 'image' ? 'image' : 'chat', { modelUsed: resolvedModel });
@@ -776,15 +794,8 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         ? await assertAndLockGeminiDailyBudget(tx, { requestId: validatedInput.requestId ?? 'missing-request-id' })
         : null;
 
-      const { wallet, plan: walletPlan } = await resolveWalletAndPlanInTransaction(tx, validatedInput.userId, plan);
-      if (!wallet) {
-        throw new Error('Failed to initialize billing wallet');
-      }
-
-      const effectivePlan = walletPlan;
-      // Entitlement may change between the preflight read and this locked
-      // transaction. Bind the provider model to the authoritative in-transaction
-      // plan so a concurrent revocation cannot retain a Pro-only Flash model.
+      // Entitlement and model binding come from the wallet read inside this
+      // locked transaction, so concurrent subscription changes remain authoritative.
       resolvedModel = resolvePlanModel(effectivePlan, validatedInput.feature, validatedInput.modelUsed);
       const usageLimit = validatedInput.feature === 'live_tutor'
         ? null
@@ -885,7 +896,6 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         );
       }
 
-      await lockWalletRow(tx, validatedInput.userId);
       const pendingCutoff = new Date(Date.now() - 5 * 60 * 1000);
       const usageWhere = {
         userId: validatedInput.userId,

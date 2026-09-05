@@ -38,11 +38,25 @@ function keyFor(identity: VoiceTelemetryIdentity): string {
   return `${identity.sessionId}:${identity.turnNumber}:${identity.generationId}`;
 }
 
-function metrics(timeline: Timeline) {
+const deviceEvents = new Set<LiveTutorVoiceEvent>([
+  'USER_SPEECH_STARTED', 'USER_SPEECH_ENDED', 'USER_AUDIO_LAST_CHUNK_SENT',
+  'FRONTEND_FIRST_PCM_RECEIVED', 'SIMLI_FIRST_AUDIO_PLAYED',
+  'AVATAR_AUDIO_PLAYBACK_COMPLETE', 'LISTENING_REOPENED',
+]);
+
+export function isDeviceVoiceEvent(event: string): event is LiveTutorVoiceEvent {
+  return deviceEvents.has(event as LiveTutorVoiceEvent);
+}
+
+export function metrics(timeline: Timeline) {
   const delta = (from: LiveTutorVoiceEvent, to: LiveTutorVoiceEvent) => {
     const start = timeline[from];
     const end = timeline[to];
-    return start !== undefined && end !== undefined ? Math.max(0, end - start) : null;
+    // Device and server clocks are not synchronized. Never manufacture latency
+    // from their difference, or turn a reversed timeline into a zero-ms result.
+    if (deviceEvents.has(from) !== deviceEvents.has(to)) return null;
+    return start !== undefined && end !== undefined && Number.isFinite(start)
+      && Number.isFinite(end) && end >= start ? end - start : null;
   };
 
   return {

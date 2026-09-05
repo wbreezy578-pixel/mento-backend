@@ -97,7 +97,21 @@ export async function releaseVoiceLease(streamId: string, ownerId: string): Prom
 }
 
 export function getRealtimeRedisStatus(): { configured: boolean; required: boolean } {
-  return { configured: Boolean(redisUrl), required: requireRedis };
+  return { configured: Boolean(redisUrl), required: requireRedis || process.env.NODE_ENV === 'production' };
+}
+
+export async function assertRealtimeRedisReadyForProduction(): Promise<void> {
+  if (process.env.NODE_ENV !== 'production') return;
+
+  const status = getRealtimeRedisStatus();
+  if (!status.configured) {
+    throw new Error('Realtime Redis is required for production Live Tutor voice sessions.');
+  }
+
+  const health = await checkRealtimeRedisHealth();
+  if (health !== 'ok') {
+    throw new Error('Realtime Redis is unavailable; refusing to start the production voice server.');
+  }
 }
 
 export async function checkRealtimeRedisHealth(): Promise<'ok' | 'not_configured' | 'fail'> {

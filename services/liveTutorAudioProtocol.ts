@@ -1,7 +1,7 @@
 export const LIVE_TUTOR_INPUT_MIME_TYPE = 'audio/pcm;rate=16000';
 export const SIMLI_PCM_SAMPLE_RATE = 16_000;
 export const SIMLI_PCM_BYTES_PER_SAMPLE = 2;
-export const SIMLI_PCM_FRAME_BYTES = 6_000;
+export const SIMLI_PCM_FRAME_BYTES = 640;
 export const SIMLI_PCM_FRAME_MS = SIMLI_PCM_FRAME_BYTES / SIMLI_PCM_BYTES_PER_SAMPLE / SIMLI_PCM_SAMPLE_RATE * 1_000;
 
 export function splitPcmIntoSimliFrames(pcm: Uint8Array): Uint8Array[] {

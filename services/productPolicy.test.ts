@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { evaluateCompletedAllowance, getFreeMonthlyWindow, getProductPolicy, getUtcDayWindow, resolvePolicyModel } from './productPolicy';
 import { allocateLiveTutorConsumption, resolveIncludedSecondsForEvent, shouldApplyEntitlementEvent } from './entitlementService';
+import { classifyLiveTutorFinalizationTiming } from './simliService';
 import { isSubscriptionActive } from './planService';
 
 describe('canonical product policy', () => {
@@ -87,5 +88,14 @@ describe('canonical product policy', () => {
     expect(resolvePolicyModel('FREE', 'gemini-3.5-flash')).toBe('gemini-3.5-flash-lite');
     expect(resolvePolicyModel('PRO', 'gemini-3.5-flash')).toBe('gemini-3.5-flash');
     expect(resolvePolicyModel('PRO', 'attacker-model')).toBe('gemini-3.5-flash');
+  });
+
+  it('classifies Live Tutor terminal timing explicitly and rejects unknown reasons', () => {
+    expect(classifyLiveTutorFinalizationTiming('transport_recovery_timeout')).toBe('transport_recovery_end');
+    expect(classifyLiveTutorFinalizationTiming('Screen closed')).toBe('transport_recovery_end');
+    expect(classifyLiveTutorFinalizationTiming('Voice WebSocket reconnect grace expired: socket_lost')).toBe('transport_recovery_end');
+    expect(classifyLiveTutorFinalizationTiming('Heartbeat expired; stale session recovery')).toBe('inactivity_end');
+    expect(classifyLiveTutorFinalizationTiming('User ended session')).toBe('active_end');
+    expect(() => classifyLiveTutorFinalizationTiming('unrecognized terminal reason')).toThrow(/Unknown Live Tutor finalization reason/);
   });
 });

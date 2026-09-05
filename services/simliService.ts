@@ -46,6 +46,34 @@ const GENUINELY_ACTIVE_STATUS = 'active';
 const RECOVERABLE_STATUSES = ['creating', 'active', 'reconnecting', 'finalizing', 'recovery_required'] as const;
 const TERMINAL_STATUSES = ['completed', 'failed', 'disconnected', 'ended'] as const;
 
+export type LiveTutorFinalizationTiming = 'active_end' | 'inactivity_end' | 'transport_recovery_end';
+
+export function classifyLiveTutorFinalizationTiming(reason: string | undefined): LiveTutorFinalizationTiming {
+  const normalized = reason?.trim().toLowerCase() ?? '';
+  if (
+    normalized === 'transport_recovery_timeout'
+    || normalized === 'simli disconnected'
+    || normalized === 'screen closed'
+    || normalized.startsWith('voice websocket reconnect grace expired:')
+  ) return 'transport_recovery_end';
+  if (
+    normalized.startsWith('heartbeat expired')
+    || normalized.startsWith('stale session')
+    || normalized === 'session cleanup'
+    || normalized === '90-second inactivity timeout'
+    || normalized === 'durable session reconciliation timeout'
+    || normalized === 'server startup recovery'
+  ) return 'inactivity_end';
+  if (
+    normalized === 'user ended session'
+      || normalized === 'live tutor session initialization failed'
+    || normalized === 'session time elapsed'
+    || normalized === 'session_expired'
+    || normalized === 'server shutdown'
+  ) return 'active_end';
+  throw new Error(`Unknown Live Tutor finalization reason: ${reason}`);
+}
+
 function isDurableSessionStale(session: { status: string; lastActivityAt: Date; expiresAt: Date | null }, now = new Date()): boolean {
   return RECOVERABLE_STATUSES.includes(session.status as typeof RECOVERABLE_STATUSES[number])
     && (session.lastActivityAt.getTime() <= now.getTime() - INACTIVITY_TIMEOUT_MS || Boolean(session.expiresAt && session.expiresAt <= now));
@@ -56,7 +84,7 @@ function isGenuinelyActiveSession(session: { status: string; lastActivityAt: Dat
 }
 
 function isFreshClaimInProgress(session: { status: string; lastActivityAt: Date; expiresAt: Date | null }, now = new Date()): boolean {
-  return ['creating', 'reconnecting'].includes(session.status) && !isDurableSessionStale(session, now);
+  return ['creating', 'reconnecting', 'recovery_required'].includes(session.status) && !isDurableSessionStale(session, now);
 }
 
 function isTerminalSession(status: string): boolean {
@@ -200,7 +228,7 @@ export async function claimLiveTutorSession(userId: string, requestId: string, a
   const preflight = await prisma.liveTutorSession.findUnique({ where: { userId } });
   if (preflight && isDurableSessionStale(preflight)) {
     logger.info('[LiveTutorLifecycle] heartbeat_expired', { streamId: preflight.streamId, sessionId: preflight.id, userId, reason: 'claim_preflight_recovery', previousStatus: preflight.status, resultingStatus: 'finalizing', category: 'live_tutor_lifecycle' });
-    await completeSimliSessionLifecycle(preflight.streamId, { status: 'disconnected', reason: 'Heartbeat expired before new session claim' }, userId).catch((error) => {
+      await completeSimliSessionLifecycle(preflight.streamId, { status: 'disconnected', timing: 'inactivity_end', reason: 'Heartbeat expired before new session claim' }, userId).catch((error) => {
       logger.warn('[LiveTutorLifecycle] claim_preflight_recovery_failed', { streamId: preflight.streamId, sessionId: preflight.id, userId, reason: error instanceof Error ? error.message : 'recovery_failed', previousStatus: preflight.status, resultingStatus: 'recovery_required', category: 'live_tutor_lifecycle' });
     });
   }
@@ -208,6 +236,18 @@ export async function claimLiveTutorSession(userId: string, requestId: string, a
     await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
     const existing = await tx.liveTutorSession.findUnique({ where: { userId } });
     const now = new Date();
+    if (existing?.status === 'recovery_required') {
+      logger.info('[LiveTutorLifecycle] claim_rejected_recovery_required', {
+        streamId: existing.streamId,
+        sessionId: existing.id,
+        userId,
+        reason: isDurableSessionStale(existing, now) ? 'recovery_reconciliation_pending' : 'fresh_recovery_in_progress',
+        previousStatus: existing.status,
+        resultingStatus: existing.status,
+        category: 'live_tutor_session_rejected_recovery',
+      });
+      return false;
+    }
     if (existing && (isGenuinelyActiveSession(existing, now) || isFreshClaimInProgress(existing, now))) {
       const reason = isGenuinelyActiveSession(existing, now) ? 'genuinely_active_session' : 'claim_in_progress';
       logger.info('[LiveTutorLifecycle] claim_rejected_active', { streamId: existing.streamId, sessionId: existing.id, userId, reason, previousStatus: existing.status, resultingStatus: existing.status, category: 'live_tutor_lifecycle' });
@@ -243,7 +283,7 @@ export async function reconcileStaleLiveTutorSession(userId: string): Promise<bo
   const durable = await prisma.liveTutorSession.findUnique({ where: { userId } });
   if (!durable || !isDurableSessionStale(durable)) return false;
   logger.info('[LiveTutorLifecycle] heartbeat_expired', { streamId: durable.streamId, sessionId: durable.id, userId, reason: 'new_session_recovery', previousStatus: durable.status, resultingStatus: 'finalizing', category: 'live_tutor_lifecycle' });
-  await completeSimliSessionLifecycle(durable.streamId, { status: 'disconnected', reason: 'Heartbeat expired; stale session recovery' }, userId);
+    await completeSimliSessionLifecycle(durable.streamId, { status: 'disconnected', timing: 'inactivity_end', reason: 'Heartbeat expired; stale session recovery' }, userId);
   const reconciled = await prisma.liveTutorSession.findUnique({ where: { userId } });
   if (reconciled?.billingFinalized && isTerminalSession(reconciled.status)) {
     logger.info('[LiveTutorLifecycle] new_session_allowed_after_recovery', { streamId: durable.streamId, sessionId: durable.id, userId, reason: 'stale_session_reconciled', previousStatus: durable.status, resultingStatus: reconciled.status, category: 'live_tutor_lifecycle' });
@@ -402,6 +442,34 @@ export async function markSimliSessionConnected(streamId: string): Promise<void>
   });
 }
 
+export async function markLiveTutorSessionUsable(streamId: string, userId: string): Promise<{ usableAt: Date; expiresAt: Date } | null> {
+  const now = new Date();
+  const durable = await prisma.liveTutorSession.findUnique({ where: { streamId }, select: { secondsReserved: true } });
+  const expiresAt = new Date(now.getTime() + (durable?.secondsReserved ?? 60) * 1000);
+  const result = await prisma.liveTutorSession.updateMany({
+    where: {
+      streamId,
+      userId,
+      status: { in: ['active', 'reconnecting'] },
+      billingFinalized: false,
+      usableAt: null,
+    },
+    data: { usableAt: now, expiresAt },
+  });
+  if (result.count > 0) {
+    const session = getSession(streamId);
+    if (session) {
+      session.expiresAt = expiresAt.toISOString();
+      saveSession(session);
+    }
+    logger.info('[LiveTutorLifecycle] session_marked_usable', { streamId, userId, category: 'live_tutor_usable' });
+    return { usableAt: now, expiresAt };
+  }
+  const session = await prisma.liveTutorSession.findUnique({ where: { streamId }, select: { userId: true, usableAt: true, expiresAt: true, billingFinalized: true } });
+  if (session?.userId !== userId || !session.usableAt || !session.expiresAt || session.billingFinalized) return null;
+  return { usableAt: session.usableAt, expiresAt: session.expiresAt };
+}
+
 export async function markSimliSessionDisconnected(streamId: string, reason?: string): Promise<void> {
   const session = getSession(streamId);
   if (!session) return;
@@ -417,7 +485,7 @@ export async function markSimliSessionDisconnected(streamId: string, reason?: st
   }
   activeSessions.set(streamId, nextSession);
   if (session.userId) {
-    await completeSimliSessionLifecycle(streamId, { status: 'disconnected', reason: reason ?? 'Simli disconnected' }, session.userId);
+    await completeSimliSessionLifecycle(streamId, { status: 'disconnected', timing: 'transport_recovery_end', reason: reason ?? 'Simli disconnected' }, session.userId);
   }
 }
 
@@ -449,7 +517,8 @@ export async function markSessionActivity(streamId: string, userId: string, repo
   if (now.getTime() - durable.lastActivityAt.getTime() < MIN_HEARTBEAT_INTERVAL_MS) return false;
   if (reportedSeconds !== undefined && (!Number.isFinite(reportedSeconds) || reportedSeconds < 0 || reportedSeconds > 90)) return false;
   const expiryMs = durable.expiresAt?.getTime() ?? now.getTime();
-  const authoritativeElapsedSeconds = Math.max(0, Math.floor((Math.min(now.getTime(), expiryMs) - durable.createdAt.getTime()) / 1000));
+  const billableStartMs = durable.usableAt?.getTime() ?? durable.createdAt.getTime();
+  const authoritativeElapsedSeconds = Math.max(0, Math.floor((Math.min(now.getTime(), expiryMs) - billableStartMs) / 1000));
   const secondsConsumed = Math.min(durable.secondsReserved, Math.max(durable.secondsConsumed, authoritativeElapsedSeconds));
   await prisma.liveTutorSession.updateMany({
     where: { streamId, userId, status: 'active', billingFinalized: false },
@@ -510,6 +579,7 @@ export async function sendRealtimeText(_streamId: string, _text: string): Promis
 
 export async function completeSimliSessionLifecycle(streamId: string, options: {
   status: 'completed' | 'failed' | 'disconnected';
+  timing: LiveTutorFinalizationTiming;
   secondsUsed?: number;
   reason?: string;
   finalizationClaimedAt?: Date;
@@ -531,6 +601,7 @@ export async function completeSimliSessionLifecycle(streamId: string, options: {
 
 async function completeSimliSessionLifecycleInternal(streamId: string, options: {
   status: 'completed' | 'failed' | 'disconnected';
+  timing: LiveTutorFinalizationTiming;
   secondsUsed?: number;
   reason?: string;
   finalizationClaimedAt?: Date;
@@ -540,33 +611,6 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
   if (!durable || (userId && durable.userId !== userId)) throw buildSimliError('Live Tutor session not found.', 404);
   if (durable.billingFinalized) {
     logger.info('[LiveTutorLifecycle] terminal_finalize_duplicate', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'already_finalized', previousStatus: durable.status, resultingStatus: durable.status, category: 'live_tutor_lifecycle' });
-    await closeRealtimeSession(streamId);
-    return;
-  }
-  const terminalStatus = durable.terminalStatus ?? options.status;
-  const terminalReason = durable.terminalReason ?? options.reason;
-  if (durable.status === 'finalizing' && terminalStatus && durable.finalizedAt === null) {
-    const committed = await prisma.liveTutorSession.update({
-      where: { streamId },
-      data: {
-        status: 'ended',
-        terminalStatus,
-        terminalReason,
-        billingFinalized: true,
-        finalizationStartedAt: null,
-        finalizedAt: new Date(),
-      },
-    });
-    logger.info('[LiveTutorLifecycle] live_tutor_terminal_state_committed', {
-      streamId,
-      sessionId: durable.id,
-      userId: durable.userId,
-      reason: terminalReason ?? 'finalizing_record_reconciled',
-      previousStatus: durable.status,
-      resultingStatus: committed.status,
-      terminalStatus: committed.terminalStatus,
-      category: 'live_tutor_lifecycle',
-    });
     await closeRealtimeSession(streamId);
     return;
   }
@@ -590,25 +634,6 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
     data: { status: 'finalizing', finalizationStartedAt: new Date() },
   });
   if (claim.count === 0) {
-    const refreshed = await prisma.liveTutorSession.findUnique({ where: { streamId } });
-    if (refreshed && refreshed.status === 'finalizing' && refreshed.terminalStatus && !refreshed.billingFinalized) {
-      const committed = await prisma.liveTutorSession.update({
-        where: { streamId },
-        data: { status: 'ended', terminalStatus: refreshed.terminalStatus, terminalReason: refreshed.terminalReason ?? options.reason, billingFinalized: true, finalizationStartedAt: null, finalizedAt: new Date() },
-      });
-      logger.info('[LiveTutorLifecycle] live_tutor_terminal_state_committed', {
-        streamId,
-        sessionId: refreshed.id,
-        userId: refreshed.userId,
-        reason: refreshed.terminalReason ?? options.reason ?? 'finalizing_record_reconciled',
-        previousStatus: refreshed.status,
-        resultingStatus: committed.status,
-        terminalStatus: committed.terminalStatus,
-        category: 'live_tutor_lifecycle',
-      });
-      await closeRealtimeSession(streamId);
-      return;
-    }
     logger.info('[LiveTutorLifecycle] terminal_finalize_duplicate', { streamId, sessionId: durable.id, userId: durable.userId, reason: 'finalization_in_progress_or_terminal', previousStatus: durable.status, resultingStatus: durable.status, category: 'live_tutor_lifecycle' });
     return;
   }
@@ -616,18 +641,19 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
   logStatusTransition({ streamId, sessionId: durable.id, userId: durable.userId, previousStatus: durable.status, resultingStatus: 'finalizing', reason: options.reason ?? 'session_ended' });
   logger.info('[LiveTutorLifecycle] terminal_finalize_started', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'session_ended', previousStatus: durable.status, resultingStatus: 'finalizing', category: 'live_tutor_lifecycle' });
 
-  const recoveredAfterInactivity = /heartbeat expired|stale session|reconciliation timeout/i.test(options.reason ?? '');
   // A disconnected app gets a 90-second recovery window, but that grace period is
   // not paid tutor time. Charge only through its last accepted heartbeat.
-  const terminalTime = recoveredAfterInactivity ? durable.lastActivityAt.getTime() : Date.now();
+  const terminalTime = options.timing === 'active_end' ? Date.now() : durable.lastActivityAt.getTime();
   const billableEnd = durable.expiresAt ? Math.min(terminalTime, durable.expiresAt.getTime()) : terminalTime;
-  const elapsedSeconds = Math.max(0, Math.floor((billableEnd - durable.createdAt.getTime()) / 1000));
+  const billableStartMs = durable.usableAt?.getTime() ?? durable.createdAt.getTime();
+  const elapsedSeconds = Math.max(0, Math.floor((billableEnd - billableStartMs) / 1000));
   const clientReportedSeconds = Number.isFinite(options.secondsUsed)
     ? Math.max(0, Math.floor(options.secondsUsed ?? 0))
     : 0;
   const authoritativeSeconds = Math.max(durable.secondsConsumed, elapsedSeconds, clientReportedSeconds);
   const secondsUsed = Math.min(durable.secondsReserved || 60, authoritativeSeconds);
   const billableSeconds = Math.max(1, secondsUsed);
+  const usable = durable.usableAt !== null;
   
   logger.info('Simli session lifecycle event', {
     provider: 'simli',
@@ -644,7 +670,7 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
   const billingUserId = durable.userId;
   if (billingRequestId && billingUserId) {
     try {
-      if (options.status === 'failed') {
+      if (!usable || options.status === 'failed') {
         logger.warn('Simli session failed, rolling back usage', {
           provider: 'simli',
           streamId,
@@ -656,10 +682,10 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
         await rollbackUsage({
           userId: billingUserId,
           feature: 'live_tutor',
-          amount: billableSeconds,
+          amount: usable ? billableSeconds : 1,
           provider: 'Simli',
           requestId: billingRequestId,
-          metadata: { streamId, status: options.status, reason: options.reason ?? 'Session failed' },
+          metadata: { streamId, status: options.status, reason: options.reason ?? 'Session failed', usableAt: durable.usableAt?.toISOString() ?? null },
           pending: true,
         });
       } else {
@@ -702,7 +728,7 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
     }
   }
 
-  await prisma.liveTutorSession.update({ where: { streamId }, data: { status: 'ended', terminalStatus: options.status, terminalReason: options.reason, secondsConsumed: billableSeconds, billingFinalized: true, finalizationStartedAt: null, finalizedAt: new Date() } });
+  await prisma.liveTutorSession.update({ where: { streamId }, data: { status: 'ended', terminalStatus: options.status, terminalReason: options.reason, secondsConsumed: usable ? billableSeconds : 0, billingFinalized: true, finalizationStartedAt: null, finalizedAt: new Date() } });
   logStatusTransition({ streamId, sessionId: durable.id, userId: durable.userId, previousStatus: 'finalizing', resultingStatus: 'ended', reason: options.reason ?? 'session_ended' });
   logger.info('[LiveTutorLifecycle] live_tutor_terminal_state_committed', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'session_ended', previousStatus: 'finalizing', resultingStatus: 'ended', terminalStatus: options.status, category: 'live_tutor_lifecycle' });
   logger.info('[LiveTutorLifecycle] terminal_finalize_completed', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'session_ended', previousStatus: 'finalizing', resultingStatus: 'ended', category: 'live_tutor_lifecycle' });
@@ -733,7 +759,8 @@ export async function shutdownActiveSimliSessions(): Promise<void> {
   await Promise.allSettled(sessions.map((session) => completeSimliSessionLifecycle(session.streamId, {
     status: 'failed',
     secondsUsed: session.secondsConsumed ?? 0,
-    reason: 'Server shutdown',
+     reason: 'Server shutdown',
+    timing: 'transport_recovery_end',
   })));
 }
 
@@ -790,7 +817,7 @@ export async function recoverDurableLiveTutorSessions(reason = 'Server startup r
     });
     if (claim.count === 0) continue;
     logger.info('[LiveTutorLifecycle] startup_recovery_started', { streamId: session.streamId, sessionId: session.id, userId: session.userId, reason, previousStatus: session.status, resultingStatus: 'finalizing', category: 'live_tutor_lifecycle' });
-    await completeSimliSessionLifecycle(session.streamId, { status: 'disconnected', reason, finalizationClaimedAt }, session.userId);
+    await completeSimliSessionLifecycle(session.streamId, { status: 'disconnected', timing: 'inactivity_end', reason, finalizationClaimedAt }, session.userId);
   }
   if (sessions.length > 0) logger.info('[LiveTutorLifecycle] startup_recovery_completed', { recoveredCount: sessions.length, reason, category: 'live_tutor_lifecycle' });
 }
@@ -814,6 +841,7 @@ const sessionCleanupTimer = setInterval(async () => {
   }).catch(() => []);
   await Promise.allSettled(durableSessions.map((session) => completeSimliSessionLifecycle(session.streamId, {
     status: 'disconnected',
+    timing: 'inactivity_end',
     secondsUsed: session.secondsConsumed,
     reason: 'Durable session reconciliation timeout',
   }, session.userId)));
@@ -825,6 +853,7 @@ const sessionCleanupTimer = setInterval(async () => {
       try {
         await completeSimliSessionLifecycle(session.streamId, {
           status: 'disconnected',
+          timing: 'inactivity_end',
           secondsUsed: session.secondsConsumed ?? 0,
           reason: 'Session cleanup',
         });
@@ -840,6 +869,7 @@ const sessionCleanupTimer = setInterval(async () => {
         logger.warn('Live tutor session terminated due to inactivity', { streamId: session.streamId, userId: session.userId });
         await completeSimliSessionLifecycle(session.streamId, {
           status: 'disconnected',
+          timing: 'inactivity_end',
           secondsUsed: session.secondsConsumed ?? 0,
           reason: '90-second inactivity timeout',
         });

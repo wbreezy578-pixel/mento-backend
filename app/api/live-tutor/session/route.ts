@@ -169,6 +169,7 @@ export async function GET(req: Request) {
     if (claimedUserId && cleanupStreamId) {
       await completeSimliSessionLifecycle(cleanupStreamId, {
         status: 'failed',
+        timing: 'active_end',
         reason: 'Live Tutor session initialization failed',
         secondsUsed: 0,
       }, claimedUserId).catch(() => undefined);

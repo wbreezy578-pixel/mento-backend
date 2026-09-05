@@ -124,6 +124,7 @@ export async function creditLiveTutorTopUp(input: {
   source: EntitlementProvider;
   expiresAt: Date | null;
 }) {
+  if (input.expiresAt !== null) throw new Error('Expiring Live Tutor top-ups are not supported until expiry-aware accounting is implemented.');
   if (!Number.isSafeInteger(input.seconds) || input.seconds <= 0) throw new Error('Top-up seconds must be a positive integer.');
   if (!input.idempotencyKey.trim()) throw new Error('Top-up idempotency key is required.');
   return prisma.$transaction(async (tx) => {

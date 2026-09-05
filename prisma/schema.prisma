@@ -211,6 +211,7 @@ model LiveTutorSession {
   billingRequestId      String?       @unique
   status                String        @default("creating")
   createdAt             DateTime      @default(now())
+  usableAt              DateTime?
   lastActivityAt        DateTime      @default(now())
   expiresAt             DateTime?
   secondsReserved       Int           @default(60)

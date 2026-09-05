@@ -3,27 +3,37 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev -H 0.0.0.0",
+    "dev": "tsx server.ts --dev",
     "build": "prisma generate && next build",
     "postinstall": "prisma generate",
-    "start": "next start",
-    "lint": "eslint"
+    "migrate:deploy": "prisma migrate deploy",
+    "start": "tsx server.ts",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit --incremental false",
+    "test": "vitest run && node --import tsx --test app/lib/auth.test.ts app/lib/accountDeletion.test.ts",
+    "test-account:grant-live-tutor": "tsx scripts/grantLiveTutorTestAccess.ts"
   },
   "dependencies": {
+    "@apple/app-store-server-library": "^3.1.0",
     "@google/genai": "^2.12.0",
+    "@paddle/paddle-node-sdk": "^3.10.0",
     "@prisma/client": "^5.22.0",
     "bcryptjs": "^2.4.3",
     "express-rate-limit": "^8.5.2",
+    "google-auth-library": "^11.0.2",
     "ioredis": "^5.3.2",
     "jsonwebtoken": "^9.0.0",
-    "next": "16.2.7",
+    "next": "16.3.2",
+    "prisma": "^5.22.0",
     "prom-client": "^14.0.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "react-markdown": "^10.1.0",
     "react-syntax-highlighter": "^16.1.1",
     "remark-breaks": "^4.0.0",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "tsx": "^4.23.12",
+    "ws": "8.21.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -33,11 +43,11 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@types/react-syntax-highlighter": "^15.5.13",
+    "@types/ws": "^8.18.1",
     "eslint": "^9",
-    "eslint-config-next": "16.2.7",
-    "prisma": "^5.22.0",
+    "eslint-config-next": "16.3.2",
     "tailwindcss": "^4",
-    "tsx": "^4.23.0",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.10"
   }
 }

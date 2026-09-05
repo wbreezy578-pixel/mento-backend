@@ -1,38 +1,45 @@
 import { prisma } from '../lib/prisma';
 
-export async function saveChatToDatabase(userId: string, prompt: string, response: string) {
+export async function saveChatToDatabase(userId: string, prompt: string, response: string, requestId: string) {
   if (!userId) throw new Error('userId is required');
   if (typeof prompt !== 'string' || typeof response !== 'string') throw new Error('prompt and response must be strings');
+  if (!requestId.trim()) throw new Error('requestId is required');
 
-  // Find the user's most recent conversation or create a new one
-  let conversation = await prisma.conversation.findFirst({
-    where: { userId },
-    orderBy: { updatedAt: 'desc' },
-  });
-
-  if (!conversation) {
-    conversation = await prisma.conversation.create({
-      data: { userId },
+  return prisma.$transaction(async (tx) => {
+    const conversation = await tx.conversation.create({
+      data: { userId, source: 'chat', title: 'Image Analysis' },
+      select: { id: true },
     });
-  }
-
-  const messages = await prisma.conversationMessage.createManyAndReturn({
-    data: [
-      { conversationId: conversation.id, role: 'user', text: prompt },
-      { conversationId: conversation.id, role: 'assistant', text: response },
-    ],
-    select: { id: true, role: true },
+    const userMessage = await tx.conversationMessage.create({
+      data: {
+        conversationId: conversation.id,
+        userId,
+        role: 'user',
+        status: 'completed',
+        content: prompt,
+        text: prompt,
+        requestId,
+      },
+      select: { id: true },
+    });
+    const assistantMessage = await tx.conversationMessage.create({
+      data: {
+        conversationId: conversation.id,
+        userId,
+        role: 'assistant',
+        status: 'completed',
+        content: response,
+        text: response,
+        requestId,
+      },
+      select: { id: true },
+    });
+    return {
+      conversationId: conversation.id,
+      userMessageId: userMessage.id,
+      assistantMessageId: assistantMessage.id,
+    };
   });
-
-  const userMsg = messages.find((message) => message.role === 'user');
-  const assistantMsg = messages.find((message) => message.role === 'assistant');
-  if (!userMsg || !assistantMsg) throw new Error('Failed to persist chat messages');
-
-  return {
-    conversationId: conversation.id,
-    userMessageId: userMsg.id,
-    assistantMessageId: assistantMsg.id,
-  };
 }
 
 export default saveChatToDatabase;

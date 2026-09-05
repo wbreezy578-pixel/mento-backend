@@ -21,6 +21,7 @@
     "types": [
       "node"
     ],
+    "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "plugins": [
       {
@@ -44,6 +45,8 @@
   "exclude": [
     "node_modules",
     "scripts",
-    ".next"
+    ".next",
+    "**/*.test.ts",
+    "**/*.test.tsx"
   ]
 }

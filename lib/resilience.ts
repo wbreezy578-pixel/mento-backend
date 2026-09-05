@@ -19,7 +19,7 @@ export interface CircuitBreakerState {
 }
 
 export type CircuitBreakerStateName = 'closed' | 'open' | 'half-open';
-export type ProviderName = 'gemini' | 'simli' | 'supabase' | 'stripe' | 'mpesa' | 'redis' | 'payment:stripe' | 'payment:mpesa';
+export type ProviderName = 'gemini' | 'simli' | 'supabase' | 'mpesa' | 'redis' | 'payment:mpesa' | 'payment:paddle';
 
 interface ProviderRetryConfig {
   timeoutMs: number;
@@ -40,11 +40,10 @@ const providerRetryDefaults: Record<ProviderName, ProviderRetryConfig> = {
   gemini: { timeoutMs: 30000, retries: 2, baseDelayMs: 500, maxDelayMs: 2000, resetTimeoutMs: 30000, failureThreshold: 5 },
   simli: { timeoutMs: 8000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 30000, failureThreshold: 3 },
   supabase: { timeoutMs: 8000, retries: 2, baseDelayMs: 300, maxDelayMs: 1500, resetTimeoutMs: 30000, failureThreshold: 3 },
-  stripe: { timeoutMs: 10000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 60000, failureThreshold: 3 },
   mpesa: { timeoutMs: 10000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 60000, failureThreshold: 3 },
   redis: { timeoutMs: 2000, retries: 1, baseDelayMs: 200, maxDelayMs: 1000, resetTimeoutMs: 30000, failureThreshold: 3 },
-  'payment:stripe': { timeoutMs: 10000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 60000, failureThreshold: 3 },
   'payment:mpesa': { timeoutMs: 10000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 60000, failureThreshold: 3 },
+  'payment:paddle': { timeoutMs: 10000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 60000, failureThreshold: 3 },
 };
 
 function sleep(ms: number) {

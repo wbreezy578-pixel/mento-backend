@@ -1,0 +1,33 @@
+name: Backend CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgresql://build:build@localhost:5432/build
+      DIRECT_URL: postgresql://build:build@localhost:5432/build
+      JWT_SECRET: ci-only-placeholder-at-least-32-characters
+      GEMINI_API_KEY: ci-only-placeholder
+      SUPABASE_URL: https://ci.invalid
+      SUPABASE_ANON_KEY: ci-only-placeholder
+      SUPABASE_SERVICE_ROLE_KEY: ci-only-placeholder
+      PAYMENT_WEBHOOK_AUTH_SECRET: ci-only-placeholder-at-least-32-characters
+      SIMLI_API_KEY: ci-only-placeholder
+      SIMLI_AVATAR_ID: ci-only-placeholder
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

@@ -1,7 +1,9 @@
 import { BrowserLiveTutorSpeechService } from './liveTutorSpeechService';
 import { RemoteLiveTutorGeminiService } from './liveTutorGeminiService';
+import { RemoteLiveTutorTtsService } from './liveTutorTtsService';
 import { type LiveTutorAvatarService } from './liveTutorAvatarService';
 import { createOfflineResilienceManager } from './offlineResilience';
+import logger from './logger';
 
 export type LiveTutorStatus = 'idle' | 'listening' | 'processing' | 'speaking' | 'error';
 
@@ -28,14 +30,16 @@ export interface LiveTutorController {
 
 export function createLiveTutorOrchestrator(
   avatarAdapter: LiveTutorAvatarAdapter | null,
-  options: LiveTutorOrchestratorOptions = {}
+  options: LiveTutorOrchestratorOptions = {},
+  userId?: string
 ): LiveTutorController {
-  return new LiveTutorOrchestrator(avatarAdapter, options);
+  return new LiveTutorOrchestrator(avatarAdapter, options, userId);
 }
 
 class LiveTutorOrchestrator implements LiveTutorController {
   private readonly voiceService: BrowserLiveTutorSpeechService;
   private readonly geminiService: RemoteLiveTutorGeminiService;
+  private readonly ttsService: RemoteLiveTutorTtsService;
   private readonly options: LiveTutorOrchestratorOptions;
   private conversationId: string | null = null;
   private status: LiveTutorStatus = 'idle';
@@ -72,7 +76,7 @@ class LiveTutorOrchestrator implements LiveTutorController {
             this.options.onStatusChange?.('speaking');
             if (!nextAssistantText.startsWith('Error:')) {
               const cleanText = nextAssistantText.replace(/[#*`]/g, '');
-              await this.avatarAdapter?.speak(cleanText);
+              await this.generateAndSendSpeech(cleanText);
               this.voiceService.speakText(cleanText);
             }
             return nextAssistantText;
@@ -80,10 +84,11 @@ class LiveTutorOrchestrator implements LiveTutorController {
         },
       });
 
-  constructor(avatarAdapter: LiveTutorAvatarAdapter | null, options: LiveTutorOrchestratorOptions = {}) {
+  constructor(avatarAdapter: LiveTutorAvatarAdapter | null, options: LiveTutorOrchestratorOptions = {}, userId?: string) {
     this.avatarAdapter = avatarAdapter;
     this.options = options;
-    this.geminiService = new RemoteLiveTutorGeminiService();
+    this.geminiService = new RemoteLiveTutorGeminiService(userId);
+    this.ttsService = new RemoteLiveTutorTtsService();
     this.voiceService = new BrowserLiveTutorSpeechService({
       onStateChange: (nextStatus) => {
         this.status = nextStatus;
@@ -113,7 +118,12 @@ class LiveTutorOrchestrator implements LiveTutorController {
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to start a tutor conversation.';
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      const isActuallyOffline =
+        typeof window !== 'undefined' &&
+        typeof navigator !== 'undefined' &&
+        navigator.onLine === false;
+
+      if (isActuallyOffline) {
         await this.offlineManager.enqueue({
           type: 'tutor',
           payload: { action: 'startConversation' },
@@ -136,7 +146,6 @@ class LiveTutorOrchestrator implements LiveTutorController {
   }
 
   async startListening(): Promise<void> {
-    await this.initialize();
     this.voiceService.startListening();
   }
 
@@ -163,12 +172,20 @@ class LiveTutorOrchestrator implements LiveTutorController {
   }
 
   private async handleUserText(text: string): Promise<string> {
+    const perfStart = Date.now();
     const trimmed = text.trim();
+    logger.info('[LiveTutorPerf] user message received', { textLength: trimmed.length, ts: perfStart });
     if (!trimmed) {
       return '';
     }
 
-    await this.initialize();
+    if (!this.conversationId) {
+      this.conversationId = await this.geminiService.startConversation();
+      if (this.conversationId) {
+        this.options.onConversationReady?.(this.conversationId);
+      }
+    }
+
     this.options.onConversationMessage?.({ role: 'user', text: trimmed });
     this.setSubtitle('Thinking…');
     this.options.onStatusChange?.('processing');
@@ -179,7 +196,12 @@ class LiveTutorOrchestrator implements LiveTutorController {
         assistantText = await this.geminiService.sendMessage(trimmed, this.conversationId || '');
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Tutor reply failed.';
-        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        const isActuallyOffline =
+          typeof window !== 'undefined' &&
+          typeof navigator !== 'undefined' &&
+          navigator.onLine === false;
+
+        if (isActuallyOffline) {
           await this.offlineManager.enqueue({
             type: 'tutor',
             payload: { action: 'sendMessage', text: trimmed, conversationId: this.conversationId },
@@ -208,7 +230,7 @@ class LiveTutorOrchestrator implements LiveTutorController {
 
       if (!assistantText.startsWith('Error:')) {
         const cleanText = assistantText.replace(/[#*`]/g, '');
-        await this.avatarAdapter?.speak(cleanText);
+        await this.generateAndSendSpeech(cleanText);
         this.voiceService.speakText(cleanText);
       }
 
@@ -224,5 +246,26 @@ class LiveTutorOrchestrator implements LiveTutorController {
   private setSubtitle(subtitle: string): void {
     this.currentSubtitle = subtitle;
     this.options.onSubtitleChange?.(subtitle);
+  }
+
+  private async generateAndSendSpeech(text: string): Promise<void> {
+    try {
+      if (!text || !text.trim() || !this.avatarAdapter) {
+        return;
+      }
+
+      const ttsStart = Date.now();
+      logger.info('[LiveTutorPerf] TTS request (orchestrator) started', { textLength: text.length, ts: ttsStart });
+      const result = await this.ttsService.generateSpeech(text);
+      const audioBytesLen = typeof result.audioBase64 === 'string' ? Buffer.byteLength(result.audioBase64, 'base64') : 0;
+      logger.info('[LiveTutorPerf] TTS response (orchestrator) received', { audioBytesLen, ts: Date.now(), elapsedMs: Date.now() - ttsStart });
+
+      await this.avatarAdapter.sendAudio(result.audioBase64, false);
+      logger.info('[LiveTutorPerf] audio sent to avatar', { ts: Date.now() });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to generate speech';
+      console.error('[LiveTutor] TTS failed:', message);
+      // Don't propagate TTS errors - keep the text visible and continue
+    }
   }
 }

@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash } from 'node:crypto';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { Prisma } from '@prisma/client';
@@ -7,17 +8,11 @@ import { loadAndValidateEnvironment, getJwtSecret as getConfiguredJwtSecret } fr
 import logger from '../../lib/logger';
 import { NextResponse } from 'next/server';
 import type { ResponseCookies } from 'next/dist/server/web/spec-extension/cookies';
+import { getRateLimitClientKey, getTrustedClientIp } from '../../lib/requestMetadata';
 
 loadAndValidateEnvironment();
-const isProduction = process.env.NODE_ENV === 'production';
 const JWT_SECRET = getConfiguredJwtSecret();
 const resolvedJwtSecret = JWT_SECRET;
-const MAX_FAILED_LOGIN_ATTEMPTS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000;
-
-function getJwtSecret(): string | undefined {
-  return resolvedJwtSecret;
-}
 
 function ensureJwtSecret(): string {
   if (!resolvedJwtSecret) {
@@ -27,17 +22,31 @@ function ensureJwtSecret(): string {
 }
 
 const JWT_ALGORITHM = 'HS256';
-const PASSWORD_MIN_LENGTH = 12;
+const JWT_ISSUER = process.env.JWT_ISSUER ?? 'mento';
+const JWT_AUDIENCE = process.env.JWT_AUDIENCE ?? 'mento';
+const PASSWORD_MIN_LENGTH = 15;
+const PASSWORD_MAX_BYTES = 72;
 const RECENT_OAUTH_REAUTH_MS = 15 * 60 * 1000;
 const ACCESS_TOKEN_TTL_SECONDS = 15 * 60;
-const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
-const userContext = new AsyncLocalStorage<string | null>();
+const REFRESH_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
+const LOGIN_LOCKOUT_THRESHOLD = 5;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+// Valid digest used for constant-work comparisons when an account is missing
+// or contains a legacy/malformed password value.
+export const DUMMY_BCRYPT_HASH = '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy';
+// Mento currently ships as a native mobile application.  Browser sign-in is
+// deliberately opt-in so the web host used for email actions cannot silently
+// become a second session surface.
+const BROWSER_AUTH_ENABLED = process.env.AUTH_BROWSER_SIGN_IN_ENABLED === 'true';
+const userContext = new AsyncLocalStorage<{ userId: string; sessionId: string } | null>();
 
 export interface JwtPayload {
   sub: string;
   email: string;
   iat: number;
   exp: number;
+  type?: 'access' | 'refresh' | string;
+  sid: string;
 }
 
 export interface PasswordValidationResult {
@@ -58,9 +67,11 @@ export interface LoginPolicyState {
 }
 
 export function getClientIp(req: Request) {
-  const forwarded = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
-  if (forwarded) return forwarded;
-  return req.headers.get('x-real-ip')?.trim() || '';
+  return getRateLimitClientKey(req.headers);
+}
+
+export function getSessionClientIp(req: Request) {
+  return getTrustedClientIp(req.headers) || null;
 }
 
 export function getLoginPolicyState(user: { failedLoginAttempts?: number | null; lockedAt?: Date | string | null }) {
@@ -80,86 +91,74 @@ export function getLoginPolicyState(user: { failedLoginAttempts?: number | null;
   };
 }
 
+function extractTokenFromRequest(req: Request): { token: string | null; source: 'authorization' | 'cookie' | 'none' } {
+  const headerValue = req.headers.get('authorization')?.trim() ?? '';
+  const headerMatch = headerValue.match(/^Bearer\s+(.+)$/i);
+  if (headerMatch?.[1]) {
+    return { token: headerMatch[1].trim(), source: 'authorization' };
+  }
+
+  if (BROWSER_AUTH_ENABLED) {
+    const cookieHeader = req.headers.get('cookie') ?? '';
+    const cookieMatch = cookieHeader.match(/(?:^|;\s*)mento_access_token=([^;]+)/);
+    if (cookieMatch?.[1]) {
+      return { token: decodeURIComponent(cookieMatch[1]).trim(), source: 'cookie' };
+    }
+  }
+
+  return { token: null, source: 'none' };
+}
+
 export async function getUserFromRequest(req: Request) {
-  const authHeader = req.headers.get('authorization')?.trim() || '';
-  const authHeaderExists = authHeader.length > 0;
-  const authScheme = authHeaderExists ? authHeader.split(' ')[0] : 'none';
-  logger.info('Auth header inspection', { authHeaderExists, authScheme });
+  const { token } = extractTokenFromRequest(req);
 
-  if (!authHeader.toLowerCase().startsWith('bearer ')) {
-    logger.warn('Auth rejected: invalid scheme');
+  if (!token) {
     userContext.enterWith(null);
     return null;
   }
 
-  const token = authHeader.slice(7).trim();
-  const tokenPresent = token.length > 0;
-  logger.info('Bearer token inspection', { tokenPresent });
-  if (!tokenPresent) {
-    logger.warn('Auth rejected: missing token');
-    userContext.enterWith(null);
-    return null;
-  }
-
-  logger.info('JWT verification started');
   try {
-    const jwtSecret = getJwtSecret();
+    const jwtSecret = resolvedJwtSecret;
     if (!jwtSecret) {
-      logger.warn('JWT_SECRET not configured: auth verification is disabled');
       userContext.enterWith(null);
       return null;
     }
-    const payload = jwt.verify(token, jwtSecret, { algorithms: [JWT_ALGORITHM] });
-    const decodedUserId = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).sub ?? null : null;
-    const decodedEmail = typeof payload === 'object' && payload !== null ? (payload as Partial<JwtPayload>).email ?? null : null;
-    logger.info('JWT verification succeeded', {
-      decodedUserId,
-      decodedEmail,
-      algorithm: JWT_ALGORITHM,
-      secretConfigured: Boolean(JWT_SECRET),
-    });
+    const payload = jwt.verify(token, jwtSecret, {
+      algorithms: [JWT_ALGORITHM],
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    }) as Partial<JwtPayload>;
+    if (typeof payload !== 'object' || payload === null || typeof (payload as Partial<JwtPayload>).sub !== 'string' || typeof (payload as Partial<JwtPayload>).email !== 'string' || typeof (payload as Partial<JwtPayload>).sid !== 'string') {
+      userContext.enterWith(null);
+      return null;
+    }
 
-    if (typeof payload !== 'object' || payload === null || typeof (payload as Partial<JwtPayload>).sub !== 'string') {
-      logger.warn('Auth rejected: invalid JWT payload');
+    if ((payload as JwtPayload).type === 'refresh') {
       userContext.enterWith(null);
       return null;
     }
 
     const userId = (payload as JwtPayload).sub;
-    const email = (payload as JwtPayload).email;
-    logger.info('JWT payload extracted', { userId, email });
+    const sessionId = (payload as JwtPayload).sid;
 
-    let user = await prisma.user.findUnique({ where: { id: userId } });
-    if (!user && typeof email === 'string') {
-      const normalizedEmail = normalizeEmail(email);
-      if (normalizedEmail) {
-        user = await prisma.user.findFirst({
-          where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
-        });
-        if (user) {
-          logger.info('JWT fallback user found by email', { email: normalizedEmail, fallbackUserId: user.id });
-        }
-      }
-    }
+    const [user, session] = await Promise.all([
+      prisma.user.findUnique({ where: { id: userId } }),
+      prisma.session.findFirst({ where: { id: sessionId, userId, revokedAt: null, expiresAt: { gt: new Date() }, absoluteExpiresAt: { gt: new Date() } } }),
+    ]);
 
     const userFound = Boolean(user);
-    logger.info('User lookup result', { userFound, userId, userEmail: user?.email ?? null });
-    if (!userFound || !user) {
-      logger.warn('Auth rejected: user lookup failed');
+    const issuedAt = typeof payload.iat === 'number' ? payload.iat * 1000 : 0;
+    if (!userFound || !user || !session || user.accountStatus !== 'ACTIVE' || issuedAt < user.credentialsChangedAt.getTime() - 1000) {
       userContext.enterWith(null);
       return null;
     }
 
-    userContext.enterWith(user.id);
+    userContext.enterWith({ userId: user.id, sessionId });
+    if (!session.lastUsedAt || Date.now() - session.lastUsedAt.getTime() > 5 * 60 * 1000) {
+      void prisma.session.update({ where: { id: sessionId }, data: { lastUsedAt: new Date() } }).catch(() => undefined);
+    }
     return user;
-  } catch (error: unknown) {
-    const errorName = error instanceof Error ? error.name : 'UnknownError';
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    logger.warn('JWT verification failed', {
-      errorName,
-      errorMessage,
-      tokenPresent,
-    });
+  } catch {
     userContext.enterWith(null);
     return null;
   }
@@ -167,6 +166,12 @@ export async function getUserFromRequest(req: Request) {
 
 export function normalizeEmail(email: string | null | undefined) {
   return typeof email === 'string' ? email.trim().toLowerCase() : '';
+}
+
+export function isBcryptHash(hash: string) {
+  // A bcrypt digest is exactly 60 characters.  Accept the prefixes supported
+  // by bcryptjs and the full cost range, but reject truncated/dummy values.
+  return /^\$2[abxy]\$(0[4-9]|[12]\d|3[01])\$[./A-Za-z0-9]{53}$/.test(hash);
 }
 
 export function isAdminUser(user: { email?: string | null; authProvider?: string | null; role?: string | null }) {
@@ -189,18 +194,7 @@ export function validatePasswordStrength(password: string): PasswordValidationRe
   if (password.length < PASSWORD_MIN_LENGTH) {
     reasons.push(`Password must be at least ${PASSWORD_MIN_LENGTH} characters long.`);
   }
-  if (!/[A-Z]/.test(password)) {
-    reasons.push('Password must contain an uppercase letter.');
-  }
-  if (!/[a-z]/.test(password)) {
-    reasons.push('Password must contain a lowercase letter.');
-  }
-  if (!/\d/.test(password)) {
-    reasons.push('Password must contain a number.');
-  }
-  if (!/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(password)) {
-    reasons.push('Password must contain a symbol.');
-  }
+  if (Buffer.byteLength(password, 'utf8') > PASSWORD_MAX_BYTES) reasons.push(`Password must be at most ${PASSWORD_MAX_BYTES} bytes long.`);
   return { isValid: reasons.length === 0, reasons };
 }
 
@@ -210,16 +204,35 @@ export async function hashPassword(password: string) {
 
 export async function verifyPassword(password: string, passwordHash: string | null | undefined) {
   if (!passwordHash || !passwordHash.trim()) return false;
-  return bcrypt.compare(password, passwordHash);
+
+  const trimmedHash = passwordHash.trim();
+  const isBcrypt = isBcryptHash(trimmedHash);
+
+  if (isBcrypt) {
+    try {
+      return await bcrypt.compare(password, trimmedHash);
+    } catch {
+      return false;
+    }
+  }
+
+  // Keep malformed/legacy account checks close to the bcrypt timing profile
+  // without ever accepting or migrating the stored value.
+  await bcrypt.compare(password, DUMMY_BCRYPT_HASH);
+  return false;
+}
+
+export function authRateLimitSubject(value: string) {
+  return createHash('sha256').update(value.trim().toLowerCase()).digest('hex').slice(0, 32);
 }
 
 export function getSensitiveActionRequirements(user: { authProvider?: string | null; lastOAuthReauthAt?: Date | string | null }, now = new Date()): SensitiveActionRequirements {
   const lastOAuthReauthAt = user.lastOAuthReauthAt ? new Date(user.lastOAuthReauthAt) : null;
-  const isGoogleUser = user.authProvider === 'google' || user.authProvider === 'mixed';
+  const isOAuthUser = user.authProvider === 'google' || user.authProvider === 'apple' || user.authProvider === 'mixed';
   const recentOAuthReauth = lastOAuthReauthAt ? now.getTime() - lastOAuthReauthAt.getTime() <= RECENT_OAUTH_REAUTH_MS : false;
   return {
     requiresPasswordConfirmation: true,
-    requiresRecentOAuthReauth: isGoogleUser && !recentOAuthReauth,
+    requiresRecentOAuthReauth: isOAuthUser && !recentOAuthReauth,
     recentOAuthReauthWindowMs: RECENT_OAUTH_REAUTH_MS,
   };
 }
@@ -232,21 +245,31 @@ export function requireUserScope(requestedUserId: string | null | undefined) {
   return activeUserId;
 }
 
-export function buildUserSummary(user: { id: string; email: string; name?: string | null }) {
-  return { id: user.id, email: user.email, name: user.name ?? null };
+export function buildUserSummary(user: {
+  id: string;
+  email: string;
+  name?: string | null;
+  authProvider?: string | null;
+  password?: string | null;
+}) {
+  return {
+    id: user.id,
+    email: normalizeEmail(user.email),
+    name: user.name ?? null,
+    authProvider: user.authProvider ?? null,
+    hasPassword: Boolean(user.password?.trim()),
+  };
 }
 
-export function signToken(userId: string, email: string, options?: { expiresInSeconds?: number }) {
+export function signToken(userId: string, email: string, options: { sessionId: string; expiresInSeconds?: number }) {
   const jwtSecret = ensureJwtSecret();
   const expiresInSeconds = options?.expiresInSeconds ?? ACCESS_TOKEN_TTL_SECONDS;
-  return jwt.sign({ sub: userId, email }, jwtSecret, { expiresIn: expiresInSeconds, algorithm: JWT_ALGORITHM });
-}
 
-export function signRefreshToken(userId: string, email: string) {
-  const jwtSecret = ensureJwtSecret();
-  return jwt.sign({ sub: userId, email, type: 'refresh' }, jwtSecret, {
-    expiresIn: REFRESH_TOKEN_TTL_SECONDS,
+  return jwt.sign({ sub: userId, email, sid: options.sessionId, type: 'access' }, jwtSecret, {
+    expiresIn: expiresInSeconds,
     algorithm: JWT_ALGORITHM,
+    issuer: JWT_ISSUER,
+    audience: JWT_AUDIENCE,
   });
 }
 
@@ -270,6 +293,9 @@ export function applyAuthCookies(
   response: NextResponse,
   params: { accessToken: string; refreshToken: string; isProduction: boolean; accessMaxAgeSeconds?: number; refreshMaxAgeSeconds?: number; path?: string }
 ) {
+  response.headers.set('Cache-Control', 'no-store');
+  if (!BROWSER_AUTH_ENABLED) return response;
+
   response.cookies.set('mento_access_token', params.accessToken, buildAuthCookieOptions({
     isProduction: params.isProduction,
     maxAgeSeconds: params.accessMaxAgeSeconds ?? ACCESS_TOKEN_TTL_SECONDS,
@@ -277,7 +303,7 @@ export function applyAuthCookies(
   }));
   response.cookies.set('mento_refresh_token', params.refreshToken, buildAuthCookieOptions({
     isProduction: params.isProduction,
-    maxAgeSeconds: params.refreshMaxAgeSeconds ?? REFRESH_TOKEN_TTL_SECONDS,
+    maxAgeSeconds: params.refreshMaxAgeSeconds ?? REFRESH_COOKIE_MAX_AGE_SECONDS,
     path: params.path,
   }));
   return response;
@@ -287,27 +313,26 @@ export async function recordSecurityEvent(userId: string | null, eventType: stri
   try {
     await prisma.securityEvent.create({ data: { userId, eventType, severity: 'info', details: details as Prisma.InputJsonValue } });
   } catch (error) {
-    logger.warn('Security event persistence failed', { error });
+    logger.warn('Security event persistence failed', { errorName: error instanceof Error ? error.name : 'unknown' });
   }
 }
 
 export async function incrementFailedLoginAttempts(userId: string) {
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user) return null;
-
-  const failedLoginAttempts = user.failedLoginAttempts + 1;
-  const shouldLockout = failedLoginAttempts >= MAX_FAILED_LOGIN_ATTEMPTS;
-  const nextLockedAt = shouldLockout ? new Date(Date.now() + LOCKOUT_DURATION_MS) : user.lockedAt;
-  const updated = await prisma.user.update({
-    where: { id: userId },
-    data: {
-      failedLoginAttempts,
-      lastFailedLoginAt: new Date(),
-      lockedAt: nextLockedAt,
-    },
-  });
-
-  return updated;
+  const now = new Date();
+  const lockUntil = new Date(now.getTime() + LOGIN_LOCKOUT_MS);
+  const rows = await prisma.$queryRaw<Array<{ failedLoginAttempts: number; lockedAt: Date | null }>>(Prisma.sql`
+    UPDATE "User"
+    SET "failedLoginAttempts" = "failedLoginAttempts" + 1,
+        "lastFailedLoginAt" = ${now},
+        "lockedAt" = CASE
+          WHEN "failedLoginAttempts" + 1 >= ${LOGIN_LOCKOUT_THRESHOLD} THEN ${lockUntil}
+          ELSE "lockedAt"
+        END
+    WHERE "id" = ${userId}
+    RETURNING "failedLoginAttempts", "lockedAt"
+  `);
+  if (!rows[0]) throw new Error('User not found');
+  return rows[0];
 }
 
 export async function resetFailedLoginAttempts(userId: string) {
@@ -322,7 +347,11 @@ export async function resetFailedLoginAttempts(userId: string) {
 }
 
 export function getActiveUserId() {
-  return userContext.getStore() ?? null;
+  return userContext.getStore()?.userId ?? null;
+}
+
+export function getActiveSessionId() {
+  return userContext.getStore()?.sessionId ?? null;
 }
 
 export function getUserContextForPrisma() {

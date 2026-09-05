@@ -1,5 +1,8 @@
 import { NextResponse } from 'next/server';
-import { createSimliStreamingAvatarSession, closeRealtimeSession } from '../../../../services/simliService';
+// Match your exact original exports from simliService
+import { claimLiveTutorSession, completeSimliSessionLifecycle, constrainLiveTutorSessionDuration, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
+import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE } from '../../../../services/liveTutorVoiceProfiles';
+import { resolveLiveTutorVoiceProfile } from '../../../../services/liveTutorVoiceProfiles';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -9,15 +12,75 @@ import {
   buildAIRequestId,
 } from '../../../../lib/aiSecurityGateway';
 import logger from '../../../../lib/logger';
+import { attachLiveTutorConversation, createLiveTutorConversation, getOwnedLiveTutorConversation } from '../../../../services/liveTutorConversationService';
+import type { BillingDecision } from '../../../../services/billingService';
+import { getLiveTutorMaxSessionSecondsForUser, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS } from '../../../../lib/liveTutorLimits';
+
+function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
+  const token = typeof session.token === 'string' && session.token.trim()
+    ? session.token.trim()
+    : typeof session.sessionToken === 'string' && session.sessionToken.trim()
+    ? session.sessionToken.trim()
+    : null;
+
+  if (!token) {
+    const error = new Error('Simli session did not return a valid session token.') as Error & { status: number };
+    error.status = 502;
+    throw error;
+  }
+
+  return token;
+}
 
 export async function GET(req: Request) {
+  let claimedRequestId: string | undefined;
+  let claimedUserId: string | undefined;
+  let cleanupStreamId: string | undefined;
   try {
     const user = await authenticateAIRequest(req);
+    claimedUserId = user.id;
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
+    const requestUrl = new URL(req.url);
+    const requestedVoiceProfile = requestUrl.searchParams.get('avatarVoiceProfile');
+    const requestedConversationId = requestUrl.searchParams.get('conversationId')?.trim() || null;
+    const avatarVoiceProfile = requestedVoiceProfile === null
+      ? DEFAULT_LIVE_TUTOR_VOICE_PROFILE
+      : resolveLiveTutorVoiceProfile(requestedVoiceProfile);
+    if (!avatarVoiceProfile) {
+      return NextResponse.json({ error: 'Invalid Live Tutor avatar voice profile.' }, { status: 400 });
+    }
+    let continuedConversationId: string | null = null;
+    if (requestedConversationId) {
+      const ownedConversation = await getOwnedLiveTutorConversation(requestedConversationId, user.id);
+      if (!ownedConversation) {
+        return NextResponse.json({ error: 'Live Tutor conversation not found.' }, { status: 404 });
+      }
+      continuedConversationId = ownedConversation.id;
+    }
+
+    logger.info('Live Tutor session request received', {
+      userId: user.id,
+      clientIp,
+      category: 'live_tutor_session_start',
+    });
+
+    await reconcileStaleLiveTutorSession(user.id);
 
     const requestId = buildAIRequestId('simli-session');
-    const { result: session, billingDecision } = await executeAIRequest({
+    claimedRequestId = requestId;
+    cleanupStreamId = `pending-${requestId}`;
+    if (!await claimLiveTutorSession(user.id, requestId, avatarVoiceProfile)) {
+      logger.warn('[LiveTutorLifecycle] claim_rejected_active', { userId: user.id, reason: 'another_genuinely_active_session', resultingStatus: 'active', category: 'live_tutor_session_rejected_active' });
+      return NextResponse.json({ error: 'A Live Tutor session is already active on another device.' }, { status: 409 });
+    }
+    logger.info('Creating new Live Tutor session', {
+      userId: user.id,
+      requestId,
+      category: 'live_tutor_session_creating',
+    });
+
+    const result = await executeAIRequest({
       user,
       clientIp,
       feature: 'live_tutor',
@@ -26,34 +89,119 @@ export async function GET(req: Request) {
       requestId,
       metadata: { streamType: 'avatar-session' },
       pending: true,
-      callback: async () => await createSimliStreamingAvatarSession(),
+      finalize: false,
+      callback: async ({ billingDecision }) => {
+        const authorizedSeconds = Math.min(
+          getLiveTutorMaxSessionSecondsForUser(user.email),
+          60 + Math.max(0, billingDecision.remainingUsage ?? 0),
+        );
+        return createSimliStreamingAvatarSession({ requestId, userId: user.id, secondsReserved: authorizedSeconds, maxSessionSeconds: authorizedSeconds, avatarVoiceProfile });
+      },
+    });
+    const session: SimliStreamingSession = result.result;
+    const billingDecision: BillingDecision = result.billingDecision;
+    cleanupStreamId = session.streamId;
+    const maxSessionSeconds = getLiveTutorMaxSessionSecondsForUser(user.email);
+    const availableSessionSeconds = Math.min(
+      maxSessionSeconds,
+      60 + Math.max(0, billingDecision.remainingUsage ?? 0),
+    );
+    const availableBalanceSeconds = 60 + Math.max(0, billingDecision.remainingUsage ?? 0);
+    session.expiresAt = await constrainLiveTutorSessionDuration(session.streamId, user.id, availableSessionSeconds) ?? session.expiresAt;
+
+    logger.info('Live Tutor session created successfully', {
+      userId: user.id,
+      sessionId: session.sessionId,
+      streamId: session.streamId,
+      billingAllowed: billingDecision.allowed,
+      billingReason: billingDecision.reason,
+      remainingSeconds: billingDecision.remainingUsage ?? 0,
+      requestId,
+      category: 'live_tutor_session_created',
     });
 
     if (billingDecision.remainingUsage !== null && billingDecision.remainingUsage <= 0) {
-      try {
-        await closeRealtimeSession(session.streamId).catch(() => undefined);
-      } catch {
-        // ignore cleanup errors
-      }
+      logger.warn('Live Tutor balance exhausted after session creation', {
+        userId: user.id,
+        sessionId: session.sessionId,
+        streamId: session.streamId,
+        requestId,
+        category: 'live_tutor_balance_exhausted',
+      });
+      // Session tracking remains safe inside local service memory allocation array maps
     }
 
+    // Fixed: Using session.token to seamlessly resolve data payload transmission parameters
+    const sessionToken = requireSessionToken(session);
+    let conversationId: string | null = null;
+    try {
+      const conversation = continuedConversationId
+        ? { id: continuedConversationId }
+        : await createLiveTutorConversation(user.id);
+      conversationId = conversation.id;
+      await attachLiveTutorConversation(session.streamId, user.id, conversation.id);
+    } catch (error) {
+      logger.warn('Live Tutor conversation preparation failed; continuing voice session', {
+        userId: user.id,
+        streamId: session.streamId,
+        error: error instanceof Error ? error.message : String(error),
+        category: 'live_tutor_conversation_persistence',
+      });
+    }
     return NextResponse.json({
-      accessToken: session.token,
+      sessionToken,
       streamId: session.streamId,
       sessionId: session.sessionId,
       avatarId: session.avatarId,
       expiresAt: session.expiresAt,
+      avatarVoiceProfile,
+      conversationId,
       billing: billingDecision,
+      limits: {
+        maxSessionSeconds,
+        authorizedSessionSeconds: availableSessionSeconds,
+        availableBalanceSeconds,
+        inactivityTimeoutSeconds: Math.floor(LIVE_TUTOR_INACTIVITY_TIMEOUT_MS / 1000),
+      },
     });
   } catch (error: unknown) {
+    const errorRequestId = claimedRequestId;
+    if (claimedUserId && cleanupStreamId) {
+      await completeSimliSessionLifecycle(cleanupStreamId, {
+        status: 'failed',
+        timing: 'active_end',
+        reason: 'Live Tutor session initialization failed',
+        secondsUsed: 0,
+      }, claimedUserId).catch(() => undefined);
+    } else if (claimedRequestId && claimedUserId) {
+      await releaseLiveTutorSessionClaim(claimedUserId, claimedRequestId).catch(() => undefined);
+    }
+    claimedRequestId = undefined;
+    claimedUserId = undefined;
     if (error instanceof AIRequestGatewayError) {
+      logger.info('Live Tutor session request blocked', {
+        status: error.status,
+        reason: typeof error.body === 'object' && error.body !== null ? (error.body as Record<string, unknown>).error : 'unknown',
+        category: 'live_tutor_session_blocked',
+      });
       return NextResponse.json(error.body, { status: error.status });
     }
 
     const message = error instanceof Error ? error.message : 'Internal Server Error';
     const status = (error as { status?: number })?.status ?? 500;
+    const isUnavailable = message && (message.includes('temporarily unavailable') || message.includes('circuit'));
 
-    logger.error('Simli session request failed', { error: message });
-    return NextResponse.json({ error: message }, { status });
+    logger.error('Live Tutor session initialization failed', {
+      status,
+      category: isUnavailable ? 'provider_unavailable' : 'session_error',
+      message: isUnavailable ? 'Simli unavailable' : 'Session error',
+      error: message,
+    });
+
+    const userMessage = isUnavailable
+      ? 'Live Tutor is temporarily unavailable. Please try again in a moment.'
+      : 'Unable to start Live Tutor. Please check your connection and try again.';
+
+    return NextResponse.json({ error: userMessage, requestId: errorRequestId }, { status });
   }
 }

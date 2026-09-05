@@ -2,9 +2,6 @@ import { NextResponse } from 'next/server';
 import { analyzeImage } from '../../../../services/geminiService';
 import saveChatToDatabase from '../../../../services/chatService';
 import logger from '../../../../lib/logger';
-import fs from 'fs/promises';
-import os from 'os';
-import path from 'path';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -12,11 +9,16 @@ import {
   executeAIRequest,
   getClientIp,
   buildAIRequestId,
+  requireClientAIRequestId,
 } from '../../../../lib/aiSecurityGateway';
 import { validateImageBuffer, detectImageMimeType } from '../../../../lib/imageValidator';
 import { classifyAppError, createApiErrorResponse } from '../../../../lib/errorHandling';
+import { assertRequestContentLength, readJsonBodyWithLimit, RequestBodyError } from '../../../../lib/requestBody';
+import { createHash } from 'node:crypto';
 
 const MAX_IMAGE_BYTES = Number(process.env.MAX_IMAGE_BYTES ?? 10 * 1024 * 1024); // 10MB default
+const MAX_IMAGE_BASE64_CHARS = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
+const MAX_IMAGE_REQUEST_BYTES = MAX_IMAGE_BASE64_CHARS + 256 * 1024;
 const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
 
 function buildJsonHeaders(requestId?: string) {
@@ -31,6 +33,14 @@ function buildErrorResponse(message: string, status: number, code: string, reque
   return NextResponse.json(createApiErrorResponse(message, { status, code, requestId, details }), { status, headers: buildJsonHeaders(requestId) });
 }
 
+type MultipartFormLike = {
+  get: (key: string) => unknown;
+};
+
+function asMultipartForm(input: unknown): MultipartFormLike {
+  return input as unknown as MultipartFormLike;
+}
+
 export async function POST(req: Request) {
   try {
     const user = await authenticateAIRequest(req);
@@ -39,23 +49,35 @@ export async function POST(req: Request) {
 
     let buffer: Buffer | null = null;
     let mimeType: string | null = null;
+    let prompt: string | null = null;
     const contentType = req.headers.get('content-type') || '';
+    assertRequestContentLength(req, MAX_IMAGE_REQUEST_BYTES);
 
-    const requestId = buildAIRequestId('image-analyze');
-    let formVar: FormData | null = null;
+    let requestId: string | undefined;
+    let formVar: MultipartFormLike | null = null;
     if (contentType.includes('multipart/form-data')) {
-      formVar = await req.formData();
+      if (!req.headers.get('content-length')) {
+        return buildErrorResponse('A Content-Length header is required for image uploads.', 411, 'validation_error', requestId);
+      }
+      formVar = asMultipartForm(await req.formData());
+      requestId = requireClientAIRequestId(req, formVar.get('requestId'));
       const file = formVar.get('image');
-      if (!file || typeof file === 'string' || typeof file.arrayBuffer !== 'function') {
+      if (!file || typeof file === 'string' || typeof (file as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer !== 'function') {
         return buildErrorResponse('No image file provided', 400, 'validation_error', requestId);
       }
-      const ab = await file.arrayBuffer();
+      const fileBlob = file as { arrayBuffer: () => Promise<ArrayBuffer>; type?: string };
+      const ab = await fileBlob.arrayBuffer();
       buffer = Buffer.from(ab);
-      mimeType = file.type || detectImageMimeType(new Uint8Array(ab));
+      mimeType = fileBlob.type || detectImageMimeType(new Uint8Array(ab));
     } else {
-      const json = await req.json().catch(() => null);
+      const json = await readJsonBodyWithLimit<{ image?: unknown; prompt?: unknown; requestId?: unknown }>(req, MAX_IMAGE_REQUEST_BYTES);
+      requestId = requireClientAIRequestId(req, json?.requestId);
       const img = json?.image;
+      prompt = typeof json?.prompt === 'string' ? json.prompt : null;
       if (!img) return buildErrorResponse('No image provided', 400, 'validation_error', undefined);
+      if (typeof img === 'string' && img.length > MAX_IMAGE_BASE64_CHARS + 128) {
+        return buildErrorResponse('Image is too large.', 413, 'file_upload_error', requestId);
+      }
       if (typeof img === 'string' && img.startsWith('data:')) {
         const match = img.match(/^data:([^;]+);base64,(.+)$/);
         if (!match) return buildErrorResponse('Invalid data URL', 400, 'validation_error', undefined);
@@ -89,21 +111,21 @@ export async function POST(req: Request) {
       return buildErrorResponse(errMsg, 400, 'file_upload_error');
     }
 
-    let prompt: string | null = null;
     if (contentType.includes('multipart/form-data')) {
       const maybePrompt = formVar?.get('prompt');
       if (typeof maybePrompt === 'string') prompt = maybePrompt;
-    } else {
-      const json = await req.json().catch(() => null);
-      prompt = typeof json?.prompt === 'string' ? json.prompt : null;
     }
 
-    const tmpDir = path.join(os.tmpdir(), 'mento-uploads');
-    await fs.mkdir(tmpDir, { recursive: true }).catch(() => undefined);
-    const tmpPath = path.join(tmpDir, `${requestId}.${mimeType.split('/')[1] || 'bin'}`);
-    try {
-      await fs.writeFile(tmpPath, buffer);
-      const { result: analysisText, billingDecision } = await executeAIRequest({
+    const operationPayloadHash = createHash('sha256')
+      .update(buffer)
+      .update('\0')
+      .update(prompt?.trim() ?? '')
+      .update('\0')
+      .update(mimeType)
+      .digest('hex');
+
+    let persistedConversationId: string | null = null;
+    const { result: analysisText, billingDecision } = await executeAIRequest({
         user,
         clientIp,
         feature: 'image',
@@ -111,34 +133,35 @@ export async function POST(req: Request) {
         amount: 1,
         requestId,
         metadata: {
-          promptPreview: prompt?.slice(0, 200),
+          operationType: 'image.analyze',
+          payloadHash: operationPayloadHash,
+          promptLength: prompt?.length ?? 0,
           mimeType,
           imageSize: buffer.length,
         },
         pending: true,
         securityInput: prompt ?? undefined,
-        callback: async () => {
-          return await analyzeImage(buffer, mimeType, prompt ?? undefined);
+        callback: async ({ billingDecision, reportUsage, reportProviderAttempt }) => {
+          return await analyzeImage(buffer, mimeType, prompt ?? undefined, billingDecision.modelUsed ?? undefined, reportUsage, reportProviderAttempt);
         },
-      });
+        beforeFinalize: async (result) => {
+          const saved = await saveChatToDatabase(
+            user.id,
+            prompt?.trim() || 'Image uploaded for analysis',
+            result,
+            requestId,
+          );
+          persistedConversationId = saved.conversationId;
+        },
+    });
 
-      try {
-        await saveChatToDatabase(user.id, 'Image uploaded for analysis', analysisText);
-      } catch (err) {
-        logger.warn('Failed to persist image analysis to conversation', { error: String(err) });
-      }
-
-      return NextResponse.json({ analysis: analysisText, billing: billingDecision });
-    } finally {
-      try {
-        await fs.unlink(tmpPath).catch(() => undefined);
-      } catch {
-        // ignore
-      }
-    }
+    return NextResponse.json({ analysis: analysisText, conversationId: persistedConversationId, billing: billingDecision });
   } catch (error: unknown) {
+    if (error instanceof RequestBodyError) {
+      return buildErrorResponse(error.message, error.status, error.code);
+    }
     if (error instanceof AIRequestGatewayError) {
-      return NextResponse.json(error.body, { status: error.status });
+      return NextResponse.json(error.body, { status: error.status, headers: error.headers });
     }
 
     const appError = classifyAppError(error, { status: (error as { status?: number })?.status, source: 'image', requestId: buildAIRequestId('image-analyze') });

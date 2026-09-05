@@ -1,0 +1,26 @@
+name: Conversation retention
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  purge-expired-conversations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Delete conversations inactive for more than one year
+        env:
+          BACKEND_URL: ${{ vars.MENTO_BACKEND_URL }}
+          RETENTION_JOB_SECRET: ${{ secrets.RETENTION_JOB_SECRET }}
+        run: |
+          test -n "$BACKEND_URL"
+          test -n "$RETENTION_JOB_SECRET"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $RETENTION_JOB_SECRET" \
+            "${BACKEND_URL%/}/api/internal/retention"

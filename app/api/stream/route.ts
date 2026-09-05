@@ -1,5 +1,5 @@
 ﻿import { NextResponse } from 'next/server';
-import { createSimliStreamingAvatarSession, closeRealtimeSession } from '../../../services/simliService';
+import { createSimliStreamingAvatarSession, closeRealtimeSession, getActiveSimliSessionForUser } from '../../../services/simliService';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -11,10 +11,28 @@ import {
 import logger from '../../../lib/logger';
 
 export async function POST(req: Request) {
+  if (process.env.NODE_ENV === 'production') {
+    return NextResponse.json(
+      { error: 'This legacy Live Tutor endpoint has been retired. Use /api/live-tutor/session.' },
+      { status: 410, headers: { Deprecation: 'true', Sunset: 'Wed, 30 Sep 2026 00:00:00 GMT' } },
+    );
+  }
+
   try {
     const user = await authenticateAIRequest(req);
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
+
+    const existingSession = getActiveSimliSessionForUser(user.id);
+    if (existingSession?.streamId) {
+      return NextResponse.json({
+        sessionToken: existingSession.sessionToken,
+        streamId: existingSession.streamId,
+        sessionId: existingSession.sessionId,
+        avatarId: existingSession.avatarId,
+        expiresAt: existingSession.expiresAt,
+      });
+    }
 
     const requestId = buildAIRequestId('live-stream');
     const { result: session, billingDecision } = await executeAIRequest({
@@ -26,7 +44,7 @@ export async function POST(req: Request) {
       requestId,
       metadata: { streamType: 'avatar-session' },
       pending: true,
-      callback: async () => await createSimliStreamingAvatarSession(),
+      callback: async () => await createSimliStreamingAvatarSession({ requestId, userId: user.id, secondsReserved: 60 }),
     });
 
     if (billingDecision.remainingUsage !== null && billingDecision.remainingUsage <= 0) {

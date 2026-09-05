@@ -2,7 +2,7 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { getEffectiveLimit, getPlan } from './planService';
 
-export type BillingPlan = 'FREE' | 'PRO' | 'PREMIUM';
+export type BillingPlan = 'FREE' | 'PRO';
 export type UsageFeature = 'chat' | 'live_tutor' | 'speech' | 'image' | string;
 export type UsageProvider = 'Gemini' | 'Simli' | 'OpenAI' | 'Azure' | 'ImageGen' | string;
 
@@ -179,7 +179,7 @@ export async function canUseAIChat(userId: string, amount = 1) {
   if (used + amount > planLimits.dailyChatLimit) {
     return {
       ok: false,
-      message: `Daily AI request limit reached for the ${wallet.plan} plan. Upgrade to Pro or Premium for more usage.`,
+      message: `Daily AI request limit reached for the ${wallet.plan} plan. Upgrade to Pro for more usage.`,
       status: 402,
       limit: planLimits.dailyChatLimit,
       used,

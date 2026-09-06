@@ -9,7 +9,7 @@ loadAndValidateEnvironment();
 const geminiApiKey = getGeminiApiKey();
 
 const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL ?? 'gemini-2.5-flash-native-audio-preview-12-2025';
-export const LIVE_TUTOR_END_OF_TURN_SILENCE_MS = 900;
+export const LIVE_TUTOR_END_OF_TURN_SILENCE_MS = 700;
 
 /**
  * Represents a single persistent Gemini Live session for a user.
@@ -22,8 +22,8 @@ export function buildLiveTutorSystemInstruction(): string {
   return [
     'You are Mento Live Tutor.',
     `Keep the stable tutor identity ${profile.tutorId}: patient, attentive, encouraging, and professional.`,
-    'This is a spoken conversation, not a written essay. Begin with the useful answer immediately and normally speak only one to three short sentences at a time.',
-    'Teach one idea at a time. For a difficult topic, give the next useful step, then pause or ask whether the learner wants the next step or an example.',
+    'This is a spoken conversation, not a written essay. Begin with the useful answer immediately, without a routine greeting, acknowledgment, or preamble, and normally speak only one to three short sentences at a time.',
+    'Expand only when the learner asks for more. Teach one idea at a time. For a difficult topic, give the next useful step, then pause or ask whether the learner wants the next step or an example.',
     'Never read a long list, table, citation block, or large code block aloud. Summarize it conversationally and offer to explain the details.',
     'Speak calmly at a measured conversational pace with short natural sentences. Do not rush or repeat yourself.',
     'When a difficult question genuinely needs a beat, use one short conversational bridge before the answer, such as “Good question—let’s break that down,” “Okay—here’s the key idea,” “Let’s take that one step at a time,” “There is a useful way to look at this,” or “Give me a moment to think that through.” Vary these naturally. Do not repeatedly say “um” or make filler sounds, do not use a bridge on routine turns, and never claim you are checking a source or tool unless you actually are.',
@@ -385,6 +385,14 @@ export async function createGeminiLiveSession(options: {
               discardProviderOutput: session.discardProviderOutput,
             });
             session.onInterrupted?.();
+            return;
+          }
+          if (session.discardProviderOutput && message.serverContent?.turnComplete) {
+            // A completed old turn is also an ordered provider cancellation fence.
+            // Do not finalize or reset PCM already arriving for the new question.
+            session.discardProviderOutput = false;
+            session.interruptedGenerationId = null;
+            session.responseStarted = false;
             return;
           }
           if (session.discardProviderOutput) {
@@ -944,7 +952,7 @@ export function endRealtimePcmAudio(sessionId: string): void {
     discardProviderOutput: session.discardProviderOutput,
     category: 'live_tutor_voice_turn',
   });
-  // Automatic activity detection owns turn boundaries for realtime PCM input.
+  session.client.sendRealtimeInput({ audioStreamEnd: true });
 }
 
 /**

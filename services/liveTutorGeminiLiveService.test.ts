@@ -1,3 +1,5 @@
+import type { createGeminiLiveSession } from './liveTutorGeminiLiveService';
+type AudioCallback = NonNullable<NonNullable<Parameters<typeof createGeminiLiveSession>[0]>['onAudioChunk']>;
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const logger = await import('../lib/logger');
@@ -40,6 +42,7 @@ it('uses a concise, natural live tutor system prompt', async () => {
   const prompt = buildLiveTutorSystemInstruction();
 
   expect(prompt).toContain('one to three short sentences');
+  expect(prompt).toContain('without a routine greeting, acknowledgment, or preamble');
   expect(prompt).toContain('Never read a long list');
   expect(prompt).toContain('Focus on the newest completed user turn');
   expect(prompt).toContain('Stop immediately when interrupted');
@@ -150,7 +153,7 @@ describe('Gemini Live PCM lifecycle', () => {
       startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
       endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
       prefixPaddingMs: 20,
-      silenceDurationMs: 900,
+      silenceDurationMs: 700,
     });
 
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
@@ -221,9 +224,11 @@ describe('Gemini Live PCM lifecycle', () => {
     sendRealtimePcmAudio(session.sessionId, pcm);
     endRealtimePcmAudio(session.sessionId);
 
-    expect(sendRealtimeInput).toHaveBeenCalledTimes(2);
+    expect(sendRealtimeInput).toHaveBeenCalledTimes(4);
     expect(sendRealtimeInput).toHaveBeenNthCalledWith(1, expect.objectContaining({ audio: expect.any(Object) }));
-    expect(sendRealtimeInput).toHaveBeenNthCalledWith(2, expect.objectContaining({ audio: expect.any(Object) }));
+    expect(sendRealtimeInput).toHaveBeenNthCalledWith(2, { audioStreamEnd: true });
+    expect(sendRealtimeInput).toHaveBeenNthCalledWith(3, expect.objectContaining({ audio: expect.any(Object) }));
+    expect(sendRealtimeInput).toHaveBeenNthCalledWith(4, { audioStreamEnd: true });
     expect(session.status).toBe('active');
 
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
@@ -257,13 +262,15 @@ describe('Gemini Live PCM lifecycle', () => {
 
     expect(session.turnNumber).toBe(2);
     expect(session.inputActivityEnded).toBe(true);
-    expect(sendRealtimeInput).toHaveBeenCalledTimes(2);
-    expect(sendRealtimeInput).toHaveBeenNthCalledWith(2, expect.objectContaining({ audio: expect.any(Object) }));
+    expect(sendRealtimeInput).toHaveBeenCalledTimes(3);
+    expect(sendRealtimeInput).toHaveBeenNthCalledWith(1, expect.objectContaining({ audio: expect.any(Object) }));
+    expect(sendRealtimeInput).toHaveBeenNthCalledWith(2, { audioStreamEnd: true });
+    expect(sendRealtimeInput).toHaveBeenNthCalledWith(3, expect.objectContaining({ audio: expect.any(Object) }));
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });
 
   it('ignores provider audio that arrives after generation cancellation', async () => {
-    const onAudioChunk = vi.fn(async () => undefined);
+    const onAudioChunk = vi.fn<AudioCallback>(async () => undefined);
     const { closeGeminiLiveSession, createGeminiLiveSession, interruptGeminiLiveSession, sendRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
     const session = await createGeminiLiveSession({ streamId: 'stream-generation', onAudioChunk });
     const pcm = new Uint8Array([1, 2]);
@@ -286,7 +293,7 @@ describe('Gemini Live PCM lifecycle', () => {
   });
 
   it('drops delayed interrupted audio after new PCM starts, then accepts new response audio', async () => {
-    const onAudioChunk = vi.fn(async () => undefined);
+    const onAudioChunk = vi.fn<AudioCallback>(async () => undefined);
     const { closeGeminiLiveSession, createGeminiLiveSession, interruptGeminiLiveSession, sendRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
     const session = await createGeminiLiveSession({ streamId: 'stream-delayed-interruption', onAudioChunk });
     const pcm = new Uint8Array([1, 2]);
@@ -312,8 +319,24 @@ describe('Gemini Live PCM lifecycle', () => {
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });
 
+  it('accepts new audio after the cancelled provider turn completes without an interruption event', async () => {
+    const onAudioChunk = vi.fn<AudioCallback>(async () => undefined);
+    const { createGeminiLiveSession, closeGeminiLiveSession, interruptGeminiLiveSession, sendRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
+    const session = await createGeminiLiveSession({ onAudioChunk });
+    sendRealtimePcmAudio(session.sessionId, new Uint8Array([1, 2]));
+    interruptGeminiLiveSession(session.sessionId);
+    sendRealtimePcmAudio(session.sessionId, new Uint8Array([3, 4]));
+    geminiCallbacks.onmessage({ serverContent: { turnComplete: true } });
+    expect(session.inputActivityEnded).toBe(false);
+    geminiCallbacks.onmessage({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AQI=', mimeType: 'audio/pcm;rate=24000' } }] } } });
+    await session.audioCallbackQueue;
+    expect(onAudioChunk).toHaveBeenCalledOnce();
+    expect(onAudioChunk.mock.calls[0][3]).toBe(session.generationId);
+    await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
+  });
+
   it('keeps one Gemini session usable for ten turns across an interruption', async () => {
-    const onAudioChunk = vi.fn(async () => undefined);
+    const onAudioChunk = vi.fn<AudioCallback>(async () => undefined);
     const { closeGeminiLiveSession, createGeminiLiveSession, interruptGeminiLiveSession, sendRealtimePcmAudio, endRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
     const session = await createGeminiLiveSession({ streamId: 'stream-ten-turns', onAudioChunk });
     const pcm = new Uint8Array([1, 2]);
@@ -335,9 +358,9 @@ describe('Gemini Live PCM lifecycle', () => {
 
     expect(session.turnNumber).toBe(10);
     expect(session.status).toBe('active');
-    expect(sendRealtimeInput).toHaveBeenCalledTimes(10);
+    expect(sendRealtimeInput).toHaveBeenCalledTimes(20);
     expect(onAudioChunk).toHaveBeenCalledTimes(10);
-    expect((onAudioChunk.mock.calls as unknown[][]).map((call) => call[3])).toEqual([1, 2, 3, 4, 5, 7, 8, 9, 10, 11]);
+    expect(onAudioChunk.mock.calls.map((call) => call[3])).toEqual([1, 2, 3, 4, 5, 7, 8, 9, 10, 11]);
 
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });

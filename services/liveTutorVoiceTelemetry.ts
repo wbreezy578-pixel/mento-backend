@@ -2,6 +2,7 @@ import logger from '../lib/logger';
 import { observeLiveTutorVoiceLatency } from '../lib/metrics';
 
 export const LIVE_TUTOR_VOICE_EVENTS = [
+  'RESPONSE_STARTING', 'THINKING_STARTED', 'THINKING_ENDED', 'RESPONSE_STARTED', 'INTERRUPTION_STARTED', 'SIMLI_SPEAKING_SIGNAL',
   'USER_SPEECH_STARTED',
   'USER_SPEECH_ENDED',
   'USER_AUDIO_LAST_CHUNK_SENT',
@@ -10,6 +11,7 @@ export const LIVE_TUTOR_VOICE_EVENTS = [
   'GEMINI_FIRST_MESSAGE',
   'GEMINI_FIRST_OUTPUT_TRANSCRIPT',
   'GEMINI_FIRST_AUDIO_RECEIVED',
+  'CLIENT_SPEECH_END_RECEIVED', 'GEMINI_AUDIO_STREAM_END_SENT',
   'GEMINI_RESAMPLE_STARTED',
   'GEMINI_RESAMPLE_ENDED',
   'BACKEND_FIRST_PCM_16K_SENT',
@@ -39,6 +41,7 @@ function keyFor(identity: VoiceTelemetryIdentity): string {
 }
 
 const deviceEvents = new Set<LiveTutorVoiceEvent>([
+  'RESPONSE_STARTING', 'THINKING_STARTED', 'THINKING_ENDED', 'RESPONSE_STARTED', 'INTERRUPTION_STARTED', 'SIMLI_SPEAKING_SIGNAL',
   'USER_SPEECH_STARTED', 'USER_SPEECH_ENDED', 'USER_AUDIO_LAST_CHUNK_SENT',
   'FRONTEND_FIRST_PCM_RECEIVED', 'SIMLI_FIRST_AUDIO_PLAYED',
   'AVATAR_AUDIO_PLAYBACK_COMPLETE', 'LISTENING_REOPENED',
@@ -60,9 +63,18 @@ export function metrics(timeline: Timeline) {
   };
 
   return {
+    speechEndedToThinkingStateMs: delta('USER_SPEECH_ENDED', 'THINKING_STARTED'),
+    speechEndedToResponseStartingMs: delta('USER_SPEECH_ENDED', 'RESPONSE_STARTING'),
+    speechEndedToResponseStartedMs: delta('USER_SPEECH_ENDED', 'RESPONSE_STARTED'),
+    responseStartedToFirstAudioMs: delta('RESPONSE_STARTED', 'FRONTEND_FIRST_PCM_RECEIVED'),
+    totalThinkingStateDurationMs: delta('THINKING_STARTED', 'THINKING_ENDED'),
+    interruptionToListeningMs: delta('INTERRUPTION_STARTED', 'LISTENING_REOPENED'),
+    firstAudioToSimliSpeakingSignalMs: delta('FRONTEND_FIRST_PCM_RECEIVED', 'SIMLI_SPEAKING_SIGNAL'),
     userSpeechEndToGeminiFirstMessageMs: delta('USER_SPEECH_ENDED', 'GEMINI_FIRST_MESSAGE'),
     userSpeechEndToGeminiTurnCommitMs: delta('USER_SPEECH_ENDED', 'GEMINI_TURN_COMMITTED'),
     userSpeechEndToGeminiFirstAudioMs: delta('USER_SPEECH_ENDED', 'GEMINI_FIRST_AUDIO_RECEIVED'),
+    backendSpeechEndToGeminiFirstAudioMs: delta('CLIENT_SPEECH_END_RECEIVED', 'GEMINI_FIRST_AUDIO_RECEIVED'),
+    speechEndForwardingMs: delta('CLIENT_SPEECH_END_RECEIVED', 'GEMINI_AUDIO_STREAM_END_SENT'),
     geminiFirstAudioToResampleStartMs: delta('GEMINI_FIRST_AUDIO_RECEIVED', 'GEMINI_RESAMPLE_STARTED'),
     resampleDurationMs: delta('GEMINI_RESAMPLE_STARTED', 'GEMINI_RESAMPLE_ENDED'),
     geminiAudioToBackendPcmSentMs: delta('GEMINI_FIRST_AUDIO_RECEIVED', 'BACKEND_FIRST_PCM_16K_SENT'),

@@ -66,6 +66,42 @@ function readOptionalEnv(name: string): string | undefined {
   }
 }
 
+function adaptWifCredentialsForAzureContainerApps(credentials: Record<string, unknown>): Record<string, unknown> {
+  const identityEndpoint = readOptionalEnv('IDENTITY_ENDPOINT');
+  const identityHeader = readOptionalEnv('IDENTITY_HEADER');
+  if (!identityEndpoint && !identityHeader) return credentials;
+  if (!identityEndpoint || !identityHeader) {
+    throw new Error('Azure Container Apps managed identity is incompletely configured.');
+  }
+
+  const credentialSource = credentials.credential_source;
+  if (!credentialSource || typeof credentialSource !== 'object' || Array.isArray(credentialSource)) {
+    throw new Error('GOOGLE_PLAY_WIF_CONFIG_JSON is missing its credential_source.');
+  }
+  const sourceUrl = (credentialSource as Record<string, unknown>).url;
+  if (typeof sourceUrl !== 'string') {
+    throw new Error('GOOGLE_PLAY_WIF_CONFIG_JSON credential_source URL is invalid.');
+  }
+
+  try {
+    const resource = new URL(sourceUrl).searchParams.get('resource');
+    if (!resource) throw new Error('missing resource');
+    const containerAppsUrl = new URL(identityEndpoint);
+    containerAppsUrl.searchParams.set('resource', resource);
+    containerAppsUrl.searchParams.set('api-version', '2019-08-01');
+    return {
+      ...credentials,
+      credential_source: {
+        ...(credentialSource as Record<string, unknown>),
+        url: containerAppsUrl.toString(),
+        headers: { 'X-IDENTITY-HEADER': identityHeader },
+      },
+    };
+  } catch (error) {
+    throw new Error('Unable to configure Google Play WIF for Azure Container Apps.', { cause: error });
+  }
+}
+
 function parseGooglePlayCredentials(): Record<string, unknown> {
   const wifConfig = readOptionalEnv('GOOGLE_PLAY_WIF_CONFIG_JSON');
   const serviceAccount = wifConfig ? undefined : readOptionalEnv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
@@ -76,14 +112,17 @@ function parseGooglePlayCredentials(): Record<string, unknown> {
     throw new Error('Google Play authentication is not configured. Set GOOGLE_PLAY_WIF_CONFIG_JSON or GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.');
   }
 
+  let value: unknown;
   try {
-    const value = JSON.parse(raw) as unknown;
+    value = JSON.parse(raw) as unknown;
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid object');
     if (wifConfig && (value as Record<string, unknown>).type !== 'external_account') throw new Error('invalid external-account type');
-    return value as Record<string, unknown>;
   } catch (error) {
     throw new Error(`${variableName} is not valid Google Auth configuration JSON.`, { cause: error });
   }
+  return wifConfig
+    ? adaptWifCredentialsForAzureContainerApps(value as Record<string, unknown>)
+    : value as Record<string, unknown>;
 }
 
 async function googlePublisherRequest<T>(path: string, init?: RequestInit): Promise<T> {

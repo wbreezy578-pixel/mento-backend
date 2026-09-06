@@ -1159,6 +1159,25 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
     ? { ...validatedInput.metadata, pricingSource: GEMINI_PRICING_SOURCE, pricingVersion: GEMINI_PRICING_VERSION }
     : validatedInput.metadata;
 
+  // A provider may finish after its pending reservation was never persisted
+  // (for example, a process interruption between provider/session creation and
+  // reservation persistence). Recover through the normal idempotent reservation
+  // path before entering the per-user transaction queue. Calling reserveUsage
+  // from inside the callback below would attempt to acquire the same queue twice
+  // and self-deadlock until the bounded queue timeout fires.
+  const existingBeforeFinalize = await prisma.usageLog.findUnique({
+    where: {
+      provider_requestId: {
+        provider,
+        requestId: validatedInput.requestId,
+      },
+    },
+    select: { id: true },
+  });
+  if (!existingBeforeFinalize) {
+    return reserveUsage({ ...validatedInput, success: true });
+  }
+
   try {
     return await runTransactionWithRetries(validatedInput.userId, async (tx) => {
       const existing = await tx.usageLog.findUnique({
@@ -1170,9 +1189,7 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
         },
       });
 
-      if (!existing) {
-        return reserveUsage({ ...validatedInput, success: true });
-      }
+      if (!existing) throw new Error('Usage reservation disappeared during finalization. Please retry.');
 
       if (existing.success === false && isNonCompletedGenerationOutcome(existing.metadata)) {
         const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);

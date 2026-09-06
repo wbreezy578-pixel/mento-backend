@@ -111,6 +111,18 @@ describe('AI billing operation security', () => {
     expect(rollbackBody).toContain('No usage reservation existed to roll back.');
   });
 
+  it('does not recursively reserve usage while finalizing a missing reservation', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'services/billingService.ts'), 'utf8');
+    const start = source.indexOf('export async function finalizeUsage(');
+    const end = source.indexOf('\nasync function reconcileNonCompletedUsage(', start);
+    const body = source.slice(start, end);
+    const transactionStart = body.indexOf('return await runTransactionWithRetries');
+    const transactionBody = body.slice(transactionStart);
+
+    expect(body).toContain('const existingBeforeFinalize = await prisma.usageLog.findUnique');
+    expect(transactionBody).not.toContain('return reserveUsage(');
+  });
+
   it('serializes concurrent billing work for one user', async () => {
     const queue = createKeyedTransactionQueue(1_000);
     let active = 0;

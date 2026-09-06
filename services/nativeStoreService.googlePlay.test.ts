@@ -28,7 +28,10 @@ const mocks = vi.hoisted(() => {
     GoogleAuth: vi.fn(function GoogleAuthMock() {
       return { getClient: vi.fn(async () => googleClient) };
     }),
-    getRequiredEnv: vi.fn(() => '{}'),
+    getRequiredEnv: vi.fn((name: string) => {
+      if (name === 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON') return '{"type":"service_account"}';
+      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
+    }),
     startPayment: vi.fn(),
     finalizePayment: vi.fn(),
     applyVerifiedEntitlementEvent: vi.fn(),
@@ -82,6 +85,10 @@ function setGoogleResponse(overrides: Record<string, unknown> = {}) {
 describe('verifyGooglePlayPurchase Google subscriptions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.getRequiredEnv.mockImplementation((name: string) => {
+      if (name === 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON') return '{"type":"service_account"}';
+      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
+    });
     vi.stubGlobal('fetch', mocks.fetch);
     mocks.googleClient.getAccessToken.mockResolvedValue({ token: 'test-access-token' });
     mocks.prisma.storePurchase.findUnique.mockResolvedValue({ userId: purchase.userId });
@@ -101,6 +108,52 @@ describe('verifyGooglePlayPurchase Google subscriptions', () => {
       autoRenewingPlan: { autoRenewEnabled: true },
     }];
     setGoogleResponse();
+  });
+
+  it('selects WIF configuration when present', async () => {
+    mocks.getRequiredEnv.mockImplementation((name: string) => {
+      if (name === 'GOOGLE_PLAY_WIF_CONFIG_JSON') return '{"type":"external_account","audience":"test"}';
+      if (name === 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON') return '{"type":"service_account"}';
+      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
+    });
+
+    await verifyGooglePlayPurchase(purchase);
+
+    expect(mocks.GoogleAuth).toHaveBeenCalledWith(expect.objectContaining({
+      credentials: { type: 'external_account', audience: 'test' },
+      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    }));
+  });
+
+  it('falls back to service-account configuration when WIF is absent', async () => {
+    await verifyGooglePlayPurchase(purchase);
+
+    expect(mocks.GoogleAuth).toHaveBeenCalledWith(expect.objectContaining({
+      credentials: { type: 'service_account' },
+    }));
+  });
+
+  it('fails closed when neither credential method is configured', async () => {
+    mocks.getRequiredEnv.mockImplementation((name: string) => {
+      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
+    });
+
+    await expect(verifyGooglePlayPurchase(purchase)).rejects.toThrow(
+      'Google Play authentication is not configured. Set GOOGLE_PLAY_WIF_CONFIG_JSON or GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.',
+    );
+    expect(mocks.GoogleAuth).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed WIF JSON without contacting Google Auth', async () => {
+    mocks.getRequiredEnv.mockImplementation((name: string) => {
+      if (name === 'GOOGLE_PLAY_WIF_CONFIG_JSON') return '{malformed';
+      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
+    });
+
+    await expect(verifyGooglePlayPurchase(purchase)).rejects.toThrow(
+      'GOOGLE_PLAY_WIF_CONFIG_JSON is not valid Google Auth configuration JSON.',
+    );
+    expect(mocks.GoogleAuth).not.toHaveBeenCalled();
   });
 
   it('verifies an initial active purchase and records its order identity', async () => {

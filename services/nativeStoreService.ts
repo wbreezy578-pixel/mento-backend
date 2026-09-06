@@ -57,19 +57,38 @@ function isNativeStoreProductId(value: string): value is NativeStoreProductId {
   return Object.prototype.hasOwnProperty.call(PRODUCT_CATALOG, value);
 }
 
-function parseServiceAccount(): Record<string, unknown> {
+function readOptionalEnv(name: string): string | undefined {
   try {
-    const value = JSON.parse(getRequiredEnv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON')) as unknown;
+    return getRequiredEnv(name);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes(`Environment variable "${name}" is required`)) return undefined;
+    throw error;
+  }
+}
+
+function parseGooglePlayCredentials(): Record<string, unknown> {
+  const wifConfig = readOptionalEnv('GOOGLE_PLAY_WIF_CONFIG_JSON');
+  const serviceAccount = wifConfig ? undefined : readOptionalEnv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
+  const raw = wifConfig ?? serviceAccount;
+  const variableName = wifConfig ? 'GOOGLE_PLAY_WIF_CONFIG_JSON' : 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON';
+
+  if (!raw) {
+    throw new Error('Google Play authentication is not configured. Set GOOGLE_PLAY_WIF_CONFIG_JSON or GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.');
+  }
+
+  try {
+    const value = JSON.parse(raw) as unknown;
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid object');
+    if (wifConfig && (value as Record<string, unknown>).type !== 'external_account') throw new Error('invalid external-account type');
     return value as Record<string, unknown>;
   } catch (error) {
-    throw new Error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is not valid JSON.', { cause: error });
+    throw new Error(`${variableName} is not valid Google Auth configuration JSON.`, { cause: error });
   }
 }
 
 async function googlePublisherRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const auth = new GoogleAuth({
-    credentials: parseServiceAccount(),
+    credentials: parseGooglePlayCredentials(),
     scopes: ['https://www.googleapis.com/auth/androidpublisher'],
   });
   const client = await auth.getClient();

@@ -37,6 +37,8 @@ param paddleTopUp50PriceId string = ''
 param paddleTopUp100PriceId string = ''
 param paddleCheckoutUrl string = ''
 @secure()
+param googlePlayWifConfigJson string = ''
+@secure()
 param googlePlayServiceAccountJson string = ''
 param googlePlayRtdnAudience string = ''
 param googlePlayRtdnServiceAccountEmail string = ''
@@ -133,6 +135,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'paddle-webhook-secret'
           value: paddleNotificationWebhookSecret
+        }
+        {
+          name: 'google-play-wif-config-json'
+          value: googlePlayWifConfigJson
         }
         {
           name: 'google-play-service-account-json'
@@ -343,6 +349,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'PADDLE_CHECKOUT_URL'
               value: paddleCheckoutUrl
+            }
+            {
+              name: 'GOOGLE_PLAY_WIF_CONFIG_JSON'
+              secretRef: 'google-play-wif-config-json'
             }
             {
               name: 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'

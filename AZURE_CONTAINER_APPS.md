@@ -30,7 +30,9 @@ Application startup intentionally does not run migrations. This prevents ordinar
 
 Android launch requires these Azure values in addition to the core database, Redis, Gemini, Supabase, and Simli settings:
 
-- `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`: the complete JSON for the Play Console-linked service account; store as a Container App secret.
+- `GOOGLE_PLAY_WIF_CONFIG_JSON`: preferred Google external-account credential configuration generated for the Azure Container App managed identity; store as a Container App secret.
+- `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`: backwards-compatible fallback containing the complete JSON for the Play Console-linked service account; store as a Container App secret when WIF is unavailable.
+- The backend prefers `GOOGLE_PLAY_WIF_CONFIG_JSON` when both credentials are present.
 - `GOOGLE_PLAY_RTDN_AUDIENCE`: the exact public RTDN endpoint URL, ending in `/api/payments/mobile/google-rtdn`.
 - `GOOGLE_PLAY_RTDN_SERVICE_ACCOUNT_EMAIL`: the service identity configured on the Pub/Sub push subscription.
 

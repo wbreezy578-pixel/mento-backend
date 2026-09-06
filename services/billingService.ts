@@ -20,6 +20,7 @@ import {
   GeminiDailyBudgetUnavailableError,
   isNormalChatGeminiBudgetSubject,
 } from './geminiDailyBudget';
+import { createKeyedTransactionQueue } from './billingTransactionQueue';
 
 // LiveTutorWallet.minutesBalance is stored in minutes; live_tutor amounts are always passed in seconds.
 const SECONDS_PER_MINUTE = 60;
@@ -380,6 +381,13 @@ const MAX_TRANSACTION_RETRIES = 6;
 const TRANSACTION_RETRY_BASE_DELAY_MS = 150;
 const TRANSACTION_RETRY_MAX_DELAY_MS = 900;
 const TRANSACTION_CONCURRENCY_LIMIT = 6;
+const configuredUserQueueTimeoutMs = Number.parseInt(
+  process.env.BILLING_USER_TRANSACTION_QUEUE_TIMEOUT_MS ?? '15000',
+  10,
+);
+const USER_TRANSACTION_QUEUE_TIMEOUT_MS = Number.isFinite(configuredUserQueueTimeoutMs)
+  ? Math.max(1_000, configuredUserQueueTimeoutMs)
+  : 15_000;
 
 function createSemaphore(maxConcurrency: number) {
   let current = 0;
@@ -411,44 +419,15 @@ function createSemaphore(maxConcurrency: number) {
 }
 
 const transactionSemaphore = createSemaphore(TRANSACTION_CONCURRENCY_LIMIT);
-const userTransactionQueues = new Map<string, Array<(release: () => void) => void>>();
-const activeUserTransactions = new Set<string>();
-
-async function acquireUserTransactionLock(userId: string): Promise<() => void> {
-  if (!activeUserTransactions.has(userId)) {
-    activeUserTransactions.add(userId);
-    return () => releaseUserTransactionLock(userId);
-  }
-
-  return new Promise((resolve) => {
-    const queue = userTransactionQueues.get(userId) ?? [];
-    queue.push(resolve);
-    userTransactionQueues.set(userId, queue);
-  });
-}
-
-function releaseUserTransactionLock(userId: string) {
-  const queue = userTransactionQueues.get(userId) ?? [];
-  if (queue.length > 0) {
-    const next = queue.shift();
-    if (next) {
-      next(() => releaseUserTransactionLock(userId));
-    }
-    if (queue.length === 0) {
-      userTransactionQueues.delete(userId);
-    }
-    return;
-  }
-
-  activeUserTransactions.delete(userId);
-}
+const userTransactionQueue = createKeyedTransactionQueue(USER_TRANSACTION_QUEUE_TIMEOUT_MS);
 
 async function runTransactionWithRetries<T>(userId: string, callback: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
   const startedAt = Date.now();
   const releaseTransaction = await transactionSemaphore.acquire();
-  const releaseUserLock = await acquireUserTransactionLock(userId);
+  let releaseUserLock: (() => void) | undefined;
 
   try {
+    releaseUserLock = await userTransactionQueue.acquire(userId);
     let attempt = 0;
     while (true) {
       try {
@@ -482,7 +461,7 @@ async function runTransactionWithRetries<T>(userId: string, callback: (tx: Prism
       }
     }
   } finally {
-    releaseUserLock();
+    releaseUserLock?.();
     releaseTransaction();
   }
 }
@@ -1494,7 +1473,7 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
   const provider = validatedInput.provider;
 
   try {
-    return await runTransactionWithRetries(validatedInput.userId, async (tx) => {
+    const result = await runTransactionWithRetries(validatedInput.userId, async (tx) => {
       const existing = await tx.usageLog.findUnique({
         where: {
           provider_requestId: {
@@ -1505,7 +1484,7 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
       });
 
       if (!existing) {
-        return reserveUsage({ ...validatedInput, success: false });
+        return null;
       }
 
       if (existing.success === true) {
@@ -1652,6 +1631,25 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
         validatedInput.modelUsed ?? plan.chatModel,
       );
     });
+    if (result) return result;
+
+    // A rollback is cleanup for an existing reservation, not authority to
+    // create a new usage record. Missing means there is nothing to reverse.
+    const decision = await getBillingDecision({
+      ...validatedInput,
+      pending: false,
+      success: false,
+    });
+    return {
+      ...decision,
+      allowed: false,
+      reason: 'No usage reservation existed to roll back.',
+      ledgerId: null,
+      idempotent: true,
+      providerCostUSD: 0,
+      userChargeUSD: 0,
+      profitUSD: 0,
+    };
   } catch (error) {
     console.error('[billingService] rollbackUsage transaction failed', {
       userId: validatedInput.userId,

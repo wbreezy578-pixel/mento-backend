@@ -1,6 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import { AIRequestGatewayError, buildBoundAIRequestId, buildInitialAIRequestId, requireClientAIRequestId } from './aiSecurityGateway';
 import { resolveDailyMessageAbuseLimit } from './rate-limiter';
+import { BillingTransactionQueueTimeoutError, createKeyedTransactionQueue } from '../services/billingTransactionQueue';
 
 describe('AI billing operation security', () => {
   it('binds a client operation to its user, conversation, operation and payload', () => {
@@ -97,5 +100,56 @@ describe('AI billing operation security', () => {
     expect(resolveDailyMessageAbuseLimit(undefined)).toBe(-1);
     expect(resolveDailyMessageAbuseLimit('500')).toBe(500);
     expect(resolveDailyMessageAbuseLimit('invalid')).toBe(-1);
+  });
+
+  it('does not recursively reserve usage while rolling back a missing reservation', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'services/billingService.ts'), 'utf8');
+    const start = source.indexOf('export async function rollbackUsage(');
+    const rollbackBody = source.slice(start);
+
+    expect(rollbackBody).not.toContain('return reserveUsage(');
+    expect(rollbackBody).toContain('No usage reservation existed to roll back.');
+  });
+
+  it('serializes concurrent billing work for one user', async () => {
+    const queue = createKeyedTransactionQueue(1_000);
+    let active = 0;
+    let maximumActive = 0;
+    let mutations = 0;
+    const run = async () => {
+      const release = await queue.acquire('user-1');
+      try {
+        active += 1;
+        maximumActive = Math.max(maximumActive, active);
+        mutations += 1;
+        await Promise.resolve();
+        active -= 1;
+      } finally {
+        release();
+      }
+    };
+
+    await Promise.all([run(), run(), run()]);
+    expect(maximumActive).toBe(1);
+    expect(mutations).toBe(3);
+  });
+
+  it('removes a timed-out waiter and allows the next billing operation', async () => {
+    vi.useFakeTimers();
+    try {
+      const queue = createKeyedTransactionQueue(50);
+      const releaseFirst = await queue.acquire('user-1');
+      const blocked = queue.acquire('user-1');
+      const rejection = expect(blocked).rejects.toBeInstanceOf(BillingTransactionQueueTimeoutError);
+
+      await vi.advanceTimersByTimeAsync(50);
+      await rejection;
+      releaseFirst();
+
+      const releaseNext = await queue.acquire('user-1');
+      releaseNext();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1,7 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import logger from '../lib/logger';
-import { cancelPaddleSubscriptionForAccountDeletion } from './paddleService';
 import { cancelGooglePlaySubscriptionsForAccountDeletion } from './nativeStoreService';
 import { deleteSupabaseAuthUser } from './supabaseAdminService';
 import {
@@ -21,15 +20,12 @@ export async function beginAccountDeletion(userId: string) {
   return prisma.$transaction(async (tx) => {
     const existing = await tx.accountDeletionJob.findUnique({ where: { userId } });
     if (existing) return existing;
-    const [user, wallet] = await Promise.all([
-      tx.user.findUnique({ where: { id: userId }, select: { id: true, supabaseUserId: true } }),
-      tx.userWallet.findUnique({ where: { userId }, select: { paddleSubscriptionId: true } }),
-    ]);
+    const user = await tx.user.findUnique({ where: { id: userId }, select: { id: true, supabaseUserId: true } });
     if (!user) throw new Error('User not found');
     await tx.user.update({ where: { id: userId }, data: { accountStatus: 'DELETION_PENDING', credentialsChangedAt: new Date() } });
     await tx.session.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
     return tx.accountDeletionJob.create({
-      data: { userId, supabaseUserId: user.supabaseUserId, paddleSubscriptionId: wallet?.paddleSubscriptionId ?? null },
+      data: { userId, supabaseUserId: user.supabaseUserId },
     });
   });
 }
@@ -78,11 +74,6 @@ export async function processAccountDeletionJob(jobId: string) {
   let failureCode: AccountDeletionFailureCode = 'internal_delete_failed';
 
   try {
-    if (!job.paddleCanceledAt) {
-      failureCode = 'paddle_cancel_failed';
-      if (job.paddleSubscriptionId) await cancelPaddleSubscriptionForAccountDeletion(job.paddleSubscriptionId);
-      await prisma.accountDeletionJob.update({ where: { id: job.id }, data: { paddleCanceledAt: new Date() } });
-    }
     if (!job.googlePlayCanceledAt) {
       failureCode = 'google_play_cancel_failed';
       await cancelGooglePlaySubscriptionsForAccountDeletion(job.userId);

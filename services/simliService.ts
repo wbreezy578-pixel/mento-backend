@@ -1,4 +1,5 @@
 import logger from '../lib/logger';
+import { liveTutorProviderHttpStatus } from './liveTutorProviderError';
 import { getCircuitBreaker, retryWithBackoff, getClientErrorMessage, getProviderRetryOptions, sanitizeForLogging } from '../lib/resilience';
 import { getSimliApiKey, getSimliAvatarId, getSimliVoiceId, getSimliApiBaseUrl } from '../lib/env';
 import { finalizeUsage, rollbackUsage } from './billingService';
@@ -54,6 +55,8 @@ export function classifyLiveTutorFinalizationTiming(reason: string | undefined):
     normalized === 'transport_recovery_timeout'
     || normalized === 'simli disconnected'
     || normalized === 'screen closed'
+    || normalized === 'unauthorized'
+    || normalized === 'forbidden'
     || normalized.startsWith('voice websocket reconnect grace expired:')
   ) return 'transport_recovery_end';
   if (
@@ -418,7 +421,7 @@ export async function createSimliStreamingAvatarSession(options: {
     const status = typeof (error as { status?: unknown })?.status === 'number'
       ? (error as { status: number }).status
       : undefined;
-    if (status !== undefined) clientError.status = status;
+    clientError.status = liveTutorProviderHttpStatus(status);
     throw clientError;
   }
 }

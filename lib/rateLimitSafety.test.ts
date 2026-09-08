@@ -16,10 +16,11 @@ describe('rate-limit failure safety', () => {
     expect(lockIndex).toBeGreaterThan(rateLimitIndex);
   });
 
-  it('requires distributed rate limiting for every aggregate AI limit', () => {
+  it('requires distributed rate limiting for every aggregate AI limit in production', () => {
     const limiter = source('lib/rate-limiter.ts');
 
-    expect(limiter).toContain('const strict = { requireDistributed: true } as const');
+    expect(limiter).toContain("process.env.NODE_ENV === 'production'");
+    expect(limiter).toContain("process.env.REQUIRE_RATE_LIMIT_REDIS === 'true'");
     expect(limiter).toContain("status: 503, code: 'rate_limiter_unavailable'");
     expect(limiter).toContain('ensureCooldown(userId, MESSAGE_COOLDOWN_MS, strict)');
     expect(limiter).toContain("RATE_WINDOW_SECONDS, 'rl:window', strict");

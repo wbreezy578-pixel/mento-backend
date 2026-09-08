@@ -9,8 +9,6 @@ const DEFAULT_ALLOWED_ORIGINS = [
 ];
 
 const CSP_NONCE_PATTERN = /^[A-Za-z0-9+/_-]{16,128}={0,2}$/;
-const PADDLE_SCRIPT_ORIGIN = 'https://cdn.paddle.com';
-const PADDLE_BROWSER_ORIGIN = 'https://*.paddle.com';
 
 function normalizeAllowedOrigins() {
   const configured = process.env.ALLOWED_ORIGINS?.split(',').map((entry) => entry.trim()).filter(Boolean) ?? [];
@@ -41,7 +39,6 @@ export function buildContentSecurityPolicy(
   }
 
   const isDevelopment = environment !== 'production';
-  const isCheckout = pathname === '/billing/checkout';
   const isSimliDevelopmentPage = isDevelopment && pathname === '/dev/simli-test';
 
   const scriptSources = [
@@ -49,12 +46,10 @@ export function buildContentSecurityPolicy(
     `'nonce-${nonce}'`,
     "'strict-dynamic'",
     ...(isDevelopment ? ["'unsafe-eval'"] : []),
-    ...(isCheckout ? [PADDLE_SCRIPT_ORIGIN] : []),
   ];
   const connectSources = [
     "'self'",
     ...(isDevelopment ? ['ws:', 'wss:'] : []),
-    ...(isCheckout ? [PADDLE_BROWSER_ORIGIN] : []),
     ...(isSimliDevelopmentPage ? ['wss://api.simli.ai', 'wss://*.livekit.cloud'] : []),
   ];
 
@@ -69,7 +64,7 @@ export function buildContentSecurityPolicy(
     `connect-src ${connectSources.join(' ')}`,
     "media-src 'self'",
     "worker-src 'self'",
-    isCheckout ? `frame-src ${PADDLE_BROWSER_ORIGIN}` : "frame-src 'none'",
+    "frame-src 'none'",
     "frame-ancestors 'none'",
     "object-src 'none'",
     "base-uri 'self'",

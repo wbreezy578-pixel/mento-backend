@@ -13,6 +13,41 @@ export function splitPcmIntoSimliFrames(pcm: Uint8Array): Uint8Array[] {
   return frames;
 }
 
+/** Keeps PCM tails across provider chunks so timed delivery only sees 20ms frames. */
+export class StreamingPcmFrameBuffer {
+  private remainder = new Uint8Array(0);
+
+  push(pcm: Uint8Array): Uint8Array[] {
+    validateLiveTutorPcm16(pcm);
+    const combined = new Uint8Array(this.remainder.byteLength + pcm.byteLength);
+    combined.set(this.remainder);
+    combined.set(pcm, this.remainder.byteLength);
+    const completeByteLength = combined.byteLength - (combined.byteLength % SIMLI_PCM_FRAME_BYTES);
+    const frames: Uint8Array[] = [];
+    for (let offset = 0; offset < completeByteLength; offset += SIMLI_PCM_FRAME_BYTES) {
+      frames.push(combined.slice(offset, offset + SIMLI_PCM_FRAME_BYTES));
+    }
+    this.remainder = combined.slice(completeByteLength);
+    return frames;
+  }
+
+  flushPadded(): Uint8Array | null {
+    if (!this.remainder.byteLength) return null;
+    const frame = new Uint8Array(SIMLI_PCM_FRAME_BYTES);
+    frame.set(this.remainder);
+    this.remainder = new Uint8Array(0);
+    return frame;
+  }
+
+  reset(): void {
+    this.remainder = new Uint8Array(0);
+  }
+
+  get remainderBytes(): number {
+    return this.remainder.byteLength;
+  }
+}
+
 export function validateLiveTutorPcm16(pcm: Uint8Array): void {
   if (!(pcm instanceof Uint8Array) || pcm.byteLength === 0 || pcm.byteLength % 2 !== 0) {
     throw new Error('Invalid PCM16 audio chunk.');

@@ -19,7 +19,7 @@ export interface CircuitBreakerState {
 }
 
 export type CircuitBreakerStateName = 'closed' | 'open' | 'half-open';
-export type ProviderName = 'gemini' | 'simli' | 'supabase' | 'mpesa' | 'redis' | 'payment:mpesa' | 'payment:paddle';
+export type ProviderName = 'gemini' | 'simli' | 'supabase' | 'mpesa' | 'redis' | 'payment:mpesa';
 
 interface ProviderRetryConfig {
   timeoutMs: number;
@@ -43,7 +43,6 @@ const providerRetryDefaults: Record<ProviderName, ProviderRetryConfig> = {
   mpesa: { timeoutMs: 10000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 60000, failureThreshold: 3 },
   redis: { timeoutMs: 2000, retries: 1, baseDelayMs: 200, maxDelayMs: 1000, resetTimeoutMs: 30000, failureThreshold: 3 },
   'payment:mpesa': { timeoutMs: 10000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 60000, failureThreshold: 3 },
-  'payment:paddle': { timeoutMs: 10000, retries: 2, baseDelayMs: 400, maxDelayMs: 1600, resetTimeoutMs: 60000, failureThreshold: 3 },
 };
 
 function sleep(ms: number) {

@@ -444,6 +444,7 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
   }
 
   let billingDecision: BillingDecision;
+  const billingStartedAt = Date.now();
   try {
     // For Normal Chat Gemini requests, reserveAIUsage performs the provider-wide
     // daily budget check and creates the estimated pending UsageLog atomically.
@@ -476,6 +477,11 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
       });
     }
     throw error;
+  } finally {
+    observeMonitoringLatency('billing', Date.now() - billingStartedAt, {
+      operation: 'billing-reservation',
+      feature: options.feature,
+    });
   }
 
   if (billingDecision.idempotent) {

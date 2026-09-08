@@ -3,16 +3,13 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { ensureUserBillingSetup } from './economicsService';
 import { ensureDefaultPlans } from './planService';
-import { applyVerifiedEntitlementEvent } from './entitlementService';
 import logger from '../lib/logger';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
 import { trackShutdownOperation } from '../lib/crashRecovery';
-import { getPaddleNotificationWebhookSecret, getPaddleTopUp50PriceId, getPaddleTopUp100PriceId } from '../lib/env';
-import { getPaddleInstance } from '../lib/paddle';
 import '../lib/metrics';
 import { getProductPolicy } from './productPolicy';
 
-export type PaymentProvider = 'MPESA' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE' | 'PADDLE';
+export type PaymentProvider = 'MPESA' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE';
 export type PaymentType = 'SUBSCRIPTION' | 'TOP_UP';
 export type PaymentStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'REQUIRES_ACTION' | 'REFUNDED';
 
@@ -81,14 +78,12 @@ const WEBHOOK_SECRET_ENV_KEYS: Record<PaymentProvider, string> = {
   MPESA: 'PAYMENT_MPESA_WEBHOOK_SECRET',
   GOOGLE_PLAY: 'PAYMENT_GOOGLE_PLAY_WEBHOOK_SECRET',
   APPLE_APP_STORE: 'PAYMENT_APPLE_APP_STORE_WEBHOOK_SECRET',
-  PADDLE: 'PADDLE_NOTIFICATION_WEBHOOK_SECRET',
 };
 
 const PROVIDER_DISPLAY_NAMES: Record<PaymentProvider, string> = {
   MPESA: 'M-Pesa',
   GOOGLE_PLAY: 'Google Play Billing',
   APPLE_APP_STORE: 'Apple App Store',
-  PADDLE: 'Paddle',
 };
 
 function normalizeProvider(value: string): PaymentProvider {
@@ -96,7 +91,6 @@ function normalizeProvider(value: string): PaymentProvider {
     case 'MPESA': return 'MPESA';
     case 'GOOGLE_PLAY': return 'GOOGLE_PLAY';
     case 'APPLE_APP_STORE': return 'APPLE_APP_STORE';
-    case 'PADDLE': return 'PADDLE';
     default: throw new Error('Unsupported payment provider');
   }
 }
@@ -170,34 +164,7 @@ export function buildPaymentIdempotencyKey(input: Pick<StartPaymentInput, 'userI
 }
 
 function getWebhookSecret(provider: PaymentProvider): string {
-  if (provider === 'PADDLE') {
-    return getPaddleNotificationWebhookSecret()?.trim() ?? '';
-  }
-
   return process.env[WEBHOOK_SECRET_ENV_KEYS[provider]]?.trim() ?? '';
-}
-
-/**
- * Maps Paddle product price IDs to live tutor minutes.
- * Returns the minute amount for known Paddle top-up price IDs.
- * Returns null for unknown price IDs (including Pro subscription prices).
- */
-function getPaddleTopUpMinutesForPriceId(priceId: string): number | null {
-  if (!priceId || typeof priceId !== 'string') {
-    return null;
-  }
-
-  const priceId50 = getPaddleTopUp50PriceId();
-  const priceId100 = getPaddleTopUp100PriceId();
-
-  if (priceId === priceId50) {
-    return 50;
-  }
-  if (priceId === priceId100) {
-    return 100;
-  }
-
-  return null;
 }
 
 async function getOrCreateTransaction(input: StartPaymentInput): Promise<PaymentRecord> {
@@ -285,9 +252,6 @@ async function startPaymentInternal(input: StartPaymentInput): Promise<PaymentTr
 
   try {
     const transaction = await getOrCreateTransaction(input);
-    // For Paddle flow, the client will perform checkout via Paddle.js and provide
-    // providerTransactionId/providerCustomerId back to the server when available.
-
     const receipt = await prisma.paymentReceipt.findUnique({ where: { transactionId: transaction.id } });
     observeMonitoringLatency('billing', Date.now() - startedAt, { provider, operation: 'start_payment' });
     return toView({
@@ -412,48 +376,13 @@ async function finalizePaymentInternal(input: {
       }
 
       if (current.type === 'TOP_UP') {
-        // Fix 2: Map Paddle top-up price IDs to exact minute amounts
-        let topUpMinutes: number | null = null;
-        
-        // First try to get price ID from provider payload (Paddle includes this)
-        const providerPayload = asJsonObject(current.providerPayload);
-        const providerData = asJsonObject(providerPayload.data);
-        const items = Array.isArray(providerData.items) ? providerData.items : Array.isArray(providerPayload.items) ? providerPayload.items : [];
-        const firstItem = asJsonObject(items[0]);
-        const price = asJsonObject(firstItem.price);
         const metadata = asJsonObject(current.metadata);
-        const paddlePriceId = String(price.id ?? metadata.priceId ?? '').trim();
-        
-        if (paddlePriceId) {
-          topUpMinutes = getPaddleTopUpMinutesForPriceId(paddlePriceId);
-          if (topUpMinutes === null) {
-            // Unknown Paddle price ID for top-up - log and do not grant minutes
-            logger.warn('Received top-up payment with unknown Paddle price ID', {
-              userId: current.userId,
-              priceId: paddlePriceId,
-              transactionId: current.id,
-            });
-            topUpMinutes = 0; // Explicitly set to 0 to indicate no grant
-          } else {
-            logger.info('Mapped Paddle price ID to top-up minutes', {
-              userId: current.userId,
-              priceId: paddlePriceId,
-              minutes: topUpMinutes,
-              transactionId: current.id,
-            });
-          }
-        } else if (provider !== 'PADDLE') {
-          const configuredMinutes = Number(metadata.topUpMinutes);
-          if (!Number.isSafeInteger(configuredMinutes) || configuredMinutes <= 0) {
-            throw new Error('Verified native-store top-up is missing a valid minute grant.');
-          }
-          topUpMinutes = configuredMinutes;
-        } else {
-          throw new Error('Completed Paddle top-up did not contain a recognized price ID.');
+        const topUpMinutes = Number(metadata.topUpMinutes);
+        if (!Number.isSafeInteger(topUpMinutes) || topUpMinutes <= 0) {
+          throw new Error('Verified native-store top-up is missing a valid minute grant.');
         }
 
-        // Only grant minutes if we have a positive amount
-        if (topUpMinutes && topUpMinutes > 0) {
+        if (topUpMinutes > 0) {
           const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: current.userId } });
           if (wallet) {
             const updated = await tx.liveTutorWallet.update({
@@ -632,95 +561,6 @@ function toView(row: PaymentRecord & { receipt?: { receiptNumber: string; status
   };
 }
 
-export async function refundPaymentByProviderTransaction(
-  providerTransactionId: string,
-  providerPayload: Record<string, unknown>,
-  options?: { adjustmentId?: string; amountMinor?: number; full?: boolean },
-): Promise<boolean> {
-  const existing = await prisma.paymentTransaction.findUnique({ where: { providerTransactionId } });
-  if (!existing || !existing.userId) return false;
-
-  const refundSuccess = await prisma.$transaction(async (tx) => {
-    const fullRefund = options?.full !== false;
-    const amountMinor = Math.min(existing.amountMinor, Math.max(0, options?.amountMinor ?? existing.amountMinor));
-    if (amountMinor === 0) return false;
-    const entryType = `REFUND:${options?.adjustmentId || 'full'}`;
-
-    if (fullRefund) {
-      const claimed = await tx.paymentTransaction.updateMany({
-        where: { id: existing.id, status: 'SUCCEEDED' },
-        data: { status: 'REFUNDED', providerPayload: providerPayload as Prisma.InputJsonValue, lastWebhookAt: new Date() },
-      });
-      if (claimed.count === 0) return false;
-    } else {
-      const duplicate = await tx.paymentLedgerEntry.findFirst({ where: { transactionId: existing.id, entryType } });
-      if (duplicate) return false;
-    }
-
-    const metadata = asJsonObject(existing.metadata);
-    let minutesToRevoke = 0;
-    if (fullRefund && existing.type === 'SUBSCRIPTION') {
-      minutesToRevoke = Math.ceil(getProductPolicy('PRO').liveTutor.includedSecondsPerPeriod / 60);
-      // Phase 4C: Subscription refund entitlement state (plan downgrade, status revocation)
-      // is now handled by applyVerifiedEntitlementEvent() after this transaction succeeds.
-      // Finalization is payment-only: it records the refund in payment ledger and updates receipt.
-    } else if (fullRefund && metadata.sku === 'topup_50') {
-      minutesToRevoke = 50;
-    } else if (fullRefund && metadata.sku === 'topup_100') {
-      minutesToRevoke = 100;
-    }
-
-    if (minutesToRevoke > 0) {
-      const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: existing.userId! } });
-      if (wallet) {
-        await tx.liveTutorWallet.update({
-          where: { userId: existing.userId! },
-          data: fullRefund && existing.type === 'SUBSCRIPTION'
-            ? { minutesBalance: Math.max(0, wallet.minutesBalance - minutesToRevoke), includedSeconds: 0 }
-            : { minutesBalance: Math.max(0, wallet.minutesBalance - minutesToRevoke), topUpSeconds: Math.max(0, wallet.topUpSeconds - minutesToRevoke * 60) },
-        });
-      }
-    }
-
-    const previousEntry = await tx.paymentLedgerEntry.findFirst({ where: { userId: existing.userId }, orderBy: { createdAt: 'desc' } });
-    await tx.paymentLedgerEntry.create({
-      data: {
-        userId: existing.userId,
-        transactionId: existing.id,
-        entryType,
-        amountUsd: -(amountMinor / 100),
-        amountMinor: -amountMinor,
-        currency: existing.currency,
-        balanceAfter: (previousEntry?.balanceAfter ?? 0) - amountMinor / 100,
-        referenceType: 'REFUND',
-        referenceId: existing.id,
-        description: 'Paddle refund applied',
-        metadata: { providerTransactionId, adjustmentId: options?.adjustmentId, fullRefund } as Prisma.InputJsonValue,
-      },
-    });
-    await tx.paymentReceipt.updateMany({ where: { transactionId: existing.id }, data: { status: fullRefund ? 'REFUNDED' : 'PARTIALLY_REFUNDED' } });
-    return true;
-  });
-
-  // Phase 4C: Route subscription refund through canonical entitlement boundary
-  if (refundSuccess && options?.full !== false && existing.type === 'SUBSCRIPTION' && existing.providerTransactionId) {
-    await applyVerifiedEntitlementEvent({
-      userId: existing.userId,
-      provider: 'PADDLE',
-      externalEventId: `${existing.providerTransactionId}:refund:${options?.adjustmentId || 'full'}`,
-      externalTransactionId: existing.providerTransactionId,
-      eventType: 'subscription_refund',
-      plan: 'FREE',
-      status: 'REVOKED',
-      periodStart: null,
-      periodEnd: null,
-      occurredAt: new Date(),
-    });
-  }
-
-  return refundSuccess;
-}
-
 export async function verifyWebhookSignature(input: { payload: string; signature: string; provider: PaymentProvider }): Promise<boolean> {
   const provider = normalizeProvider(input.provider);
   const secret = getWebhookSecret(provider);
@@ -734,12 +574,6 @@ export async function verifyWebhookSignature(input: { payload: string; signature
   }
 
   try {
-    if (provider === 'PADDLE') {
-      const paddle = getPaddleInstance();
-      await paddle.webhooks.unmarshal(input.payload, secret, candidate);
-      return true;
-    }
-
     const expected = createHmac('sha256', secret).update(input.payload).digest('hex');
     return candidate === expected || candidate === `sha256=${expected}`;
   } catch (err) {

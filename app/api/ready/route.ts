@@ -10,7 +10,6 @@ import { checkRealtimeRedisHealth } from '../../../lib/realtimeRedis';
 const geminiBreaker = getCircuitBreaker('gemini', 5, 30000);
 const simliBreaker = getCircuitBreaker('simli', 3, 30000);
 const mpesaBreaker = getCircuitBreaker('payment:mpesa', 3, 60000);
-const paddleBreaker = getCircuitBreaker('payment:paddle', 3, 60000);
 
 function getDiskHealth() {
   try {
@@ -66,7 +65,6 @@ export async function GET() {
   checks.redis = { status: await checkRealtimeRedisHealth() };
   checks.paymentProviders = {
     mpesa: { status: mpesaBreaker.isOpen() ? 'circuit_open' : 'not_probed', circuitState: mpesaBreaker.getState() },
-    paddle: { status: paddleBreaker.isOpen() ? 'circuit_open' : 'not_probed', circuitState: paddleBreaker.getState() },
   };
   checks.disk = getDiskHealth();
   checks.memory = getMemoryHealth();

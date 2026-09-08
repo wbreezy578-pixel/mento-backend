@@ -5,7 +5,7 @@ import {
   getConversationHistoryForAI,
   validateConversationOwnership,
   initializeStreamingTurn,
-  updateConversationSummary,
+  refreshConversationSummarySafely,
 } from '../../../../lib/conversationDb';
 import {
   AIRequestGatewayError,
@@ -166,10 +166,20 @@ export async function POST(req: Request) {
       if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'idempotency_check_failed' }).catch(() => undefined);
       throw error;
     }
-    logger.info('Chat stream conversation selected', { userId, conversationId });
+    logger.info('Chat stream conversation selected', {
+      userId,
+      conversationId,
+      elapsedMs: Date.now() - requestStartedAt,
+    });
 
     const generationOwnerId = `${userId}:${requestId}`;
+    const generationLockStartedAt = Date.now();
     const generationLockAcquired = await acquireAIGenerationLock(conversationId, generationOwnerId);
+    observeMonitoringLatency('api', Date.now() - generationLockStartedAt, {
+      route: 'chat-stream',
+      operation: 'generation-lock',
+      status: generationLockAcquired ? 'acquired' : 'contended',
+    });
     if (!generationLockAcquired) {
       if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'generation_lock_unavailable' }).catch(() => undefined);
       return NextResponse.json(
@@ -193,6 +203,11 @@ export async function POST(req: Request) {
       const historyStartedAt = Date.now();
       historyForAI = await getConversationHistoryForAI(conversationId);
       observeMonitoringLatency('database', Date.now() - historyStartedAt, { route: 'chat-stream', operation: 'history' });
+      observeMonitoringLatency('api', Date.now() - requestStartedAt, { route: 'chat-stream', operation: 'history-ready' });
+      logger.info('Chat stream history ready', {
+        conversationId,
+        elapsedMs: Date.now() - requestStartedAt,
+      });
     } catch (error) {
       generationLease.stop();
       await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
@@ -235,6 +250,10 @@ export async function POST(req: Request) {
           });
           userMessageId = initializedTurn.userMessageId;
           assistantMessageId = initializedTurn.assistantMessageId;
+          logger.info('Chat stream turn initialized', {
+            conversationId,
+            elapsedMs: Date.now() - requestStartedAt,
+          });
           if (userMessageId) {
             enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'user_message', messageId: userMessageId })}\n\n`));
           }
@@ -289,18 +308,39 @@ export async function POST(req: Request) {
                 ],
               };
               const priorHistory = createdForRequest ? historyForAI.slice(0, -1) : historyForAI;
+              const settingsStartedAt = Date.now();
               const tutorLanguage = await getTutorLanguage(userId);
+              observeMonitoringLatency('database', Date.now() - settingsStartedAt, {
+                route: 'chat-stream',
+                operation: 'settings-language',
+              });
               const contents: GeminiMessage[] = [
                 { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
                 ...priorHistory,
                 userEntry,
               ];
 
-              const modelToUse = billingDecision.modelUsed ?? undefined;
+              const modelToUse = answerMode === 'short' && !validatedImage
+                ? 'gemini-3.5-flash-lite'
+                : billingDecision.modelUsed ?? undefined;
               assistantText = '';
+              const geminiStartedAt = Date.now();
+              let firstTokenObserved = false;
+              observeMonitoringLatency('api', geminiStartedAt - requestStartedAt, {
+                route: 'chat-stream',
+                operation: 'gemini-request',
+              });
               const generation = await askGeminiStream(contents, async (token: string) => {
                 if (isStreamClosed()) {
                   return;
+                }
+                if (!firstTokenObserved) {
+                  firstTokenObserved = true;
+                  observeMonitoringLatency('gemini', Date.now() - geminiStartedAt, {
+                    provider: 'Gemini',
+                    operation: 'first-token',
+                    status: 'success',
+                  });
                 }
                 assistantText += token;
                 const payload = JSON.stringify({ type: 'token', token });
@@ -309,7 +349,7 @@ export async function POST(req: Request) {
               }, modelToUse, generationSignal, sanitizedText, reportUsage, async (model) => {
                 await generationLease.assertOwned();
                 return reportProviderAttempt(model);
-              });
+              }, sanitizedText);
 
               if (generationLease.signal.aborted) {
                 throw generationLease.signal.reason;
@@ -329,12 +369,6 @@ export async function POST(req: Request) {
                   data: { content: finalAssistantText, text: finalAssistantText, status: 'completed' },
                 });
               }
-              await updateConversationSummary(conversationId).catch((summaryError) => {
-                logger.warn('Deferred conversation summary refresh', {
-                  conversationId,
-                  errorName: summaryError instanceof Error ? summaryError.name : 'UnknownError',
-                });
-              });
             },
           });
 
@@ -345,6 +379,12 @@ export async function POST(req: Request) {
           if (!isStreamClosed()) {
             enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
           }
+          void refreshConversationSummarySafely(conversationId).catch((summaryError) => {
+            logger.warn('Conversation summary refresh deferred after chat response', {
+              conversationId,
+              errorName: summaryError instanceof Error ? summaryError.name : 'UnknownError',
+            });
+          });
           observeMonitoringLatency('api', Date.now() - requestStartedAt, { route: 'chat-stream', operation: 'total' });
           close();
         } catch (err: unknown) {
@@ -357,7 +397,7 @@ export async function POST(req: Request) {
                 logger.error('Failed to discard cancelled assistant message', { error: String(dbErr), assistantMessageId });
               });
             }
-            await updateConversationSummary(conversationId).catch(() => undefined);
+            await refreshConversationSummarySafely(conversationId);
             await prisma.chatAnalyticsEvent.create({
               data: { userId, conversationId, eventType: 'generation_cancelled', metadata: { requestId } },
             }).catch(() => undefined);
@@ -384,7 +424,7 @@ export async function POST(req: Request) {
               logger.error('Failed to mark assistant message as failed', { error: String(dbErr), assistantMessageId });
             });
           }
-          await updateConversationSummary(conversationId).catch(() => undefined);
+          await refreshConversationSummarySafely(conversationId);
           await prisma.chatAnalyticsEvent.create({
             data: { userId, conversationId, messageId: assistantMessageId, eventType: 'unanswered_question', metadata: { requestId, reason: 'generation_failed' } },
           }).catch(() => undefined);

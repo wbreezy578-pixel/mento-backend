@@ -1,5 +1,10 @@
 import type { createGeminiLiveSession } from './liveTutorGeminiLiveService';
 type AudioCallback = NonNullable<NonNullable<Parameters<typeof createGeminiLiveSession>[0]>['onAudioChunk']>;
+type AudioCallbackCall = Parameters<AudioCallback>;
+
+function audioCallbackGeneration(call: readonly unknown[] | undefined): number | undefined {
+  return (call as AudioCallbackCall | undefined)?.[3];
+}
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const logger = await import('../lib/logger');
@@ -46,9 +51,14 @@ it('uses a concise, natural live tutor system prompt', async () => {
   expect(prompt).toContain('Never read a long list');
   expect(prompt).toContain('Focus on the newest completed user turn');
   expect(prompt).toContain('Stop immediately when interrupted');
-  expect(prompt).toContain('one short conversational bridge');
-  expect(prompt).toContain('Do not repeatedly say “um”');
-  expect(prompt).toContain('never claim you are checking a source or tool unless you actually are');
+  expect(prompt).toContain('calm, measured speaking pace');
+  expect(prompt).toContain('steady rhythm');
+  expect(prompt).toContain('avoid long silences or hesitation inside a phrase');
+  expect(prompt).toContain('Never rush, compress words, or race through the final phrase');
+  expect(prompt).toContain('Only when a complex question genuinely needs a beat');
+  expect(prompt).toContain('at most one short conversational bridge');
+  expect(prompt).toContain('Never use a bare “um,” stretch filler sounds');
+  expect(prompt).toContain('Never say you are checking a source or tool unless you actually are');
   expect(prompt).toContain('never tease, insult');
   expect(prompt).not.toContain('150 words per minute');
   expect(classifyLiveTutorResponseMode('What is gravity?')).toBe('fast_direct');
@@ -57,6 +67,30 @@ it('uses a concise, natural live tutor system prompt', async () => {
 });
 
 describe('Gemini Live PCM lifecycle', () => {
+  it('releases final PCM before slow persistence and still reports persistence failure', async () => {
+    let failSave!: (error: Error) => void;
+    const saving = new Promise<void>((_, reject) => { failSave = reject; });
+    const order: string[] = [];
+    const onError = vi.fn();
+    const onResponseCompleted = vi.fn();
+    const { createGeminiLiveSession, closeGeminiLiveSession } = await import('./liveTutorGeminiLiveService');
+    const session = await createGeminiLiveSession({
+      onAudioChunk: async () => { order.push('pcm'); },
+      onAudioCompleted: async () => { order.push('audio-complete'); },
+      onTurnComplete: () => { order.push('save'); return saving; },
+      onResponseCompleted,
+      onError,
+    });
+    geminiCallbacks.onmessage({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AQI=', mimeType: 'audio/pcm;rate=24000' } }] }, turnComplete: true } });
+    await vi.waitFor(() => expect(order).toEqual(['pcm', 'audio-complete', 'save']));
+    expect(onResponseCompleted).not.toHaveBeenCalled();
+    failSave(new Error('synthetic slow save failure'));
+    await session.audioCallbackQueue;
+    expect(onError).toHaveBeenCalledOnce();
+    expect(onResponseCompleted).not.toHaveBeenCalled();
+    await closeGeminiLiveSession(session.sessionId);
+  });
+
   beforeEach(() => {
     sendClientContent.mockClear();
     sendRealtimeInput.mockClear();
@@ -183,6 +217,31 @@ describe('Gemini Live PCM lifecycle', () => {
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });
 
+  it('ignores a stale completion that arrives before the new native-audio response begins', async () => {
+    const onResponseCompleted = vi.fn();
+    const onAudioChunk = vi.fn<AudioCallback>(async () => undefined);
+    const { closeGeminiLiveSession, createGeminiLiveSession, endRealtimePcmAudio, sendRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
+    const session = await createGeminiLiveSession({ streamId: 'stream-stale-complete', onAudioChunk, onResponseCompleted });
+    const pcm = new Uint8Array([1, 2]);
+    const audioMessage = { serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AQI=', mimeType: 'audio/pcm;rate=24000' } }] } } };
+
+    sendRealtimePcmAudio(session.sessionId, pcm);
+    endRealtimePcmAudio(session.sessionId);
+    geminiCallbacks.onmessage({ serverContent: { turnComplete: true } });
+    await Promise.resolve();
+
+    expect(session.completedGenerationId).toBeNull();
+    expect(onResponseCompleted).not.toHaveBeenCalled();
+
+    geminiCallbacks.onmessage(audioMessage);
+    geminiCallbacks.onmessage({ serverContent: { turnComplete: true } });
+    await session.audioCallbackQueue;
+
+    expect(onAudioChunk).toHaveBeenCalledOnce();
+    expect(onResponseCompleted).toHaveBeenCalledOnce();
+    await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
+  });
+
   it('serializes provider audio callbacks in arrival order', async () => {
     let releaseFirstCallback!: () => void;
     const firstCallbackReleased = new Promise<void>((resolve) => {
@@ -210,6 +269,41 @@ describe('Gemini Live PCM lifecycle', () => {
     releaseFirstCallback();
     await session.audioCallbackQueue;
     expect(receivedChunks).toEqual([1, 2]);
+    await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
+  });
+
+  it('starts a new generation without waiting for a cancelled generation to drain', async () => {
+    let releaseOlderGeneration!: () => void;
+    const olderGenerationBlocked = new Promise<void>((resolve) => {
+      releaseOlderGeneration = resolve;
+    });
+    const receivedGenerations: number[] = [];
+    const onAudioChunk = vi.fn<AudioCallback>(async (_chunk, _mimeType, _timestamp, generationId) => {
+      receivedGenerations.push(generationId);
+      if (generationId === 1) await olderGenerationBlocked;
+    });
+    const onInterrupted = vi.fn();
+    const { closeGeminiLiveSession, createGeminiLiveSession, interruptGeminiLiveSession, sendRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
+    const session = await createGeminiLiveSession({ streamId: 'stream-generation-isolation', onAudioChunk, onInterrupted });
+    const pcm = new Uint8Array([1, 2]);
+    const audioMessage = { serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AQI=', mimeType: 'audio/pcm;rate=24000' } }] } } };
+
+    sendRealtimePcmAudio(session.sessionId, pcm);
+    geminiCallbacks.onmessage(audioMessage);
+    await Promise.resolve();
+    expect(receivedGenerations).toEqual([1]);
+
+    interruptGeminiLiveSession(session.sessionId);
+    sendRealtimePcmAudio(session.sessionId, pcm);
+    geminiCallbacks.onmessage({ serverContent: { interrupted: true } });
+    geminiCallbacks.onmessage(audioMessage);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(receivedGenerations).toEqual([1, session.generationId]);
+    expect(onInterrupted).not.toHaveBeenCalled();
+    releaseOlderGeneration();
+    await session.audioCallbackQueue;
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });
 
@@ -292,6 +386,29 @@ describe('Gemini Live PCM lifecycle', () => {
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });
 
+  it('does not advance the generation twice for duplicate cancellation requests', async () => {
+    const { createGeminiLiveSession, closeGeminiLiveSession, interruptGeminiLiveSession } = await import('./liveTutorGeminiLiveService');
+    const session = await createGeminiLiveSession({ streamId: 'duplicate-interruption' });
+    const generation = interruptGeminiLiveSession(session.sessionId);
+    expect(interruptGeminiLiveSession(session.sessionId)).toBe(generation);
+    expect(session.generationId).toBe(generation);
+    await closeGeminiLiveSession(session.sessionId);
+  });
+
+  it('reports the cancelled generation when Gemini confirms an interruption', async () => {
+    const onInterrupted = vi.fn();
+    const { createGeminiLiveSession, closeGeminiLiveSession, interruptGeminiLiveSession, sendRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
+    const session = await createGeminiLiveSession({ streamId: 'confirmed-interruption-generation', onInterrupted });
+
+    sendRealtimePcmAudio(session.sessionId, new Uint8Array([1, 2]));
+    const replacementGenerationId = interruptGeminiLiveSession(session.sessionId);
+    geminiCallbacks.onmessage({ serverContent: { interrupted: true } });
+
+    expect(onInterrupted).toHaveBeenCalledExactlyOnceWith(replacementGenerationId - 1);
+    expect(session.cancelledGenerationId).toBeNull();
+    await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
+  });
+
   it('drops delayed interrupted audio after new PCM starts, then accepts new response audio', async () => {
     const onAudioChunk = vi.fn<AudioCallback>(async () => undefined);
     const { closeGeminiLiveSession, createGeminiLiveSession, interruptGeminiLiveSession, sendRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
@@ -314,7 +431,7 @@ describe('Gemini Live PCM lifecycle', () => {
     await session.audioCallbackQueue;
 
     expect(onAudioChunk).toHaveBeenCalledTimes(2);
-    expect(onAudioChunk.mock.calls[1][3]).toBe(session.generationId);
+    expect(audioCallbackGeneration(onAudioChunk.mock.calls.at(1))).toBe(session.generationId);
     expect(sendRealtimeInput).toHaveBeenCalledTimes(2);
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
   });
@@ -331,8 +448,42 @@ describe('Gemini Live PCM lifecycle', () => {
     geminiCallbacks.onmessage({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AQI=', mimeType: 'audio/pcm;rate=24000' } }] } } });
     await session.audioCallbackQueue;
     expect(onAudioChunk).toHaveBeenCalledOnce();
-    expect(onAudioChunk.mock.calls[0][3]).toBe(session.generationId);
+    expect(audioCallbackGeneration(onAudioChunk.mock.calls.at(0))).toBe(session.generationId);
     await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
+  });
+
+  it('recovers a new learner turn when Gemini never confirms the cancelled response', async () => {
+    vi.useFakeTimers();
+    const onAudioChunk = vi.fn<AudioCallback>(async () => undefined);
+    const { closeGeminiLiveSession, createGeminiLiveSession, endRealtimePcmAudio, interruptGeminiLiveSession, sendRealtimePcmAudio } = await import('./liveTutorGeminiLiveService');
+    const session = await createGeminiLiveSession({ streamId: 'stream-interruption-fence-timeout', onAudioChunk });
+    const oldAudio = { serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AQI=', mimeType: 'audio/pcm;rate=24000' } }] } } };
+
+    try {
+      sendRealtimePcmAudio(session.sessionId, new Uint8Array([1, 2]));
+      interruptGeminiLiveSession(session.sessionId);
+      sendRealtimePcmAudio(session.sessionId, new Uint8Array([3, 4]));
+      endRealtimePcmAudio(session.sessionId);
+
+      // This is old audio without either provider fence event. It must remain
+      // rejected until the fallback owns a new provider connection.
+      geminiCallbacks.onmessage(oldAudio);
+      await session.audioCallbackQueue;
+      expect(onAudioChunk).not.toHaveBeenCalled();
+      expect(session.discardProviderOutput).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(1_201);
+      await vi.waitFor(() => expect(session.recovering).toBe(false));
+      expect(session.discardProviderOutput).toBe(false);
+      expect(sendRealtimeInput).toHaveBeenLastCalledWith({ audioStreamEnd: true });
+
+      geminiCallbacks.onmessage(oldAudio);
+      await session.audioCallbackQueue;
+      expect(onAudioChunk).toHaveBeenCalledExactlyOnceWith(expect.any(Uint8Array), 'audio/pcm;rate=24000', expect.any(Number), session.generationId);
+    } finally {
+      await closeGeminiLiveSession(session.sessionId, 'test_cleanup');
+      vi.useRealTimers();
+    }
   });
 
   it('keeps one Gemini session usable for ten turns across an interruption', async () => {

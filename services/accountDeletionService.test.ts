@@ -66,19 +66,18 @@ describe('durable account deletion retries', () => {
   });
 
   it('marks a transient provider failure pending and completes on a later retry', async () => {
-    mocks.cancelPaddleSubscriptionForAccountDeletion
-      .mockRejectedValueOnce(new Error('temporary Paddle outage'))
-      .mockResolvedValueOnce(undefined);
+    mocks.cancelGooglePlaySubscriptionsForAccountDeletion
+      .mockRejectedValueOnce(new Error('temporary Google Play outage'))
+      .mockResolvedValueOnce(0);
 
     await expect(processAccountDeletionJob('deletion-job-a')).rejects.toBeInstanceOf(AccountDeletionPendingError);
     expect(mocks.prisma.accountDeletionJob.update).toHaveBeenCalledWith({
       where: { id: 'deletion-job-a' },
-      data: { status: 'PENDING', lastError: 'paddle_cancel_failed' },
+      data: { status: 'PENDING', lastError: 'google_play_cancel_failed' },
     });
 
     await expect(processAccountDeletionJob('deletion-job-a')).resolves.toEqual(job);
-    expect(mocks.cancelPaddleSubscriptionForAccountDeletion).toHaveBeenCalledTimes(2);
-    expect(mocks.cancelGooglePlaySubscriptionsForAccountDeletion).toHaveBeenCalledWith('user-a');
+    expect(mocks.cancelGooglePlaySubscriptionsForAccountDeletion).toHaveBeenCalledTimes(2);
     expect(mocks.deleteSupabaseAuthUser).toHaveBeenCalledWith('supabase-a');
     expect(mocks.prisma.user.delete).toHaveBeenCalledWith({ where: { id: 'user-a' } });
   });

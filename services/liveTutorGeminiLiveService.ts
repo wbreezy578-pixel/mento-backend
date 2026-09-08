@@ -10,6 +10,11 @@ const geminiApiKey = getGeminiApiKey();
 
 const GEMINI_LIVE_MODEL = process.env.GEMINI_LIVE_MODEL ?? 'gemini-2.5-flash-native-audio-preview-12-2025';
 export const LIVE_TUTOR_END_OF_TURN_SILENCE_MS = 700;
+// Gemini normally acknowledges a barge-in immediately. If it does not, retain
+// the new learner turn and replace the stalled provider connection rather than
+// ever relabelling the old response as the new generation.
+export const LIVE_TUTOR_INTERRUPTION_FENCE_TIMEOUT_MS = 1_200;
+const LIVE_TUTOR_INTERRUPTION_RECOVERY_MAX_PCM_BYTES = 960_000;
 
 /**
  * Represents a single persistent Gemini Live session for a user.
@@ -25,8 +30,8 @@ export function buildLiveTutorSystemInstruction(): string {
     'This is a spoken conversation, not a written essay. Begin with the useful answer immediately, without a routine greeting, acknowledgment, or preamble, and normally speak only one to three short sentences at a time.',
     'Expand only when the learner asks for more. Teach one idea at a time. For a difficult topic, give the next useful step, then pause or ask whether the learner wants the next step or an example.',
     'Never read a long list, table, citation block, or large code block aloud. Summarize it conversationally and offer to explain the details.',
-    'Speak slowly and clearly at a relaxed tutoring pace. Enunciate each word, leave a small natural pause between phrases, and never rush or compress the answer. Use short natural sentences and do not repeat yourself.',
-    'When a difficult question genuinely needs a beat, use one short conversational bridge before the answer, such as “Good question—let’s break that down,” “Okay—here’s the key idea,” “Let’s take that one step at a time,” “There is a useful way to look at this,” or “Give me a moment to think that through.” Vary these naturally. Do not repeatedly say “um” or make filler sounds, do not use a bridge on routine turns, and never claim you are checking a source or tool unless you actually are.',
+    'Use a calm, measured speaking pace with steady rhythm and clear pronunciation. Keep each sentence flowing continuously; avoid long silences or hesitation inside a phrase. Leave brief natural pauses only between ideas and at sentence boundaries. Never rush, compress words, or race through the final phrase. Keep the delivery conversational rather than exaggeratedly slow, and do not repeat yourself.',
+    'Only when a complex question genuinely needs a beat, use at most one short conversational bridge before the answer, such as “Let’s work through that,” “Here’s the key idea,” “I see what you mean,” or “Let me think that through.” Vary these naturally and then answer. Never use a bare “um,” stretch filler sounds, or add a bridge on routine turns. Never say you are checking a source or tool unless you actually are.',
     'Be warm and lightly playful when the learner welcomes it, but never tease, insult, shame, manipulate, or pretend to be human.',
     'Focus on the newest completed user turn. If the learner changes topic or corrects you, stop the old explanation and follow the new request.',
     'Stop immediately when interrupted. Preserve relevant conversation context, but never insist on finishing an abandoned answer.',
@@ -92,11 +97,12 @@ export interface GeminiLiveSession {
   conversationContext?: string;
   client?: Session;
   onAudioChunk?: (chunk: Uint8Array, mimeType: string, chunkTimestampMs: number, generationId: number) => Promise<void>;
-  onInterrupted?: () => void;
+  onInterrupted?: (cancelledGenerationId: number) => void;
   onError?: (error: Error) => void;
   onTurnComplete?: (turn: { turnNumber: number; generationId: number; userText?: string; assistantText?: string; timestampMs: number }) => void | Promise<void>;
   onResponseStarted?: (turnNumber: number, generationId: number) => void;
-  onResponseCompleted?: (turnNumber: number, generationId: number) => void;
+  onAudioCompleted?: (turnNumber: number, generationId: number) => void | Promise<void>;
+  onResponseCompleted?: (turnNumber: number, generationId: number) => void | Promise<void>;
   onTranscript?: (transcript: { speaker: 'user' | 'assistant'; text: string; isFinal: boolean; turnNumber: number; generationId: number }) => void;
   voiceTraceId?: string;
   voiceProfile: LiveTutorVoiceProfile;
@@ -117,16 +123,37 @@ export interface GeminiLiveSession {
   discardProviderOutput: boolean;
   activeResponseMode: LiveTutorResponseMode;
   lastInputTranscript?: string;
+  /**
+   * Provider chunks must stay ordered within a response, but a newly-created
+   * generation must never sit behind a slow or cancelled older response.
+   */
+  audioCallbackQueues: Map<number, Promise<void>>;
   audioCallbackQueue: Promise<void>;
   completedGenerationId: number | null;
   pendingTurnCompleteGenerationId: number | null;
   interruptedGenerationId: number | null;
+  cancelledGenerationId: number | null;
+  interruptionFenceTimer?: ReturnType<typeof setTimeout>;
+  recoverAfterInterruptedTurn?: () => void;
+  activeInputPcm: Uint8Array[];
+  activeInputPcmBytes: number;
+  activeInputMimeType: string;
   inputTranscriptBuffer: string;
   outputTranscriptBuffer: string;
   recovering?: boolean;
   recoveryPcm?: Uint8Array[];
   recoveryPcmBytes?: number;
   pendingLanguage?: TutorLanguage;
+}
+
+function voiceTelemetryIdentity(session: GeminiLiveSession) {
+  return {
+    sessionId: session.sessionId,
+    streamId: session.streamId,
+    voiceTraceId: session.voiceTraceId,
+    turnNumber: session.turnNumber,
+    generationId: session.generationId,
+  };
 }
 
 function mergeTranscript(existing: string, fragment: string): string {
@@ -140,6 +167,27 @@ function mergeTranscript(existing: string, fragment: string): string {
     if (existing.endsWith(next.slice(0, length))) return `${existing}${next.slice(length)}`;
   }
   return `${existing} ${next}`.replace(/\s+/g, ' ').trim();
+}
+
+function clearInterruptionFenceTimer(session: GeminiLiveSession): void {
+  if (!session.interruptionFenceTimer) return;
+  clearTimeout(session.interruptionFenceTimer);
+  session.interruptionFenceTimer = undefined;
+}
+
+function retainActiveInputPcm(session: GeminiLiveSession, pcm: Uint8Array, mimeType: string): void {
+  if (session.activeInputPcmBytes + pcm.byteLength > LIVE_TUTOR_INTERRUPTION_RECOVERY_MAX_PCM_BYTES) {
+    // A very long utterance cannot be safely replayed after a provider stall.
+    // Keep the most recent audio, which is more useful than failing a live turn.
+    while (session.activeInputPcm.length > 0
+      && session.activeInputPcmBytes + pcm.byteLength > LIVE_TUTOR_INTERRUPTION_RECOVERY_MAX_PCM_BYTES) {
+      const discarded = session.activeInputPcm.shift();
+      session.activeInputPcmBytes -= discarded?.byteLength ?? 0;
+    }
+  }
+  session.activeInputPcm.push(pcm.slice());
+  session.activeInputPcmBytes += pcm.byteLength;
+  session.activeInputMimeType = mimeType;
 }
 
 // In-memory session store (TODO: Move to Redis for production)
@@ -189,13 +237,43 @@ function invokeAudioChunkHandlerSafely(
     });
   }
 
-  session.audioCallbackQueue = session.audioCallbackQueue.then(async () => {
+  const previousForGeneration = session.audioCallbackQueues.get(generationId) ?? Promise.resolve();
+  const callback = previousForGeneration.then(async () => {
     try {
       await session.onAudioChunk?.(chunk, mimeType, chunkTimestampMs, generationId);
     } catch (error: unknown) {
       logAudioChunkCallbackFailure(session, chunk, mimeType, generationId, chunkTimestampMs, error);
     }
   });
+  session.audioCallbackQueues.set(generationId, callback);
+  // Keep this aggregate promise for callers and tests that need to await all
+  // callbacks already accepted by the session. It is deliberately not used to
+  // schedule the next generation.
+  session.audioCallbackQueue = Promise.all([...session.audioCallbackQueues.values()].map((queue) => queue.catch(() => undefined))).then(() => undefined);
+  const removeCallback = () => {
+    if (session.audioCallbackQueues.get(generationId) === callback) {
+      session.audioCallbackQueues.delete(generationId);
+    }
+  };
+  void callback.then(removeCallback, removeCallback);
+}
+
+function finalizeAudioGeneration(
+  session: GeminiLiveSession,
+  generationId: number,
+  finalize: () => Promise<void>,
+): Promise<void> {
+  const pendingAudio = session.audioCallbackQueues.get(generationId) ?? Promise.resolve();
+  const completion = pendingAudio.then(finalize);
+  session.audioCallbackQueues.set(generationId, completion);
+  session.audioCallbackQueue = Promise.all([...session.audioCallbackQueues.values()].map((queue) => queue.catch(() => undefined))).then(() => undefined);
+  const removeCompletion = () => {
+    if (session.audioCallbackQueues.get(generationId) === completion) {
+      session.audioCallbackQueues.delete(generationId);
+    }
+  };
+  void completion.then(removeCompletion, removeCompletion);
+  return completion;
 }
 
 /**
@@ -211,11 +289,12 @@ export async function createGeminiLiveSession(options: {
   systemInstruction?: string;
   beforeProviderReconnect?: () => Promise<void>;
   onAudioChunk?: (chunk: Uint8Array, mimeType: string, chunkTimestampMs: number, generationId: number) => Promise<void>;
-  onInterrupted?: () => void;
+  onInterrupted?: (cancelledGenerationId: number) => void;
   onError?: (error: Error) => void;
   onTurnComplete?: (turn: { turnNumber: number; generationId: number; userText?: string; assistantText?: string; timestampMs: number }) => void | Promise<void>;
   onResponseStarted?: (turnNumber: number, generationId: number) => void;
-  onResponseCompleted?: (turnNumber: number, generationId: number) => void;
+  onAudioCompleted?: (turnNumber: number, generationId: number) => void | Promise<void>;
+  onResponseCompleted?: (turnNumber: number, generationId: number) => void | Promise<void>;
   onTranscript?: (transcript: { speaker: 'user' | 'assistant'; text: string; isFinal: boolean; turnNumber: number; generationId: number }) => void;
 } = {}): Promise<GeminiLiveSession> {
   const sessionId = buildSessionId();
@@ -235,6 +314,7 @@ export async function createGeminiLiveSession(options: {
     onError: options.onError,
     onTurnComplete: options.onTurnComplete,
     onResponseStarted: options.onResponseStarted,
+    onAudioCompleted: options.onAudioCompleted,
     onResponseCompleted: options.onResponseCompleted,
     onTranscript: options.onTranscript,
     voiceTraceId: options.voiceTraceId,
@@ -251,10 +331,15 @@ export async function createGeminiLiveSession(options: {
     discardProviderOutput: false,
     activeResponseMode: 'fast_direct',
     lastInputTranscript: undefined,
+    audioCallbackQueues: new Map(),
     audioCallbackQueue: Promise.resolve(),
     completedGenerationId: null,
     pendingTurnCompleteGenerationId: null,
     interruptedGenerationId: null,
+    cancelledGenerationId: null,
+    activeInputPcm: [],
+    activeInputPcmBytes: 0,
+    activeInputMimeType: 'audio/pcm;rate=16000',
     inputTranscriptBuffer: '',
     outputTranscriptBuffer: '',
   };
@@ -312,6 +397,7 @@ export async function createGeminiLiveSession(options: {
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: session.geminiVoice } } },
+        thinkingConfig: { thinkingBudget: 0 },
         systemInstruction: options.systemInstruction ?? buildLiveTutorSystemInstruction(),
         inputAudioTranscription: {},
         outputAudioTranscription: {},
@@ -345,7 +431,7 @@ export async function createGeminiLiveSession(options: {
           session.lastActivityAt = Date.now();
           const serverContent = message.serverContent;
           if (session.turnNumber > 0) {
-            recordLiveTutorVoiceEvent('GEMINI_FIRST_MESSAGE', session, session.lastActivityAt);
+            recordLiveTutorVoiceEvent('GEMINI_FIRST_MESSAGE', voiceTelemetryIdentity(session), session.lastActivityAt);
           }
           const parts = serverContent?.modelTurn?.parts ?? [];
           const audioPartCount = parts.filter((part) => Boolean(part.inlineData?.data && part.inlineData.mimeType)).length;
@@ -365,6 +451,25 @@ export async function createGeminiLiveSession(options: {
             logger.info('[LiveTutorVoiceServer] gemini_interrupted', { voiceTraceId: session.voiceTraceId, sessionId, category: 'live_tutor_voice_gemini_interruption' });
             const newInputStarted = session.interruptedGenerationId !== null
               && session.generationId !== session.interruptedGenerationId;
+            const cancelledGenerationId = session.cancelledGenerationId ?? session.generationId;
+            if (newInputStarted) {
+              // The provider is confirming cancellation of an old response.
+              // Never let that late acknowledgement clear a newer PCM turn.
+              session.discardProviderOutput = false;
+              session.interruptedGenerationId = null;
+              session.cancelledGenerationId = null;
+              clearInterruptionFenceTimer(session);
+              logger.info('late_provider_interruption_ignored', {
+                streamId: session.streamId,
+                sessionId,
+                cancelledGenerationId,
+                activeGenerationId: session.generationId,
+                turnNumber: session.turnNumber,
+                reason: 'newer_input_turn_active',
+                category: 'gemini_live_lifecycle',
+              });
+              return;
+            }
             if (!newInputStarted) {
               session.inputTurnActive = false;
               session.inputActivityEnded = true;
@@ -372,6 +477,8 @@ export async function createGeminiLiveSession(options: {
             session.responseStarted = false;
             session.discardProviderOutput = false;
             session.interruptedGenerationId = null;
+            session.cancelledGenerationId = null;
+            clearInterruptionFenceTimer(session);
             logger.info('live_tutor_turn_invalidated', {
               streamId: session.streamId,
               sessionId,
@@ -384,7 +491,7 @@ export async function createGeminiLiveSession(options: {
               inputActivityEnded: session.inputActivityEnded,
               discardProviderOutput: session.discardProviderOutput,
             });
-            session.onInterrupted?.();
+            session.onInterrupted?.(cancelledGenerationId);
             return;
           }
           if (session.discardProviderOutput && message.serverContent?.turnComplete) {
@@ -392,7 +499,9 @@ export async function createGeminiLiveSession(options: {
             // Do not finalize or reset PCM already arriving for the new question.
             session.discardProviderOutput = false;
             session.interruptedGenerationId = null;
+            session.cancelledGenerationId = null;
             session.responseStarted = false;
+            clearInterruptionFenceTimer(session);
             return;
           }
           if (session.discardProviderOutput) {
@@ -423,10 +532,10 @@ export async function createGeminiLiveSession(options: {
             session.onTranscript?.({ speaker: 'assistant', text: session.outputTranscriptBuffer, isFinal: false, turnNumber: session.turnNumber, generationId: session.generationId });
           }
           if (inputTranscriptFinished) {
-            recordLiveTutorVoiceEvent('GEMINI_INPUT_TRANSCRIPT_FINAL', session, Date.now(), { transcriptChars: inputTranscript?.length ?? session.lastInputTranscript?.length ?? 0 });
+            recordLiveTutorVoiceEvent('GEMINI_INPUT_TRANSCRIPT_FINAL', voiceTelemetryIdentity(session), Date.now(), { transcriptChars: inputTranscript?.length ?? session.lastInputTranscript?.length ?? 0 });
           }
           if (outputTranscript) {
-            recordLiveTutorVoiceEvent('GEMINI_FIRST_OUTPUT_TRANSCRIPT', session, Date.now(), { transcriptChars: outputTranscript.length });
+            recordLiveTutorVoiceEvent('GEMINI_FIRST_OUTPUT_TRANSCRIPT', voiceTelemetryIdentity(session), Date.now(), { transcriptChars: outputTranscript.length });
           }
           if (inputTranscript || outputTranscript) {
             logger.info('[LiveTutorVoiceBackend] Gemini transcript received', {
@@ -485,7 +594,7 @@ export async function createGeminiLiveSession(options: {
               });
               session.onResponseStarted?.(session.turnNumber, session.generationId);
             }
-            recordLiveTutorVoiceEvent('GEMINI_FIRST_AUDIO_RECEIVED', session, audioChunkReceivedAt, { mimeType: inlineData.mimeType, byteLength: audioChunk.byteLength });
+            recordLiveTutorVoiceEvent('GEMINI_FIRST_AUDIO_RECEIVED', voiceTelemetryIdentity(session), audioChunkReceivedAt, { mimeType: inlineData.mimeType, byteLength: audioChunk.byteLength });
             logger.info('[LiveTutorVoiceServer] gemini_audio_received', {
               voiceTraceId: session.voiceTraceId,
               sessionId,
@@ -516,6 +625,24 @@ export async function createGeminiLiveSession(options: {
             invokeAudioChunkHandlerSafely(session, audioChunk, inlineData.mimeType, audioChunkReceivedAt, session.generationId);
           }
           if (message.serverContent?.turnComplete) {
+            // Gemini can deliver the completion of an interrupted response
+            // after the learner has already ended a new PCM turn. It carries
+            // no generation identifier, so treating it as the new response
+            // would mark that generation completed and discard all of its
+            // later audio as stale. Native-audio turns must begin before they
+            // may complete.
+            if (session.turnNumber > 0 && session.inputTurnActive && session.inputActivityEnded && !session.responseStarted) {
+              logger.info('gemini_pre_response_turn_complete_ignored', {
+                voiceTraceId: session.voiceTraceId,
+                sessionId,
+                streamId: session.streamId,
+                turnNumber: session.turnNumber,
+                generationId: session.generationId,
+                reason: 'no_response_audio_started',
+                category: 'gemini_live_lifecycle',
+              });
+              return;
+            }
             const completedTurn = session.turnNumber;
             const completedGeneration = session.generationId;
             if (session.completedGenerationId === completedGeneration || session.pendingTurnCompleteGenerationId === completedGeneration) {
@@ -525,8 +652,8 @@ export async function createGeminiLiveSession(options: {
               const finalizedUserText = session.inputTranscriptBuffer;
               const finalizedAssistantText = session.outputTranscriptBuffer;
               logger.info('turn_complete_received', { voiceTraceId: session.voiceTraceId, sessionId, turnNumber: completedTurn, generationId: completedGeneration, duplicate: false, category: 'gemini_live_lifecycle' });
-              recordLiveTutorVoiceEvent('GEMINI_INPUT_TRANSCRIPT_FINAL', session, Date.now(), { transcriptChars: session.lastInputTranscript?.length ?? 0, finality: 'turn_complete' });
-              recordLiveTutorVoiceEvent('GEMINI_TURN_COMPLETE', session, Date.now());
+              recordLiveTutorVoiceEvent('GEMINI_INPUT_TRANSCRIPT_FINAL', voiceTelemetryIdentity(session), Date.now(), { transcriptChars: session.lastInputTranscript?.length ?? 0, finality: 'turn_complete' });
+              recordLiveTutorVoiceEvent('GEMINI_TURN_COMPLETE', voiceTelemetryIdentity(session), Date.now());
               logger.info('[LiveTutorVoiceServer] gemini_turn_completed', {
                 voiceTraceId: session.voiceTraceId,
                 sessionId,
@@ -537,11 +664,17 @@ export async function createGeminiLiveSession(options: {
                 discardProviderOutput: session.discardProviderOutput,
                 category: 'live_tutor_voice_turn',
               });
-              // Final audio callbacks are serialized ahead of this marker.
-              session.audioCallbackQueue = session.audioCallbackQueue.then(async () => {
+              // Wait only for this response's PCM work. A new response must
+              // begin immediately even when a previous generation is still
+              // draining or being cancelled.
+              finalizeAudioGeneration(session, completedGeneration, async () => {
+                if (session.generationId !== completedGeneration || session.discardProviderOutput || session.status !== 'active') return;
                 if (session.completedGenerationId === completedGeneration) return;
                 session.pendingTurnCompleteGenerationId = null;
                 session.completedGenerationId = completedGeneration;
+                // Flush the last PCM and notify the playback client before
+                // persistence. Database latency is not audio still playing.
+                await session.onAudioCompleted?.(completedTurn, completedGeneration);
                 await session.onTurnComplete?.({
                   turnNumber: completedTurn,
                   generationId: completedGeneration,
@@ -549,7 +682,7 @@ export async function createGeminiLiveSession(options: {
                   assistantText: finalizedAssistantText,
                   timestampMs: Date.now(),
                 });
-                session.onResponseCompleted?.(completedTurn, completedGeneration);
+                await session.onResponseCompleted?.(completedTurn, completedGeneration);
                 logger.info('turn_finalized', { voiceTraceId: session.voiceTraceId, sessionId, turnNumber: completedTurn, generationId: completedGeneration, category: 'gemini_live_lifecycle' });
               }).catch(() => {
                 session.status = 'error';
@@ -562,6 +695,8 @@ export async function createGeminiLiveSession(options: {
             session.lastInputTranscript = undefined;
             session.inputTranscriptBuffer = '';
             session.outputTranscriptBuffer = '';
+            session.activeInputPcm = [];
+            session.activeInputPcmBytes = 0;
             logger.info('[LiveTutorVoiceServer] gemini_ready_for_next_turn', { voiceTraceId: session.voiceTraceId, sessionId, turnNumber: completedTurn, category: 'live_tutor_voice_turn' });
           }
         },
@@ -603,12 +738,13 @@ export async function createGeminiLiveSession(options: {
         },
       });
     }
-    function recoverProvider(): Promise<void> {
+    function recoverProvider(recoveryOptions: { allowFreshConnection?: boolean; reason?: string } = {}): Promise<void> {
       if (recovery) return recovery;
       session.recovering = true;
       session.recoveryPcm = [];
       session.recoveryPcmBytes = 0;
       const handle = resumptionHandle;
+      const replayInterruptedTurn = recoveryOptions.reason === 'interruption_fence_timeout';
       resumptionHandle = undefined;
       resumable = false;
       goAwayPending = false;
@@ -618,13 +754,18 @@ export async function createGeminiLiveSession(options: {
       recovery = (async () => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
-          if (!handle) throw new Error('Live Tutor recovery is unavailable.');
+          if (!handle && !recoveryOptions.allowFreshConnection) throw new Error('Live Tutor recovery is unavailable.');
           const deadline = new Promise<never>((_, reject) => {
             timer = setTimeout(() => reject(new Error('Live Tutor recovery timed out.')), 8_000);
           });
           await Promise.race([Promise.resolve().then(() => options.beforeProviderReconnect?.()), deadline]);
           if (session.isClosingGracefully || session.status !== 'active') return;
-          const connecting = connectProvider(handle);
+          // A cancellation-fence timeout is different from a transport
+          // recovery: resuming could also resume the old model output. Start
+          // a clean Live connection for that one fallback and replay only the
+          // completed current learner turn.
+          const reconnectHandle = replayInterruptedTurn ? undefined : handle;
+          const connecting = connectProvider(reconnectHandle);
           // A late connection must never survive timeout or user termination.
           void connecting.then((client) => {
             if (session.isClosingGracefully || session.status !== 'active') client.close();
@@ -638,10 +779,33 @@ export async function createGeminiLiveSession(options: {
             client.sendClientContent({ turns: [{ role: 'user', parts: [{ text: buildTutorLanguageInstruction(session.pendingLanguage) }] }], turnComplete: false });
             session.pendingLanguage = undefined;
           }
-          for (const pcm of session.recoveryPcm ?? []) {
-            client.sendRealtimeInput({ audio: { data: Buffer.from(pcm).toString('base64'), mimeType: 'audio/pcm;rate=16000' } });
+          const replayPcm = replayInterruptedTurn
+            ? [...session.activeInputPcm, ...(session.recoveryPcm ?? [])]
+            : (session.recoveryPcm ?? []);
+          const replayMimeType = session.activeInputMimeType;
+          if (replayInterruptedTurn) {
+            // Old socket callbacks are fenced by connectionEpoch. The clean
+            // provider connection receives only the retained learner turn.
+            session.discardProviderOutput = false;
+            session.interruptedGenerationId = null;
+            session.cancelledGenerationId = null;
+            session.responseStarted = false;
+            clearInterruptionFenceTimer(session);
           }
-          logger.info('live_tutor_provider_resumed', { category: 'live_tutor_recovery' });
+          for (const pcm of replayPcm) {
+            client.sendRealtimeInput({ audio: { data: Buffer.from(pcm).toString('base64'), mimeType: replayMimeType } });
+          }
+          if (replayInterruptedTurn && session.inputActivityEnded) {
+            client.sendRealtimeInput({ audioStreamEnd: true });
+          }
+          logger.info('live_tutor_provider_resumed', {
+            streamId: session.streamId,
+            sessionId,
+            resumed: Boolean(reconnectHandle),
+            reason: recoveryOptions.reason ?? 'provider_go_away',
+            replayedPcmBytes: replayPcm.reduce((total, pcm) => total + pcm.byteLength, 0),
+            category: 'live_tutor_recovery',
+          });
         } catch {
           if (!session.isClosingGracefully) {
             session.status = 'error';
@@ -658,6 +822,26 @@ export async function createGeminiLiveSession(options: {
       })();
       return recovery;
     }
+    session.recoverAfterInterruptedTurn = () => {
+      if (!session.discardProviderOutput
+        || session.interruptedGenerationId === null
+        || !session.inputTurnActive
+        || !session.inputActivityEnded
+        || session.isClosingGracefully
+        || session.status !== 'active') return;
+
+      logger.warn('live_tutor_interruption_fence_timeout', {
+        streamId: session.streamId,
+        sessionId,
+        cancelledGenerationId: session.cancelledGenerationId,
+        activeGenerationId: session.generationId,
+        turnNumber: session.turnNumber,
+        timeoutMs: LIVE_TUTOR_INTERRUPTION_FENCE_TIMEOUT_MS,
+        retainedInputBytes: session.activeInputPcmBytes,
+        category: 'gemini_live_lifecycle',
+      });
+      void recoverProvider({ allowFreshConnection: true, reason: 'interruption_fence_timeout' });
+    };
     session.client = await connectProvider();
     session.status = 'active';
     if (options.conversationContext) {
@@ -851,12 +1035,6 @@ export function sendRealtimePcmAudio(sessionId: string, pcm: Uint8Array, mimeTyp
   const session = getGeminiLiveSession(sessionId);
   if (!session?.client || session.status !== 'active') throw new Error(`Gemini Live session is not active: ${sessionId}`);
   if (pcm.byteLength === 0 || pcm.byteLength % 2 !== 0) throw new Error('Invalid PCM16 audio chunk.');
-  if (session.recovering) {
-    if ((session.recoveryPcmBytes ?? 0) + pcm.byteLength > 32_000) throw new Error('Live Tutor recovery audio buffer is full.');
-    session.recoveryPcm?.push(pcm.slice());
-    session.recoveryPcmBytes = (session.recoveryPcmBytes ?? 0) + pcm.byteLength;
-    return;
-  }
   session.lastActivityAt = Date.now();
   if (!session.inputTurnActive || session.inputActivityEnded) {
     session.turnNumber += 1;
@@ -865,6 +1043,9 @@ export function sendRealtimePcmAudio(sessionId: string, pcm: Uint8Array, mimeTyp
     session.inputTurnActive = true;
     session.inputActivityEnded = false;
     session.lastInputTranscript = undefined;
+    session.activeInputPcm = [];
+    session.activeInputPcmBytes = 0;
+    session.activeInputMimeType = mimeType;
     logger.info('[LiveTutorVoiceServer] gemini_turn_started', {
       voiceTraceId: session.voiceTraceId,
       sessionId,
@@ -879,6 +1060,13 @@ export function sendRealtimePcmAudio(sessionId: string, pcm: Uint8Array, mimeTyp
     logger.info('generation_started', { voiceTraceId: session.voiceTraceId, sessionId, turnNumber: session.turnNumber, generationId: session.generationId, category: 'gemini_live_lifecycle' });
     logger.info('gemini_input_started', { voiceTraceId: session.voiceTraceId, sessionId, turnNumber: session.turnNumber, generationId: session.generationId, category: 'gemini_live_lifecycle' });
   }
+  retainActiveInputPcm(session, pcm, mimeType);
+  if (session.recovering) {
+    if ((session.recoveryPcmBytes ?? 0) + pcm.byteLength > 32_000) throw new Error('Live Tutor recovery audio buffer is full.');
+    session.recoveryPcm?.push(pcm.slice());
+    session.recoveryPcmBytes = (session.recoveryPcmBytes ?? 0) + pcm.byteLength;
+    return;
+  }
   session.pcmInputChunks += 1;
   session.pcmInputBytes += pcm.byteLength;
   if (session.pcmInputChunks === 1 || session.pcmInputChunks % 50 === 0) {
@@ -891,10 +1079,13 @@ export function sendRealtimePcmAudio(sessionId: string, pcm: Uint8Array, mimeTyp
 export function interruptGeminiLiveSession(sessionId: string): number {
   const session = getGeminiLiveSession(sessionId);
   if (!session?.client || session.status !== 'active') return 0;
+  if (session.discardProviderOutput && !session.inputTurnActive) return session.generationId;
 
   const interruptedGenerationId = session.generationId;
   session.generationId += 1;
   session.interruptedGenerationId = session.generationId;
+  session.cancelledGenerationId = interruptedGenerationId;
+  clearInterruptionFenceTimer(session);
   session.pendingTurnCompleteGenerationId = null;
   session.discardProviderOutput = true;
   session.inputTurnActive = false;
@@ -953,6 +1144,13 @@ export function endRealtimePcmAudio(sessionId: string): void {
     category: 'live_tutor_voice_turn',
   });
   session.client.sendRealtimeInput({ audioStreamEnd: true });
+  if (session.discardProviderOutput && session.interruptedGenerationId !== null) {
+    clearInterruptionFenceTimer(session);
+    session.interruptionFenceTimer = setTimeout(() => {
+      session.interruptionFenceTimer = undefined;
+      session.recoverAfterInterruptedTurn?.();
+    }, LIVE_TUTOR_INTERRUPTION_FENCE_TIMEOUT_MS);
+  }
 }
 
 /**
@@ -965,6 +1163,7 @@ export async function closeGeminiLiveSession(sessionId: string, reason?: string)
   try {
     session.isClosingGracefully = true;
     session.status = 'closed';
+    clearInterruptionFenceTimer(session);
     session.lastActivityAt = Date.now();
 
     if (session.client) {

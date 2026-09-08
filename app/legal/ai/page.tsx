@@ -1,6 +1,10 @@
 import LegalPage from '../LegalPage';
 
-export const metadata = { title: 'AI and Provider Information — Mento' };
+export const metadata = {
+  title: 'AI and Provider Information — Mento',
+  description: 'Understand how Mento uses Gemini, Simli, and safety controls in its AI learning features.',
+  alternates: { canonical: '/legal/ai' },
+};
 
 export default function AiInformationPage() {
   return <LegalPage title="AI and Provider Information" updated="August 25, 2026">

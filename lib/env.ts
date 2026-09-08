@@ -132,83 +132,17 @@ export function getPaymentWebhookAuthSecret(): string {
   return getPaymentWebhookSecret();
 }
 
-export function getPaddleProPriceId(): string {
-  ensureEnvironmentLoaded();
-  const value = resolveEnvValue('PADDLE_PRO_PRICE_ID');
-  if (!value) {
-    throw new Error('Environment variable "PADDLE_PRO_PRICE_ID" is required and must not be empty.');
-  }
-  return value;
-}
-
-export function getPaddleTopUpPriceId(): string | null {
-  ensureEnvironmentLoaded();
-  return resolveEnvValue('PADDLE_TOP_UP_PRICE_ID') ?? null;
-}
-
-export function getPaddleTopUp50PriceId(): string {
-  ensureEnvironmentLoaded();
-  const value = resolveEnvValue('PADDLE_TOP_UP_50_PRICE_ID');
-  if (!value) {
-    throw new Error('Environment variable "PADDLE_TOP_UP_50_PRICE_ID" is required and must not be empty.');
-  }
-  return value;
-}
-
-export function getPaddleTopUp100PriceId(): string {
-  ensureEnvironmentLoaded();
-  const value = resolveEnvValue('PADDLE_TOP_UP_100_PRICE_ID');
-  if (!value) {
-    throw new Error('Environment variable "PADDLE_TOP_UP_100_PRICE_ID" is required and must not be empty.');
-  }
-  return value;
-}
-
-export function getPaddleClientToken(): string | null {
-  ensureEnvironmentLoaded();
-  // This is a client-facing token that is safe to expose to the browser when configured.
-  return resolveEnvValue('NEXT_PUBLIC_PADDLE_CLIENT_TOKEN') ?? null;
-}
-
-export function getPaddleCheckoutUrl(): string {
-  ensureEnvironmentLoaded();
-  const value = resolveEnvValue('PADDLE_CHECKOUT_URL');
-  if (!value || !/^https:\/\//i.test(value)) {
-    throw new Error('Environment variable "PADDLE_CHECKOUT_URL" is required and must be an HTTPS URL.');
-  }
-  return value;
-}
-export type PaddleEnvironment = 'sandbox' | 'production';
-
-function normalizePaddleEnvironment(value: string | undefined): PaddleEnvironment {
-  const normalized = String(value ?? '').trim().toLowerCase();
-  if (normalized === 'production' || normalized === 'prod') {
-    return 'production';
-  }
-  return 'sandbox';
-}
-
-export function getPaddleApiKey(): string {
-  return getRequiredEnv('PADDLE_API_KEY');
-}
-
-export function getPaddleEnv(): PaddleEnvironment {
-  ensureEnvironmentLoaded();
-  const value = resolveEnvValue('PADDLE_ENV') ?? resolveEnvValue('NEXT_PUBLIC_PADDLE_ENV');
-  return normalizePaddleEnvironment(value);
-}
-
-export function getPaddleNotificationWebhookSecret(): string | null {
-  ensureEnvironmentLoaded();
-  return resolveEnvValue('PADDLE_NOTIFICATION_WEBHOOK_SECRET') ?? null;
-}
-
 export function getSimliApiKey(): string {
   return getRequiredEnv('SIMLI_API_KEY');
 }
 
 export function getSimliAvatarId(): string {
-  return getRequiredEnv('SIMLI_AVATAR_ID') || getRequiredEnv('SIMLI_FACE_ID');
+  ensureEnvironmentLoaded();
+  const avatarId = resolveEnvValue('SIMLI_AVATAR_ID') ?? resolveEnvValue('SIMLI_FACE_ID');
+  if (!avatarId) {
+    throw new Error('Environment variable "SIMLI_AVATAR_ID" is required and must not be empty.');
+  }
+  return avatarId;
 }
 
 export function getSimliVoiceId(): string {

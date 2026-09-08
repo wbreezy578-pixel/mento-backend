@@ -260,6 +260,7 @@ model UsageLog {
 
   @@unique([provider, requestId])
   @@index([userId, createdAt])
+  @@index([userId, feature, success, createdAt])
   @@index([feature, provider])
 }
 
@@ -571,6 +572,7 @@ model ConversationMessage {
 
   @@unique([conversationId, requestId, role])
   @@index([conversationId, createdAt])
+  @@index([conversationId, status, role, createdAt])
   @@index([userId])
 }
 

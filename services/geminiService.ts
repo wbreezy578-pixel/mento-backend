@@ -798,6 +798,7 @@ export async function askGeminiStream(
   securityInputOverride?: string,
   onUsage?: (usage: GeminiUsage) => void,
   onProviderAttempt?: (model: string) => Promise<unknown>,
+  approvedSecurityInput?: string,
 ): Promise<GeminiStreamResult> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
   assertFeatureEnabled(AI_FEATURES.STREAMING, 'Streaming is currently disabled.');
@@ -816,7 +817,14 @@ export async function askGeminiStream(
     throw new Error('Gemini is temporarily unavailable. Please try again shortly.');
   }
 
-  await runSecurityCheck(securityInputOverride ?? input);
+  const securityInput = securityInputOverride ?? input;
+  const latestPrompt = extractLatestUserPrompt(securityInput);
+  const hasApprovedSecurityInput = typeof approvedSecurityInput === 'string'
+    && approvedSecurityInput.trim().length > 0
+    && latestPrompt.startsWith(approvedSecurityInput.trim());
+  if (!hasApprovedSecurityInput) {
+    await runSecurityCheck(securityInput);
+  }
   const payload = await buildGeminiRequestPayload(input, requestKind);
   const requestStartedAt = Date.now();
   const candidates = getModelCandidatesForKind(requestKind, modelOverride);

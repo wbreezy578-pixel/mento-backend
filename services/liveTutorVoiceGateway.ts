@@ -1,5 +1,6 @@
 import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { LiveTutorPcmDeliveryQueue } from './liveTutorPcmDeliveryQueue';
 import { WebSocket, WebSocketServer } from 'ws';
 import { prisma } from '../lib/prisma';
 import { completeSimliSessionLifecycle, markLiveTutorSessionUsable } from './simliService';
@@ -16,7 +17,7 @@ import {
   type GeminiLiveSession,
 } from './liveTutorGeminiLiveService';
 import { PCMResampler } from './liveTutorAudioBridge';
-import { LIVE_TUTOR_INPUT_MIME_TYPE, resamplePcm16Mono, parsePcmMimeType, SIMLI_PCM_BYTES_PER_SAMPLE, SIMLI_PCM_FRAME_BYTES, SIMLI_PCM_SAMPLE_RATE, splitPcmIntoSimliFrames, validateLiveTutorPcm16 } from './liveTutorAudioProtocol';
+import { LIVE_TUTOR_INPUT_MIME_TYPE, resamplePcm16Mono, parsePcmMimeType, SIMLI_PCM_BYTES_PER_SAMPLE, SIMLI_PCM_FRAME_BYTES, SIMLI_PCM_SAMPLE_RATE, StreamingPcmFrameBuffer, validateLiveTutorPcm16 } from './liveTutorAudioProtocol';
 import logger from '../lib/logger';
 import { acquireVoiceLease, refreshVoiceLease, releaseVoiceLease } from '../lib/realtimeRedis';
 import { getLiveTutorConversationContext, persistLiveTutorTurn } from './liveTutorConversationService';
@@ -37,6 +38,28 @@ type VoiceSessionRuntime = {
   detachedAt: number | null;
   leaseOwnerId: string;
 };
+
+type QueuedPcmFrame = {
+  bytes: Uint8Array;
+  generationId: number;
+  turnNumber: number;
+  mimeType: string;
+  geminiAudioReceivedAt?: number;
+};
+
+function compactLiveKitReceiverStats(details: Record<string, unknown> | undefined): Record<string, unknown> {
+  const compactTrack = (value: unknown, fields: string[]) => {
+    const source = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+    return Object.fromEntries(fields.map((field) => [field, typeof source[field] === 'number' && Number.isFinite(source[field]) ? source[field] : null]));
+  };
+  return {
+    sampledAtMs: typeof details?.timestampMs === 'number' && Number.isFinite(details.timestampMs) ? details.timestampMs : null,
+    audioContextSampleRate: typeof details?.audioContextSampleRate === 'number' && Number.isFinite(details.audioContextSampleRate) ? details.audioContextSampleRate : null,
+    simliWorkletBufferSamples: typeof details?.simliWorkletBufferSamples === 'number' && Number.isFinite(details.simliWorkletBufferSamples) ? details.simliWorkletBufferSamples : null,
+    audio: compactTrack(details?.audio, ['jitter', 'packetsLost', 'concealedSamples', 'concealmentEvents', 'silentConcealedSamples']),
+    video: compactTrack(details?.video, ['jitter', 'packetsLost', 'framesReceived', 'framesDecoded', 'framesDropped', 'nackCount', 'pliCount']),
+  };
+}
 
 const voiceSessionRuntimes = new Map<string, VoiceSessionRuntime>();
 
@@ -120,9 +143,71 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
     let streamingResampler: PCMResampler | null = null;
     let resamplerGeneration = -1;
     let resamplerFormat = "";
+    const pcmFrameBuffer = new StreamingPcmFrameBuffer();
+    let frameBufferGeneration = -1;
     const audioSequenceByGeneration = new Map<number, number>();
     const previousAudioSentAtByGeneration = new Map<number, number>();
     const pendingPcm: Uint8Array[] = [];
+    const sendQueuedPcmFrame = (item: QueuedPcmFrame): boolean => {
+      if (gemini?.generationId !== item.generationId || gemini?.discardProviderOutput) return false;
+      const targetSocket = socketRef.current;
+      if (!activeRef.current || targetSocket?.readyState !== WebSocket.OPEN) return false;
+      try {
+        const sequenceNumber = (audioSequenceByGeneration.get(item.generationId) ?? 0) + 1;
+        audioSequenceByGeneration.set(item.generationId, sequenceNumber);
+        const backendPcmSentAt = Date.now();
+        const previousAudioSentAt = previousAudioSentAtByGeneration.get(item.generationId);
+        previousAudioSentAtByGeneration.set(item.generationId, backendPcmSentAt);
+        const audioDurationMs = (item.bytes.byteLength / SIMLI_PCM_BYTES_PER_SAMPLE / SIMLI_PCM_SAMPLE_RATE) * 1_000;
+        targetSocket.send(JSON.stringify({
+          type: 'audio_chunk',
+          sessionId: gemini?.sessionId ?? null,
+          streamId: durableStreamId,
+          mimeType: item.mimeType,
+          turnNumber: item.turnNumber,
+          generationId: item.generationId,
+          sequenceNumber,
+          byteLength: item.bytes.byteLength,
+          audioDurationMs,
+          geminiAudioReceivedAt: item.geminiAudioReceivedAt,
+          backendPcmSentAt,
+          millisecondsSincePreviousAudioChunk: previousAudioSentAt === undefined ? null : backendPcmSentAt - previousAudioSentAt,
+        }));
+        targetSocket.send(item.bytes, { binary: true });
+        const shouldSampleAudioLog = sequenceNumber === 1 || sequenceNumber % 50 === 0;
+        recordLiveTutorVoiceEvent('BACKEND_FIRST_PCM_16K_SENT', {
+          sessionId: gemini?.sessionId ?? 'unknown',
+          streamId: durableStreamId,
+          voiceTraceId,
+          turnNumber: item.turnNumber,
+          generationId: item.generationId,
+        }, backendPcmSentAt, { mimeType: item.mimeType, byteLength: item.bytes.byteLength, sequenceNumber, audioDurationMs });
+        if (shouldSampleAudioLog) logger.info('[LiveTutorVoiceGateway] output_pcm_delivery_sample', {
+          sessionId: gemini?.sessionId ?? null,
+          streamId: durableStreamId,
+          turnNumber: item.turnNumber,
+          generationId: item.generationId,
+          mimeType: item.mimeType,
+          byteLength: item.bytes.byteLength,
+          sequenceNumber,
+          category: 'live_tutor_voice_audio_path',
+        });
+        return true;
+      } catch (error) {
+        logger.error('[LiveTutorVoiceGateway] output_pcm_send_failed', {
+          sessionId: gemini?.sessionId ?? null,
+          streamId: durableStreamId,
+          turnNumber: item.turnNumber,
+          generationId: item.generationId,
+          mimeType: item.mimeType,
+          byteLength: item.bytes.byteLength,
+          error: error instanceof Error ? error.message : String(error),
+          category: 'live_tutor_voice_audio_path',
+        });
+        return false;
+      }
+    };
+    const deliveryQueue = new LiveTutorPcmDeliveryQueue<QueuedPcmFrame>({ send: sendQueuedPcmFrame });
     const authTimer = setTimeout(() => reject(socket, 'authentication_timeout'), AUTH_TIMEOUT_MS);
 
     const cleanup = async (reason: string) => {
@@ -139,6 +224,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
         clearTimeout(sessionExpiryTimer);
         sessionExpiryTimer = null;
       }
+      deliveryQueue.clear();
       const terminalDisconnect = reason === 'mobile_disconnect' || reason === 'user_ended_session' || reason === 'session_expired';
       const canResume = Boolean(authenticated && gemini && durableStreamId && !terminalDisconnect && gemini.status === 'active');
       if (gemini && !canResume) {
@@ -318,32 +404,60 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
                 assistantText: turn.assistantText,
               });
             },
-            onInterrupted: () => {
+            onInterrupted: (cancelledGenerationId) => {
+              if (gemini?.generationId !== cancelledGenerationId + 1 && gemini?.generationId !== cancelledGenerationId) {
+                logger.info('late_provider_interruption_ignored', {
+                  sessionId: gemini?.sessionId ?? null,
+                  streamId: durableStreamId,
+                  cancelledGenerationId,
+                  activeGenerationId: gemini?.generationId ?? null,
+                  reason: 'newer_generation_active_at_gateway',
+                  category: 'live_tutor_voice_interrupted',
+                });
+                return;
+              }
               streamingResampler?.reset();
-              logger.info('[LiveTutorVoice] Gemini interruption', { category: 'live_tutor_voice_interrupted' });
-              if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'interrupted' }));
+              pcmFrameBuffer.reset();
+              frameBufferGeneration = -1;
+              deliveryQueue.clear();
+              logger.info('[LiveTutorVoice] Gemini interruption', { cancelledGenerationId, category: 'live_tutor_voice_interrupted' });
+              if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'interrupted', generationId: cancelledGenerationId }));
             },
             onError: (error) => {
               logger.error('[LiveTutorVoiceServer] error', { voiceTraceId, stage: 'gemini', message: error.message, category: 'live_tutor_voice_error' });
+              activeRef.current = false;
+              if (socketRef.current?.readyState === WebSocket.OPEN) {
+                socketRef.current.send(JSON.stringify({ type: 'error', code: 'provider_session_ended' }));
+                socketRef.current.close(1011, 'provider_session_ended');
+              }
               void completeSimliSessionLifecycle(identity.streamId, { status: 'failed', timing: 'transport_recovery_end', reason: error.message }, identity.userId)
-                .catch(() => undefined)
-                .finally(() => {
-                  if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.close(1011, 'gemini_error');
-                });
+                .catch(() => undefined);
             },
             onResponseStarted: (turnNumber, generationId) => {
+              deliveryQueue.startGeneration(generationId);
               if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'response_started', turnNumber, generationId }));
             },
-            onResponseCompleted: (turnNumber, generationId) => {
+            onAudioCompleted: async (turnNumber, generationId) => {
+              if (gemini?.generationId !== generationId || gemini.discardProviderOutput) return;
               const tail = resamplerGeneration === generationId ? streamingResampler?.flush() : undefined;
-              if (tail?.byteLength && activeRef.current && socketRef.current?.readyState === WebSocket.OPEN && !gemini?.discardProviderOutput) {
-                const sequenceNumber = (audioSequenceByGeneration.get(generationId) ?? 0) + 1;
-                audioSequenceByGeneration.set(generationId, sequenceNumber);
-                socketRef.current.send(JSON.stringify({ type: 'audio_chunk', generationId, turnNumber,
-                  sequenceNumber, mimeType: 'audio/pcm;rate=16000', byteLength: tail.byteLength, backendPcmSentAt: Date.now() }));
-                socketRef.current.send(tail, { binary: true });
+              const finalFrames = tail?.byteLength && frameBufferGeneration === generationId
+                ? pcmFrameBuffer.push(tail)
+                : [];
+              const paddedTail = frameBufferGeneration === generationId ? pcmFrameBuffer.flushPadded() : null;
+              if (paddedTail) finalFrames.push(paddedTail);
+              for (const frame of finalFrames) {
+                const accepted = await deliveryQueue.enqueue(generationId, {
+                  bytes: frame,
+                  generationId,
+                  turnNumber,
+                  mimeType: 'audio/pcm;rate=16000',
+                });
+                if (!accepted) break;
               }
-              if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'response_completed', turnNumber, generationId }));
+              await deliveryQueue.waitForDrain(generationId);
+              if (gemini?.generationId === generationId && !gemini.discardProviderOutput && socketRef.current?.readyState === WebSocket.OPEN) {
+                socketRef.current.send(JSON.stringify({ type: 'response_completed', turnNumber, generationId }));
+              }
             },
             onTranscript: ({ speaker, text, isFinal, turnNumber, generationId }) => {
               if (socketRef.current?.readyState === WebSocket.OPEN && text.trim()) {
@@ -405,6 +519,9 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
                 streamingResampler = new PCMResampler(format.sampleRate, 16000);
                 resamplerGeneration = generationId;
                 resamplerFormat = mimeType;
+                pcmFrameBuffer.reset();
+                frameBufferGeneration = generationId;
+                deliveryQueue.startGeneration(generationId);
                 audioSequenceByGeneration.clear();
                 previousAudioSentAtByGeneration.clear();
               }
@@ -438,63 +555,15 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
                 category: 'live_tutor_audio_format',
               });
 
-              if (activeRef.current && socketRef.current?.readyState === WebSocket.OPEN) {
-                try {
-                  for (const frame of splitPcmIntoSimliFrames(simliAudio)) {
-                    if (!activeRef.current || socketRef.current?.readyState !== WebSocket.OPEN) break;
-                    const sequenceNumber = (audioSequenceByGeneration.get(generationId) ?? 0) + 1;
-                    audioSequenceByGeneration.set(generationId, sequenceNumber);
-                    const backendPcmSentAt = Date.now();
-                    const previousAudioSentAt = previousAudioSentAtByGeneration.get(generationId);
-                    previousAudioSentAtByGeneration.set(generationId, backendPcmSentAt);
-                    const audioDurationMs = (frame.byteLength / SIMLI_PCM_BYTES_PER_SAMPLE / SIMLI_PCM_SAMPLE_RATE) * 1_000;
-                    socketRef.current.send(JSON.stringify({
-                      type: 'audio_chunk',
-                      sessionId: gemini?.sessionId ?? null,
-                      streamId: durableStreamId,
-                      mimeType: simliMimeType,
-                      turnNumber: gemini?.turnNumber ?? 0,
-                      generationId,
-                      sequenceNumber,
-                      byteLength: frame.byteLength,
-                      audioDurationMs,
-                      geminiAudioReceivedAt: _timestamp,
-                      backendPcmSentAt,
-                      millisecondsSincePreviousAudioChunk: previousAudioSentAt === undefined ? null : backendPcmSentAt - previousAudioSentAt,
-                    }));
-                    socketRef.current.send(frame, { binary: true });
-                    const shouldSampleAudioLog = sequenceNumber === 1 || sequenceNumber % 50 === 0;
-                    recordLiveTutorVoiceEvent('BACKEND_FIRST_PCM_16K_SENT', {
-                      sessionId: gemini?.sessionId ?? 'unknown',
-                      streamId: durableStreamId,
-                      voiceTraceId,
-                      turnNumber: gemini?.turnNumber ?? 0,
-                      generationId,
-                    }, backendPcmSentAt, { mimeType: simliMimeType, byteLength: frame.byteLength, sequenceNumber, audioDurationMs });
-                    if (shouldSampleAudioLog) logger.info('[LiveTutorVoiceGateway] output_pcm_delivery_sample', {
-                      sessionId: gemini?.sessionId ?? null,
-                      streamId: durableStreamId,
-                      turnNumber: gemini?.turnNumber ?? 0,
-                      generationId,
-                      mimeType: simliMimeType,
-                      byteLength: frame.byteLength,
-                      sequenceNumber,
-                      category: 'live_tutor_voice_audio_path',
-                    });
-                  }
-                } catch (error) {
-                  const message = error instanceof Error ? error.message : String(error);
-                  logger.error('[LiveTutorVoiceGateway] output_pcm_send_failed', {
-                    sessionId: gemini?.sessionId ?? null,
-                    streamId: durableStreamId,
-                    turnNumber: gemini?.turnNumber ?? 0,
-                    generationId,
-                    mimeType: simliMimeType,
-                    byteLength: simliAudio.byteLength,
-                    error: message,
-                    category: 'live_tutor_voice_audio_path',
-                  });
-                }
+              for (const frame of pcmFrameBuffer.push(simliAudio)) {
+                const accepted = await deliveryQueue.enqueue(generationId, {
+                  bytes: frame,
+                  generationId,
+                  turnNumber: gemini?.turnNumber ?? 0,
+                  mimeType: simliMimeType,
+                  geminiAudioReceivedAt: _timestamp,
+                });
+                if (!accepted) break;
               }
             },
           });
@@ -519,13 +588,32 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
         }
 
         if (!isBinary) {
-          const message = JSON.parse(payload.toString()) as { type?: string; tutorLanguage?: unknown; token?: string; streamId?: string; event?: string; eventTimestampMs?: number; turnNumber?: number; generationId?: number; details?: Record<string, unknown> };
+          const message = JSON.parse(payload.toString()) as { type?: string; tutorLanguage?: unknown; token?: string; streamId?: string; event?: string; eventTimestampMs?: number; turnNumber?: number; generationId?: number; queueDepthMs?: unknown; details?: Record<string, unknown> };
           if (message.type === 'language') {
             if (!gemini || !isTutorLanguage(message.tutorLanguage)) return reject(socket, 'invalid_tutor_language');
             updateLiveTutorLanguage(gemini.sessionId, message.tutorLanguage);
             return;
           }
           logger.info('[LiveTutorVoiceBackend] message received', { type: message.type ?? 'unknown', category: 'live_tutor_voice_message' });
+          if (message.type === 'playback_buffer') {
+            const generationId = Number.isInteger(message.generationId) ? message.generationId : gemini?.generationId;
+            if (generationId !== undefined && typeof message.queueDepthMs === 'number' && Number.isFinite(message.queueDepthMs)) {
+              deliveryQueue.setClientQueueDepthMs(generationId, message.queueDepthMs);
+            }
+            return;
+          }
+          if (message.type === 'livekit_receiver_stats') {
+            logger.info('[LiveTutorVoiceGateway] livekit_receiver_stats', {
+              sessionId: gemini?.sessionId ?? null,
+              streamId: durableStreamId,
+              voiceTraceId,
+              turnNumber: gemini?.turnNumber ?? null,
+              generationId: gemini?.generationId ?? null,
+              ...compactLiveKitReceiverStats(message.details),
+              category: 'live_tutor_livekit_receiver_stats',
+            });
+            return;
+          }
           if (message.type === 'auth_refresh') {
             if (!message.token || message.streamId !== durableStreamId || !durableUserId) {
               return reject(socket, 'invalid_auth_refresh');
@@ -572,16 +660,23 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
           }
           if (message.type === 'interrupt') {
             streamingResampler?.reset();
-            const generationId = gemini ? interruptGeminiLiveSession(gemini.sessionId) : 0;
+            deliveryQueue.clear();
+            const replacementGenerationId = gemini ? interruptGeminiLiveSession(gemini.sessionId) : 0;
+            const cancelledGenerationId = gemini?.cancelledGenerationId ?? replacementGenerationId;
             logger.info('live_tutor_barge_in_detected', {
               streamId: durableStreamId,
               turnId: `${durableStreamId ?? 'unknown'}-turn-${gemini?.turnNumber ?? 0}`,
               previousState: 'speaking',
               resultingState: 'interrupted',
               reason: 'user_speech_activity',
-              generationId,
+              generationId: cancelledGenerationId,
+              replacementGenerationId,
             });
-            if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'interrupted', generationId }));
+            if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({
+              type: 'interrupted',
+              generationId: cancelledGenerationId,
+              replacementGenerationId,
+            }));
           }
           return;
         }

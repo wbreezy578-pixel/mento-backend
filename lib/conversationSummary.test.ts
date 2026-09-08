@@ -98,6 +98,7 @@ import {
   CONVERSATION_SUMMARY_MAX_CHARS,
   getConversationHistoryForAI,
   mergeConversationSummary,
+  refreshConversationSummarySafely,
   selectLanguageAgnosticSummaryLines,
   updateConversationSummary,
 } from './conversationDb';
@@ -172,12 +173,24 @@ describe('incremental conversation summaries', () => {
 
   it('keeps recent unsummarized turns verbatim and out of the summary', async () => {
     appendMessages(45);
+    await updateConversationSummary('conversation-1');
     const history = await getConversationHistoryForAI('conversation-1');
     expect(history).toHaveLength(42);
     expect(history[0].parts[0].text).toContain('untrusted learner/model context');
     expect(history[2].parts[0].text).toBe('turn 5');
     expect(history[41].parts[0].text).toBe('turn 44');
     expect(mocks.state.summary).not.toContain('turn 5');
+  });
+
+  it('uses the last persisted summary without refreshing it during history construction', async () => {
+    appendMessages(42);
+    await updateConversationSummary('conversation-1');
+    const transactionCallsBeforeHistory = mocks.prisma.$transaction.mock.calls.length;
+
+    const history = await getConversationHistoryForAI('conversation-1');
+
+    expect(history[0].parts[0].text).toContain('turn 0');
+    expect(mocks.prisma.$transaction.mock.calls.length).toBe(transactionCallsBeforeHistory);
   });
 
   it('preserves the prior summary when refresh fails', async () => {
@@ -188,6 +201,27 @@ describe('incremental conversation summaries', () => {
     mocks.setFailure(true);
     await expect(updateConversationSummary('conversation-1')).rejects.toThrow('summary database unavailable');
     expect(mocks.state).toEqual(prior);
+  });
+
+  it('isolates post-exchange summary failure from the chat response lifecycle', async () => {
+    appendMessages(42);
+    const prior = { ...mocks.state };
+    mocks.setFailure(true);
+
+    await expect(refreshConversationSummarySafely('conversation-1')).resolves.toBeUndefined();
+    expect(mocks.state).toEqual(prior);
+  });
+
+  it('coalesces concurrent refreshes for the same conversation', async () => {
+    appendMessages(42);
+
+    await Promise.all([
+      refreshConversationSummarySafely('conversation-1'),
+      refreshConversationSummarySafely('conversation-1'),
+    ]);
+
+    expect(mocks.prisma.$transaction).toHaveBeenCalledOnce();
+    expect(mocks.state.summaryRevision).toBe(1);
   });
 
   it('retries an optimistic conflict without overwriting the newer summary', async () => {

@@ -22,7 +22,6 @@
       "node"
     ],
     "allowImportingTsExtensions": true,
-    "baseUrl": ".",
     "plugins": [
       {
         "name": "next"

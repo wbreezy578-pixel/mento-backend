@@ -28,15 +28,6 @@ param simliVoiceId string = 'Default'
 @secure()
 param paymentWebhookAuthSecret string
 @secure()
-param paddleApiKey string = ''
-@secure()
-param paddleNotificationWebhookSecret string = ''
-param paddleEnv string = 'production'
-param paddleProPriceId string = ''
-param paddleTopUp50PriceId string = ''
-param paddleTopUp100PriceId string = ''
-param paddleCheckoutUrl string = ''
-@secure()
 param googlePlayWifConfigJson string = ''
 @secure()
 param googlePlayServiceAccountJson string = ''
@@ -127,14 +118,6 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
         {
           name: 'payment-webhook-auth-secret'
           value: paymentWebhookAuthSecret
-        }
-        {
-          name: 'paddle-api-key'
-          value: paddleApiKey
-        }
-        {
-          name: 'paddle-webhook-secret'
-          value: paddleNotificationWebhookSecret
         }
         {
           name: 'google-play-wif-config-json'
@@ -321,34 +304,6 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'PAYMENT_WEBHOOK_AUTH_SECRET'
               secretRef: 'payment-webhook-auth-secret'
-            }
-            {
-              name: 'PADDLE_ENV'
-              value: paddleEnv
-            }
-            {
-              name: 'PADDLE_API_KEY'
-              secretRef: 'paddle-api-key'
-            }
-            {
-              name: 'PADDLE_NOTIFICATION_WEBHOOK_SECRET'
-              secretRef: 'paddle-webhook-secret'
-            }
-            {
-              name: 'PADDLE_PRO_PRICE_ID'
-              value: paddleProPriceId
-            }
-            {
-              name: 'PADDLE_TOP_UP_50_PRICE_ID'
-              value: paddleTopUp50PriceId
-            }
-            {
-              name: 'PADDLE_TOP_UP_100_PRICE_ID'
-              value: paddleTopUp100PriceId
-            }
-            {
-              name: 'PADDLE_CHECKOUT_URL'
-              value: paddleCheckoutUrl
             }
             {
               name: 'GOOGLE_PLAY_WIF_CONFIG_JSON'

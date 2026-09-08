@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { normalizePcmForSimli, SIMLI_PCM_FRAME_BYTES, splitPcmIntoSimliFrames } from './liveTutorAudioProtocol';
+import { normalizePcmForSimli, SIMLI_PCM_FRAME_BYTES, splitPcmIntoSimliFrames, StreamingPcmFrameBuffer } from './liveTutorAudioProtocol';
 
 describe('normalizePcmForSimli', () => {
   it('resamples Gemini TTS 24 kHz PCM to Simli 16 kHz PCM', () => {
@@ -30,12 +30,46 @@ describe('normalizePcmForSimli', () => {
 });
 
 describe('splitPcmIntoSimliFrames', () => {
-  it('splits 6,000-byte provider bursts into 640-byte streamable frames', () => {
+  it('splits provider chunks into 20ms PCM frames without losing the tail', () => {
     const pcm = new Uint8Array(6_000);
     const frames = splitPcmIntoSimliFrames(pcm);
 
+    expect(SIMLI_PCM_FRAME_BYTES).toBe(16000 * 2 * 0.020);
     expect(frames).toHaveLength(10);
-    expect(frames.slice(0, 9).every((frame) => frame.byteLength === SIMLI_PCM_FRAME_BYTES)).toBe(true);
     expect(frames[9].byteLength).toBe(240);
+    expect(frames[0].byteLength).toBe(SIMLI_PCM_FRAME_BYTES);
+  });
+});
+
+describe('StreamingPcmFrameBuffer', () => {
+  it('preserves partial PCM across chunks and emits only exact 20ms frames', () => {
+    const frameBuffer = new StreamingPcmFrameBuffer();
+    const first = new Uint8Array(1_000).fill(1);
+    const second = new Uint8Array(920).fill(2);
+
+    const firstFrames = frameBuffer.push(first);
+    const secondFrames = frameBuffer.push(second);
+
+    expect(firstFrames).toHaveLength(1);
+    expect(secondFrames).toHaveLength(2);
+    expect([...firstFrames, ...secondFrames].every(frame => frame.byteLength === 640)).toBe(true);
+    expect(frameBuffer.remainderBytes).toBe(0);
+    expect(secondFrames[0].slice(0, 360)).toEqual(new Uint8Array(360).fill(1));
+    expect(secondFrames[0].slice(360)).toEqual(new Uint8Array(280).fill(2));
+  });
+
+  it('pads only the final response tail and clears it on interruption', () => {
+    const frameBuffer = new StreamingPcmFrameBuffer();
+    frameBuffer.push(new Uint8Array(240).fill(7));
+    const tail = frameBuffer.flushPadded();
+    expect(tail).not.toBeNull();
+    expect(tail?.byteLength).toBe(SIMLI_PCM_FRAME_BYTES);
+    expect(tail?.slice(0, 240)).toEqual(new Uint8Array(240).fill(7));
+    expect(tail?.slice(240)).toEqual(new Uint8Array(400));
+    expect(frameBuffer.flushPadded()).toBeNull();
+
+    frameBuffer.push(new Uint8Array(100).fill(9));
+    frameBuffer.reset();
+    expect(frameBuffer.remainderBytes).toBe(0);
   });
 });

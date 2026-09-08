@@ -2,6 +2,16 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('../lib/logger', () => ({ default: { info: vi.fn() } }));
 vi.mock('../lib/metrics', () => ({ observeLiveTutorVoiceLatency: vi.fn() }));
 import { isDeviceVoiceEvent, metrics } from './liveTutorVoiceTelemetry';
+it('separates bridge and prebuffer latency without fabricating audible playback', () => {
+  const result = metrics({ FRONTEND_FIRST_PCM_RECEIVED: 1000, WEBVIEW_FIRST_PCM_RECEIVED: 1012,
+    SIMLI_FIRST_PCM_SUBMITTED: 1132, SIMLI_SPEAKING_SIGNAL: 1350 });
+  expect(isDeviceVoiceEvent('WEBVIEW_FIRST_PCM_RECEIVED')).toBe(true);
+  expect(isDeviceVoiceEvent('SIMLI_FIRST_PCM_SUBMITTED')).toBe(true);
+  expect(result.frontendToWebviewMs).toBe(12);
+  expect(result.webviewPrebufferWaitMs).toBe(120);
+  expect(result.submissionToSimliSpeakingSignalMs).toBe(218);
+  expect(result.frontendReceivedToSimliPlayedMs).toBeNull();
+});
 
 describe('Live Tutor clock-domain latency', () => {
   it('does not let client telemetry impersonate provider events', () => {

@@ -198,15 +198,14 @@ async function assertTokenOwnership(userId: string, purchaseToken: string): Prom
 
 async function removeNativeSubscriptionEntitlement(userId: string): Promise<void> {
   const now = new Date();
-  const [otherActive, wallet, freePlan] = await Promise.all([
+  const [otherActive, freePlan] = await Promise.all([
     prisma.storePurchase.findFirst({
       where: { userId, purchaseType: 'SUBSCRIPTION', expiresAt: { gt: now }, status: { in: ['SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD', 'SUBSCRIPTION_STATE_CANCELED', 'ACTIVE'] } },
       select: { id: true },
     }),
-    prisma.userWallet.findUnique({ where: { userId }, select: { paddleSubscriptionId: true } }),
     prisma.plan.findUnique({ where: { name: 'FREE' }, select: { id: true } }),
   ]);
-  if (!otherActive && !wallet?.paddleSubscriptionId && freePlan) {
+  if (!otherActive && freePlan) {
     await prisma.userWallet.update({ where: { userId }, data: { planId: freePlan.id, subscriptionStatus: 'inactive', subscriptionExpiresAt: null } });
   }
 }

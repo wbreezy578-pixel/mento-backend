@@ -471,12 +471,51 @@ async function resolveWalletAndPlanInTransaction(
   userId: string,
   fallbackPlan: PlanRecord,
 ): Promise<{ wallet: { id: string; userId: string; planId: string; planName: string; subscriptionStatus: string; subscriptionStartedAt: Date | null; subscriptionPeriodStart: Date | null; subscriptionExpiresAt: Date | null } | null; plan: PlanRecord }> {
-  const existingWallet = await tx.userWallet.findUnique({
-    where: { userId },
-    include: { plan: true },
-  });
+  const existingWallet = await tx.$queryRaw<Array<{
+    walletId: string;
+    walletUserId: string;
+    planId: string;
+    planName: string;
+    planPrice: number;
+    planMessageLimit: number | null;
+    planImageLimit: number | null;
+    planChatModel: string;
+    planFairUseEnabled: boolean;
+    planImageDailyLimit: number;
+    planPriority: number;
+    planLiveTutorEnabled: boolean;
+    planFeatures: Prisma.JsonValue | null;
+    subscriptionStatus: string;
+    subscriptionStartedAt: Date | null;
+    subscriptionPeriodStart: Date | null;
+    subscriptionExpiresAt: Date | null;
+  }>>`
+    SELECT
+      w."id" AS "walletId",
+      w."userId" AS "walletUserId",
+      p."id" AS "planId",
+      p."name" AS "planName",
+      p."price" AS "planPrice",
+      p."messageLimit" AS "planMessageLimit",
+      p."imageLimit" AS "planImageLimit",
+      p."chatModel" AS "planChatModel",
+      p."fairUseEnabled" AS "planFairUseEnabled",
+      p."imageDailyLimit" AS "planImageDailyLimit",
+      p."priority" AS "planPriority",
+      p."liveTutorEnabled" AS "planLiveTutorEnabled",
+      p."features" AS "planFeatures",
+      w."subscriptionStatus" AS "subscriptionStatus",
+      w."subscriptionStartedAt" AS "subscriptionStartedAt",
+      w."subscriptionPeriodStart" AS "subscriptionPeriodStart",
+      w."subscriptionExpiresAt" AS "subscriptionExpiresAt"
+    FROM "UserWallet" w
+    INNER JOIN "Plan" p ON p."id" = w."planId"
+    WHERE w."userId" = ${userId}
+    FOR UPDATE
+  `;
 
-  const wallet = existingWallet ?? await (async () => {
+  const existingWalletRow = existingWallet[0];
+  const createdWallet = existingWalletRow ? null : await (async () => {
     const currentFallbackPlan = await tx.plan.findUnique({
       where: { name: fallbackPlan.name },
       select: { id: true },
@@ -488,38 +527,57 @@ async function resolveWalletAndPlanInTransaction(
     );
   })();
 
-  const planRecord = wallet.plan ? {
-    id: wallet.plan.id,
-    name: wallet.plan.name,
-    price: wallet.plan.price,
-    messageLimit: wallet.plan.messageLimit,
-    imageLimit: wallet.plan.imageLimit,
-    chatModel: wallet.plan.chatModel,
-    fairUseEnabled: wallet.plan.fairUseEnabled,
-    imageDailyLimit: wallet.plan.imageDailyLimit,
-    priority: wallet.plan.priority,
-    liveTutorEnabled: wallet.plan.liveTutorEnabled,
-    features: wallet.plan.features as Record<string, unknown>,
-  } as PlanRecord : fallbackPlan;
+  const planRecord = existingWalletRow
+    ? {
+        id: existingWalletRow.planId,
+        name: existingWalletRow.planName,
+        price: existingWalletRow.planPrice,
+        messageLimit: existingWalletRow.planMessageLimit,
+        imageLimit: existingWalletRow.planImageLimit,
+        chatModel: existingWalletRow.planChatModel,
+        fairUseEnabled: existingWalletRow.planFairUseEnabled,
+        imageDailyLimit: existingWalletRow.planImageDailyLimit,
+        priority: existingWalletRow.planPriority,
+        liveTutorEnabled: existingWalletRow.planLiveTutorEnabled,
+        features: (existingWalletRow.planFeatures ?? {}) as Record<string, unknown>,
+      } as PlanRecord
+    : fallbackPlan;
 
   const effectivePlan = isSubscriptionActive(
-    wallet.subscriptionStatus as string,
-    wallet.subscriptionExpiresAt,
-    wallet.subscriptionPeriodStart ?? wallet.subscriptionStartedAt,
+    existingWalletRow?.subscriptionStatus ?? createdWallet!.subscriptionStatus,
+    existingWalletRow?.subscriptionExpiresAt ?? createdWallet!.subscriptionExpiresAt,
+    existingWalletRow?.subscriptionPeriodStart ?? createdWallet!.subscriptionPeriodStart ?? createdWallet!.subscriptionStartedAt,
   )
     ? planRecord
     : fallbackPlan;
 
+  if (existingWalletRow) {
+    return {
+      wallet: {
+        id: existingWalletRow.walletId,
+        userId: existingWalletRow.walletUserId,
+        planId: existingWalletRow.planId,
+        planName: existingWalletRow.planName,
+        subscriptionStatus: existingWalletRow.subscriptionStatus,
+        subscriptionStartedAt: existingWalletRow.subscriptionStartedAt,
+        subscriptionPeriodStart: existingWalletRow.subscriptionPeriodStart,
+        subscriptionExpiresAt: existingWalletRow.subscriptionExpiresAt,
+      },
+      plan: effectivePlan,
+    };
+  }
+
+  const newWallet = createdWallet!;
   return {
     wallet: {
-      id: wallet.id,
-      userId: wallet.userId,
-      planId: wallet.planId,
-      planName: wallet.plan.name,
-      subscriptionStatus: wallet.subscriptionStatus,
-      subscriptionStartedAt: wallet.subscriptionStartedAt,
-      subscriptionPeriodStart: wallet.subscriptionPeriodStart,
-      subscriptionExpiresAt: wallet.subscriptionExpiresAt,
+      id: newWallet.id,
+      userId: newWallet.userId,
+      planId: newWallet.planId,
+      planName: newWallet.plan.name,
+      subscriptionStatus: newWallet.subscriptionStatus,
+      subscriptionStartedAt: newWallet.subscriptionStartedAt,
+      subscriptionPeriodStart: newWallet.subscriptionPeriodStart,
+      subscriptionExpiresAt: newWallet.subscriptionExpiresAt,
     },
     plan: effectivePlan,
   };
@@ -680,6 +738,7 @@ async function createUsageLedgerEntry(
 }
 
 export async function reserveUsage(input: BillingReservationInput): Promise<BillingDecision> {
+  const reservationStartedAt = Date.now();
   const validatedInput = validateBillingReservationInput(input);
   const defaultPlans = await ensureDefaultPlans();
   const fallbackPlan = validatedInput.planOverride
@@ -688,34 +747,31 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
     throw new Error('The FREE plan could not be resolved for wallet initialization.');
   }
 
-  const providerCostUSD = await calculateProviderCost({
+  const economicsInput = {
     feature: validatedInput.feature,
     provider: validatedInput.provider,
     tokensInput: validatedInput.tokensInput,
     tokensOutput: validatedInput.tokensOutput,
     secondsUsed: validatedInput.secondsUsed,
-  });
-  const userChargeUSD = await calculateUserCharge({
-    feature: validatedInput.feature,
-    provider: validatedInput.provider,
-    tokensInput: validatedInput.tokensInput,
-    tokensOutput: validatedInput.tokensOutput,
-    secondsUsed: validatedInput.secondsUsed,
-  });
-  const profitUSD = await calculateProfit({
-    feature: validatedInput.feature,
-    provider: validatedInput.provider,
-    tokensInput: validatedInput.tokensInput,
-    tokensOutput: validatedInput.tokensOutput,
-    secondsUsed: validatedInput.secondsUsed,
+  };
+  const [providerCostUSD, userChargeUSD, profitUSD] = await Promise.all([
+    calculateProviderCost(economicsInput),
+    calculateUserCharge(economicsInput),
+    calculateProfit(economicsInput),
+  ]);
+  logger.info('Billing reservation preflight completed', {
+    requestId: validatedInput.requestId ?? null,
+    elapsedMs: Date.now() - reservationStartedAt,
   });
 
   try {
     return await runTransactionWithRetries(validatedInput.userId, async (tx) => {
-      if (validatedInput.feature !== 'live_tutor') {
-        await lockWalletRow(tx, validatedInput.userId);
-      }
+      const transactionStartedAt = Date.now();
       const { wallet, plan: effectivePlan } = await resolveWalletAndPlanInTransaction(tx, validatedInput.userId, fallbackPlan);
+      logger.info('Billing reservation wallet resolved', {
+        requestId: validatedInput.requestId ?? null,
+        elapsedMs: Date.now() - transactionStartedAt,
+      });
       if (!wallet) {
         throw new Error('Failed to initialize billing wallet');
       }
@@ -744,6 +800,11 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
             createdAt: { gte: windowStart },
           },
         });
+      logger.info('Billing reservation idempotency checked', {
+        requestId: validatedInput.requestId ?? null,
+        elapsedMs: Date.now() - transactionStartedAt,
+        existing: Boolean(existing),
+      });
 
         const usageLimit = validatedInput.feature === 'live_tutor'
           ? null
@@ -772,6 +833,11 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const budgetReservation = budgetSubject
         ? await assertAndLockGeminiDailyBudget(tx, { requestId: validatedInput.requestId ?? 'missing-request-id' })
         : null;
+      logger.info('Billing reservation budget checked', {
+        requestId: validatedInput.requestId ?? null,
+        elapsedMs: Date.now() - transactionStartedAt,
+        budgetSubject,
+      });
 
       // Entitlement and model binding come from the wallet read inside this
       // locked transaction, so concurrent subscription changes remain authoritative.
@@ -876,21 +942,6 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       }
 
       const pendingCutoff = new Date(Date.now() - 5 * 60 * 1000);
-      const usageWhere = {
-        userId: validatedInput.userId,
-        feature: toUsageFeature(validatedInput.feature),
-        OR: [
-          { success: true },
-          { success: null, createdAt: { gte: pendingCutoff } },
-        ],
-      } satisfies Prisma.UsageLogWhereInput;
-      const used = await tx.usageLog.count({
-        where: {
-          ...usageWhere,
-          createdAt: { gte: windowStart },
-        },
-      });
-
       const pendingReservation = validatedInput.pending === true;
       const policy = getProductPolicy(effectivePlan.name);
       const freeMonth = getFreeMonthlyWindow();
@@ -901,8 +952,31 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         ? wallet.subscriptionExpiresAt
         : freeMonth.end;
       const monthlyLimit = validatedInput.feature === 'chat' ? policy.normalChat.monthlyCompletedMessages : null;
-      const monthlyUsed = monthlyLimit === null ? 0 : await tx.usageLog.count({
-        where: { ...usageWhere, createdAt: { gte: monthlyStart, lt: monthlyEnd } },
+      const earliestUsageStart = new Date(Math.min(windowStart.getTime(), monthlyStart.getTime()));
+      const usageCounts = await tx.$queryRaw<Array<{ dailyUsed: number; monthlyUsed: number }>>`
+        SELECT
+          COUNT(*) FILTER (
+            WHERE "createdAt" >= ${windowStart}
+          )::int AS "dailyUsed",
+          COUNT(*) FILTER (
+            WHERE "createdAt" >= ${monthlyStart}
+              AND "createdAt" < ${monthlyEnd}
+          )::int AS "monthlyUsed"
+        FROM "UsageLog"
+        WHERE "userId" = ${validatedInput.userId}
+          AND "feature" = ${toUsageFeature(validatedInput.feature)}
+          AND "createdAt" >= ${earliestUsageStart}
+          AND (
+            "success" = true
+            OR ("success" IS NULL AND "createdAt" >= ${pendingCutoff})
+          )
+      `;
+      const used = usageCounts[0]?.dailyUsed ?? 0;
+      const monthlyUsed = monthlyLimit === null ? 0 : usageCounts[0]?.monthlyUsed ?? 0;
+      logger.info('Billing reservation usage counted', {
+        requestId: validatedInput.requestId ?? null,
+        elapsedMs: Date.now() - transactionStartedAt,
+        monthlyCounted: monthlyLimit !== null,
       });
       const allowance = validatedInput.feature === 'chat' && typeof usageLimit === 'number' && monthlyLimit !== null
         ? evaluateCompletedAllowance({ dailyUsed: used, monthlyUsed, dailyLimit: usageLimit, monthlyLimit, requested: validatedInput.amount })
@@ -1013,6 +1087,11 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         userChargeUSD - reservedProviderCostUSD,
         reservationMetadata,
       );
+      logger.info('Billing reservation ledger written', {
+        requestId: validatedInput.requestId ?? null,
+        elapsedMs: Date.now() - transactionStartedAt,
+        totalElapsedMs: Date.now() - reservationStartedAt,
+      });
 
       return buildDecision(
         true,

@@ -58,13 +58,14 @@ describe('web security headers', () => {
     expect(production).not.toContain('wss://*.livekit.cloud');
   });
 
-  it('allows Paddle browser resources only on the executable checkout page', () => {
+  it('keeps the production CSP strict and free of legacy payment provider origins', () => {
     const checkout = buildContentSecurityPolicy('/billing/checkout', 'production', TEST_NONCE);
     const ordinaryPage = buildContentSecurityPolicy('/billing/success', 'production', TEST_NONCE);
-    expect(checkout).toContain('https://cdn.paddle.com');
-    expect(checkout).toContain('frame-src https://*.paddle.com');
-    expect(checkout).toContain("connect-src 'self' https://*.paddle.com");
+    expect(checkout).toContain("frame-src 'none'");
+    expect(checkout).toContain("default-src 'self'");
+    expect(checkout).toContain("connect-src 'self'");
     expect(ordinaryPage).not.toContain('paddle.com');
+    expect(ordinaryPage).not.toContain('googleapis.com');
   });
 
   it('keeps inline-style compatibility separate from script execution', () => {

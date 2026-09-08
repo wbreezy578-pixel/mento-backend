@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { POST as directUpgrade } from '../billing/upgrade/route';
 import { PUT as clientFinalize } from './route';
-import { isPaddleCheckoutSku } from '../../../services/paddleService';
 import { buildContentSecurityPolicy } from '../../../lib/securityHeaders';
 
 describe('payment security boundaries', () => {
@@ -16,14 +15,9 @@ describe('payment security boundaries', () => {
     expect(response.status).toBe(405);
   });
 
-  it('accepts only server-configured checkout SKUs', () => {
-    expect(isPaddleCheckoutSku('pro')).toBe(true);
-    expect(isPaddleCheckoutSku('topup_50')).toBe(true);
-    expect(isPaddleCheckoutSku('pri_attacker_supplied')).toBe(false);
-  });
-
-  it('allows Paddle resources only on the dedicated checkout page', () => {
-    expect(buildContentSecurityPolicy('/billing/checkout', 'production', nonce)).toContain('https://cdn.paddle.com');
-    expect(buildContentSecurityPolicy('/other', 'production', nonce)).not.toContain('https://cdn.paddle.com');
+  it('keeps the CSP locked down and strips legacy checkout provider origins', () => {
+    expect(buildContentSecurityPolicy('/billing/checkout', 'production', nonce)).toContain("frame-src 'none'");
+    expect(buildContentSecurityPolicy('/other', 'production', nonce)).not.toContain('paddle.com');
+    expect(buildContentSecurityPolicy('/other', 'production', nonce)).not.toContain('cdn.paddle.com');
   });
 });

@@ -16,9 +16,12 @@ export function resolveDailyMessageAbuseLimit(rawValue: string | undefined): num
 const DAILY_MESSAGES_LIMIT = resolveDailyMessageAbuseLimit(process.env.DAILY_MESSAGES_LIMIT);
 
 export async function enforceRateLimit(userId: string, ip: string) {
-  // Every caller of this aggregate limiter starts a billable AI operation.
-  // Never degrade to per-process counters, even in a misconfigured runtime.
-  const strict = { requireDistributed: true } as const;
+  // Production keeps the distributed guarantee; local development can use the
+  // existing in-memory fallback when Redis is intentionally not configured.
+  const strict = {
+    requireDistributed: process.env.NODE_ENV === 'production'
+      || process.env.REQUIRE_RATE_LIMIT_REDIS === 'true',
+  } as const;
   // Cooldown per user
   const cd = await ensureCooldown(userId, MESSAGE_COOLDOWN_MS, strict);
   if (!cd.ok) return cd.unavailable

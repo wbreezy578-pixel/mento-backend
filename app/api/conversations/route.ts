@@ -55,7 +55,7 @@ export async function GET(req: Request) {
         summary: conv.summary,
         summaryUpdatedAt: conv.summaryUpdatedAt,
         recentMessageWindow: 40,
-        lastMessage: conv.messages[conv.messages.length - 1]?.text ?? '',
+        lastMessage: conv.messages[0]?.text ?? '',
       })),
     }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   } catch (error: unknown) {

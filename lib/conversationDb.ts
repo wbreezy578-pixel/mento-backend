@@ -1,5 +1,6 @@
 import { prisma } from './prisma';
 import logger from './logger';
+import { observeMonitoringLatency } from './monitoring';
 
 const AI_HISTORY_MESSAGE_LIMIT = 40;
 export const CONVERSATION_SUMMARY_MAX_CHARS = 6_000;
@@ -7,6 +8,7 @@ const SUMMARY_MESSAGE_MAX_CHARS = 240;
 const MAX_SUMMARY_UPDATE_RETRIES = 5;
 const MAX_UNSUMMARIZED_CONTEXT_MESSAGES = 80;
 export const RECENT_MESSAGE_WINDOW = AI_HISTORY_MESSAGE_LIMIT;
+const activeSummaryRefreshes = new Map<string, Promise<void>>();
 
 type SummaryMessage = { role: string; content?: string | null; text?: string | null };
 type GeminiHistoryMessage = { role: 'user' | 'model'; parts: Array<{ text: string }> };
@@ -477,14 +479,8 @@ export async function getConversationHistoryForAI(
   conversationId: string,
   options: ConversationHistoryOptions = {},
 ): Promise<GeminiHistoryMessage[]> {
-  // Opportunistically repair a previously failed summary refresh before
-  // constructing context. Failure is safe: the prior boundary remains valid.
-  await updateConversationSummary(conversationId).catch((error) => {
-    logger.warn('Conversation summary repair deferred', {
-      conversationId,
-      errorName: error instanceof Error ? error.name : 'UnknownError',
-    });
-  });
+  // Summary maintenance runs after the exchange so the current response can
+  // use the last persisted summary without waiting on a write transaction.
   const conv = await prisma.conversation.findUnique({
     where: { id: conversationId },
     select: {
@@ -673,6 +669,45 @@ export async function updateConversationSummary(conversationId: string) {
     if (result.state !== 'retry') return result;
   }
   throw new Error('Conversation summary refresh conflicted repeatedly.');
+}
+
+export async function refreshConversationSummarySafely(conversationId: string): Promise<void> {
+  const activeRefresh = activeSummaryRefreshes.get(conversationId);
+  if (activeRefresh) {
+    await activeRefresh;
+    return;
+  }
+
+  const refreshPromise = refreshConversationSummary(conversationId);
+  activeSummaryRefreshes.set(conversationId, refreshPromise);
+  await refreshPromise;
+  if (activeSummaryRefreshes.get(conversationId) === refreshPromise) {
+    activeSummaryRefreshes.delete(conversationId);
+  }
+}
+
+async function refreshConversationSummary(conversationId: string): Promise<void> {
+  const startedAt = Date.now();
+  logger.info('Conversation summary refresh started', { conversationId });
+  try {
+    await updateConversationSummary(conversationId);
+    observeMonitoringLatency('database', Date.now() - startedAt, {
+      route: 'chat-stream',
+      operation: 'summary-refresh',
+      status: 'success',
+    });
+    logger.info('Conversation summary refresh completed', { conversationId });
+  } catch (error) {
+    observeMonitoringLatency('database', Date.now() - startedAt, {
+      route: 'chat-stream',
+      operation: 'summary-refresh',
+      status: 'failure',
+    });
+    logger.warn('Conversation summary refresh failed after chat response', {
+      conversationId,
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+    });
+  }
 }
 
 function titleize(value: string) {

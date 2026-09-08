@@ -35,6 +35,8 @@ const ALLOWED_CATEGORIES = new Set([
 const MAX_TITLE_LENGTH = 120;
 const MAX_BODY_LENGTH = 1000;
 const MAX_TYPE_LENGTH = 60;
+const NOTIFICATION_TABLE_CACHE_TTL_MS = 5 * 60 * 1000;
+let notificationTableAvailability: { exists: boolean; checkedAt: number } | null = null;
 
 function isNotificationsEnabled(): boolean {
   return process.env.NOTIFICATIONS_ENABLED !== 'false' && process.env.ENABLE_NOTIFICATIONS !== 'false';
@@ -51,14 +53,21 @@ function isMissingTableError(error: unknown): boolean {
 }
 
 async function checkNotificationTableExists(): Promise<boolean> {
+  const cached = notificationTableAvailability;
+  if (cached && Date.now() - cached.checkedAt < NOTIFICATION_TABLE_CACHE_TTL_MS) {
+    return cached.exists;
+  }
+
   try {
     const result = await prisma.$queryRaw<Array<{ table_name: string | null }>>`
       SELECT to_regclass('public."Notification"')::text AS table_name;
     `;
     const exists = Boolean(result[0]?.table_name);
+    notificationTableAvailability = { exists, checkedAt: Date.now() };
     logger.info('Notification table availability check', { exists, tableName: result[0]?.table_name ?? null });
     return exists;
   } catch (error) {
+    notificationTableAvailability = { exists: false, checkedAt: Date.now() };
     logger.warn('Unable to verify notification table availability', { error: getErrorMessage(error) });
     return false;
   }

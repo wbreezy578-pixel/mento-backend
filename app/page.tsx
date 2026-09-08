@@ -5,6 +5,7 @@ import styles from './home.module.css';
 export const metadata: Metadata = {
   title: 'Mento — AI learning, made conversational',
   description: 'Mento is an AI learning companion for focused chat, image understanding, and optional Live Tutor conversations.',
+  alternates: { canonical: '/' },
 };
 
 const features = [

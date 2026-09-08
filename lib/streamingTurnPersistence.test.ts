@@ -214,4 +214,23 @@ describe('atomic streaming-turn persistence', () => {
     expect(cancellationGuard).toBeGreaterThan(-1);
     expect(cancellationGuard).toBeLessThan(initialization);
   });
+
+  it('starts Gemini without summary maintenance and refreshes only after done is queued', () => {
+    const route = readFileSync(new URL('../app/api/chat/stream/route.ts', import.meta.url), 'utf8');
+    const history = route.indexOf('await getConversationHistoryForAI(conversationId)');
+    const providerExecution = route.indexOf('await executeAIRequest({');
+    const geminiExecution = route.indexOf('await askGeminiStream(');
+    const doneEvent = route.indexOf("JSON.stringify({ type: 'done' })");
+    const summaryRefresh = route.indexOf('void refreshConversationSummarySafely(conversationId)');
+
+    expect(history).toBeGreaterThan(-1);
+    expect(providerExecution).toBeGreaterThan(history);
+    expect(geminiExecution).toBeGreaterThan(providerExecution);
+    expect(summaryRefresh).toBeGreaterThan(doneEvent);
+    expect(summaryRefresh).toBeGreaterThan(geminiExecution);
+    expect(route.slice(history, geminiExecution)).not.toContain('await updateConversationSummary(conversationId)');
+    expect(route).toContain("operation: 'history-ready'");
+    expect(route).toContain("operation: 'first-token'");
+    expect(route).toContain('void refreshConversationSummarySafely(conversationId)');
+  });
 });

@@ -4,7 +4,7 @@ import logger from '../lib/logger';
 import { getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, type CanonicalPlanName } from './productPolicy';
 import { isSubscriptionActive } from './planService';
 
-export type EntitlementProvider = 'SYSTEM' | 'ADMIN' | 'PADDLE' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE';
+export type EntitlementProvider = 'SYSTEM' | 'ADMIN' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE';
 export type CanonicalEntitlementStatus = 'ACTIVE' | 'GRACE_PERIOD' | 'CANCELLED' | 'EXPIRED' | 'REVOKED' | 'ON_HOLD';
 
 export interface CanonicalEntitlement {

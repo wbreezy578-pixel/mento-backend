@@ -94,6 +94,7 @@ describe('canonical product policy', () => {
     expect(classifyLiveTutorFinalizationTiming('transport_recovery_timeout')).toBe('transport_recovery_end');
     expect(classifyLiveTutorFinalizationTiming('Screen closed')).toBe('transport_recovery_end');
     expect(classifyLiveTutorFinalizationTiming('Voice WebSocket reconnect grace expired: socket_lost')).toBe('transport_recovery_end');
+    expect(classifyLiveTutorFinalizationTiming('unauthorized')).toBe('transport_recovery_end');
     expect(classifyLiveTutorFinalizationTiming('Heartbeat expired; stale session recovery')).toBe('inactivity_end');
     expect(classifyLiveTutorFinalizationTiming('User ended session')).toBe('active_end');
     expect(() => classifyLiveTutorFinalizationTiming('unrecognized terminal reason')).toThrow(/Unknown Live Tutor finalization reason/);

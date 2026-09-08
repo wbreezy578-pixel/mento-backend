@@ -22,6 +22,21 @@ describe('isVoiceSessionResumable', () => {
 });
 
 describe('voice readiness ordering', () => {
+  it('notifies and closes the phone before waiting for provider cleanup', () => {
+    const source = readFileSync('services/liveTutorVoiceGateway.ts', 'utf8');
+    const start = source.indexOf('onError: (error) => {');
+    const end = source.indexOf('onResponseStarted:', start);
+    const body = source.slice(start + 'onError: (error) => {'.length, end).replace(/},\s*$/, '');
+    const events: string[] = [];
+    const activeRef = { current: true };
+    const run = new Function('error', 'logger', 'voiceTraceId', 'activeRef', 'socketRef', 'WebSocket', 'identity', 'completeSimliSessionLifecycle', body);
+    run(new Error('deadline'), { error() {} }, 'trace', activeRef,
+      { current: { readyState: 1, send: (data: string) => events.push(JSON.parse(data).code), close: () => events.push('closed') } },
+      { OPEN: 1 }, { streamId: 'stream', userId: 'user' },
+      () => { events.push('cleanup'); return new Promise(() => {}); });
+    expect(events).toEqual(['provider_session_ended', 'closed', 'cleanup']);
+    expect(activeRef.current).toBe(false);
+  });
   it('marks usability only after Gemini/runtime registration and before connected', () => {
     const source = readFileSync('services/liveTutorVoiceGateway.ts', 'utf8');
     const geminiCreated = source.indexOf('gemini = await createGeminiLiveSession');

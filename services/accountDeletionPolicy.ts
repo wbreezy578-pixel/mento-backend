@@ -2,7 +2,6 @@ const MINUTE_MS = 60_000;
 const MAX_RETRY_DELAY_MS = 60 * MINUTE_MS;
 
 export type AccountDeletionFailureCode =
-  | 'paddle_cancel_failed'
   | 'google_play_cancel_failed'
   | 'supabase_delete_failed'
   | 'internal_delete_failed';

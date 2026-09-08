@@ -137,7 +137,7 @@ describe('IDOR ownership boundaries', () => {
     expect(source('app/api/wallet/summary/route.ts')).toMatch(/const userId = user\.id/);
     expect(source('app/api/payments/route.ts')).toMatch(/getPayment\(user\.id, paymentId\)/);
     expect(source('app/api/payments/route.ts')).toMatch(/listPayments\(user\.id\)/);
-    expect(source('app/api/payments/manage-subscription/route.ts')).toMatch(/createPaddleCustomerPortalForUser\(user\.id\)/);
+    expect(source('app/api/payments/mobile/verify/route.ts')).toMatch(/getUserFromRequest\(req\)|require.*user\.id/);
     expect(source('app/api/support/reports/route.ts')).toMatch(/where:\s*\{\s*id: report\.conversationId, userId: user\.id/);
     expect(source('app/api/support/reports/route.ts')).toMatch(/conversation:\s*\{\s*userId: user\.id\s*\}/);
     expect(source('app/api/live-tutor/session/route.ts')).toMatch(/getOwnedLiveTutorConversation\(requestedConversationId, user\.id\)/);

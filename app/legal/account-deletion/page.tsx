@@ -1,6 +1,10 @@
 import LegalPage from '../LegalPage';
 
-export const metadata = { title: 'Delete Your Mento Account' };
+export const metadata = {
+  title: 'Delete Your Mento Account',
+  description: 'Instructions for permanently deleting your Mento account and associated learning data.',
+  alternates: { canonical: '/legal/account-deletion' },
+};
 
 export default function AccountDeletionPage() {
   return <LegalPage title="Delete your Mento account" updated="August 25, 2026">

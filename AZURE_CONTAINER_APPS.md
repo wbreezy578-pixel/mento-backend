@@ -28,6 +28,8 @@ Application startup intentionally does not run migrations. This prevents ordinar
 
 ## Production billing configuration
 
+The active production billing model for Mento is native mobile billing through Google Play for Android and App Store for iOS. Legacy Paddle values are intentionally not part of the current production configuration.
+
 Android launch requires these Azure values in addition to the core database, Redis, Gemini, Supabase, and Simli settings:
 
 - `GOOGLE_PLAY_WIF_CONFIG_JSON`: preferred Google external-account credential configuration generated for the Azure Container App managed identity; store as a Container App secret.
@@ -40,7 +42,7 @@ The Play products must use the exact IDs `mento_pro_monthly`, `mento_live_tutor_
 
 Before an iOS launch, also set `APPLE_ROOT_CERTIFICATES_BASE64` and the numeric `APPLE_APP_ID`, then configure App Store Server Notifications to `/api/payments/mobile/apple-notifications`.
 
-Paddle is only the web checkout path. Its server API key, webhook secret, three price IDs, environment, and Vercel checkout URL remain Azure settings; the public Paddle client token belongs only on Vercel.
+Do not configure Paddle API keys, Paddle webhook secrets, or Paddle price IDs for the current alpha release. Those settings are historical and not used by the live Android flow.
 
 ## Authentication and deletion operations
 
@@ -54,8 +56,8 @@ Account deletion first revokes every session and marks the user as deletion-pend
 - HTTPS ingress with WebSocket-compatible transport
 - Log Analytics application logs
 - Parameterized secrets
-- Exactly one replica for the voice server. Gemini Live connections are process-local and cannot be safely load-balanced between replicas.
+- Exactly one replica for the voice server. The Bicep deployment enforces this with fixed `minReplicas: 1` and `maxReplicas: 1`; Gemini Live connections are process-local and cannot be safely load-balanced between replicas.
 
-Redis-backed lease coordination is supported, but it does not make the live Gemini connection portable between processes. Multi-replica voice hosting requires a dedicated realtime worker/session service and is not enabled by this deployment.
+Redis-backed lease coordination is supported, but it does not make the live Gemini connection portable between processes. Production startup also fails before listening if realtime Redis is missing or unhealthy, so `REQUIRE_REALTIME_REDIS=true` and a healthy `REDIS_URL` are required. Multi-replica voice hosting requires a dedicated realtime worker/session service and is not enabled by this deployment.
 
 For a controlled countdown test, set `LIVE_TUTOR_TEST_MAX_SESSION_SECONDS=120` together with `LIVE_TUTOR_TEST_USER_EMAILS` containing only the exact test account emails. Other users keep the normal production limit. Remove both values after the countdown and ledger test passes.

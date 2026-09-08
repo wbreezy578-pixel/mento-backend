@@ -1,6 +1,10 @@
 import LegalPage from '../LegalPage';
 
-export const metadata = { title: 'Terms of Service — Mento' };
+export const metadata = {
+  title: 'Terms of Service — Mento',
+  description: 'Read the terms and end user licence agreement for using Mento AI-assisted learning services.',
+  alternates: { canonical: '/legal/terms' },
+};
 
 export default function TermsPage() {
   return <LegalPage title="Terms of Service" updated="August 25, 2026">

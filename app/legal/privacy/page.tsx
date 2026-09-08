@@ -1,6 +1,10 @@
 import LegalPage from '../LegalPage';
 
-export const metadata = { title: 'Privacy Policy — Mento' };
+export const metadata = {
+  title: 'Privacy Policy — Mento',
+  description: 'Learn what information Mento processes, why it is used, and the choices available to you.',
+  alternates: { canonical: '/legal/privacy' },
+};
 
 export default function PrivacyPolicyPage() {
   return <LegalPage title="Privacy Policy" updated="August 25, 2026">

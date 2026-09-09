@@ -16,6 +16,7 @@ import { attachLiveTutorConversation, createLiveTutorConversation, getOwnedLiveT
 import type { BillingDecision } from '../../../../services/billingService';
 import { getLiveTutorMaxSessionSecondsForUser, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS } from '../../../../lib/liveTutorLimits';
 import { LIVE_TUTOR_AVATAR_TRANSPORTS, resolveLiveTutorAvatarTransport } from '../../../../services/liveTutorAvatarTransportPolicy';
+import { LIVE_TUTOR_VOICE_PROVIDER, validateLiveTutorVoiceProviderHandshake } from '../../../../services/liveTutorVoiceProvider';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -78,6 +79,19 @@ export async function GET(req: Request) {
       clientIp,
       category: 'live_tutor_session_start',
     });
+
+    if (LIVE_TUTOR_VOICE_PROVIDER === 'openai') {
+      try {
+        await validateLiveTutorVoiceProviderHandshake();
+      } catch (error) {
+        logger.error('Live Tutor OpenAI provider preflight failed', {
+          userId: user.id,
+          message: error instanceof Error ? error.message : String(error),
+          category: 'live_tutor_openai_preflight',
+        });
+        return NextResponse.json({ error: 'Live Tutor voice is temporarily unavailable. Please try again shortly.' }, { status: 503 });
+      }
+    }
 
     await reconcileStaleLiveTutorSession(user.id);
 

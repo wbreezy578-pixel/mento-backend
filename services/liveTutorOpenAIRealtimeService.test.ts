@@ -1,12 +1,26 @@
 import { EventEmitter } from 'node:events';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+let shouldAcknowledgeSessionUpdate = true;
+
 class FakeWebSocket extends EventEmitter {
   static OPEN = 1;
+  static lastHeaders: Record<string, string> | undefined;
+  static latest: FakeWebSocket | undefined;
   readyState = FakeWebSocket.OPEN;
   sent: string[] = [];
-  constructor() { super(); queueMicrotask(() => this.emit('open')); }
-  send(value: string) { this.sent.push(value); }
+  constructor(_url?: string, options?: { headers?: Record<string, string> }) {
+    super();
+    FakeWebSocket.lastHeaders = options?.headers;
+    FakeWebSocket.latest = this;
+    queueMicrotask(() => this.emit('open'));
+  }
+  send(value: string) {
+    this.sent.push(value);
+    if (shouldAcknowledgeSessionUpdate && JSON.parse(value).type === 'session.update') {
+      queueMicrotask(() => this.emit('message', Buffer.from(JSON.stringify({ type: 'session.updated' }))));
+    }
+  }
   close() { this.readyState = 3; this.emit('close'); }
 }
 
@@ -16,6 +30,7 @@ describe('OpenAI Realtime Live Tutor adapter', () => {
   beforeEach(() => {
     process.env.OPENAI_API_KEY = 'test-openai-key';
     process.env.OPENAI_REALTIME_MODEL = 'gpt-realtime-test';
+    shouldAcknowledgeSessionUpdate = true;
     vi.resetModules();
   });
 
@@ -31,6 +46,7 @@ describe('OpenAI Realtime Live Tutor adapter', () => {
     const socket = (session as typeof session & { openAiSocket: FakeWebSocket }).openAiSocket;
     const events = () => socket.sent.map((item) => JSON.parse(item) as { type: string; session?: { audio?: { input?: { turn_detection?: unknown }; output?: { speed?: number } } } });
     expect(events()[0]).toMatchObject({ type: 'session.update', session: { audio: { input: { turn_detection: null }, output: { speed: 0.95 } } } });
+    expect(FakeWebSocket.lastHeaders).toEqual({ Authorization: 'Bearer test-openai-key' });
 
     sendOpenAIRealtimePcmAudio(session.sessionId, new Uint8Array(640));
     endOpenAIRealtimePcmAudio(session.sessionId);
@@ -53,5 +69,14 @@ describe('OpenAI Realtime Live Tutor adapter', () => {
     delete process.env.OPENAI_API_KEY;
     const { createOpenAIRealtimeSession } = await import('./liveTutorOpenAIRealtimeService');
     await expect(createOpenAIRealtimeSession()).rejects.toThrow('OPENAI_API_KEY is required');
+  });
+
+  it('rejects startup when OpenAI rejects the session configuration', async () => {
+    shouldAcknowledgeSessionUpdate = false;
+    const { createOpenAIRealtimeSession } = await import('./liveTutorOpenAIRealtimeService');
+    const creating = createOpenAIRealtimeSession();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    FakeWebSocket.latest?.emit('message', Buffer.from(JSON.stringify({ type: 'error', error: { message: 'invalid session schema' } })));
+    await expect(creating).rejects.toThrow('invalid session schema');
   });
 });

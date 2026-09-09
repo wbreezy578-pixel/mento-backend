@@ -424,7 +424,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
               if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify({ type: 'interrupted', generationId: cancelledGenerationId }));
             },
             onError: (error) => {
-              logger.error('[LiveTutorVoiceServer] error', { voiceTraceId, stage: 'gemini', message: error.message, category: 'live_tutor_voice_error' });
+              logger.error('[LiveTutorVoiceServer] error', { voiceTraceId, stage: 'voice_provider', message: error.message, category: 'live_tutor_voice_error' });
               activeRef.current = false;
               if (socketRef.current?.readyState === WebSocket.OPEN) {
                 socketRef.current.send(JSON.stringify({ type: 'error', code: 'provider_session_ended' }));

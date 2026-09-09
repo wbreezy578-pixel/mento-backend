@@ -44,8 +44,9 @@ describe('OpenAI Realtime Live Tutor adapter', () => {
     });
     registerOpenAIRealtimeSession(session);
     const socket = (session as typeof session & { openAiSocket: FakeWebSocket }).openAiSocket;
-    const events = () => socket.sent.map((item) => JSON.parse(item) as { type: string; session?: { audio?: { input?: { turn_detection?: unknown }; output?: { speed?: number } } } });
-    expect(events()[0]).toMatchObject({ type: 'session.update', session: { audio: { input: { turn_detection: null }, output: { speed: 0.95 } } } });
+    const events = () => socket.sent.map((item) => JSON.parse(item) as { type: string; session?: { audio?: { input?: { turn_detection?: unknown; transcription?: { model?: string }; input_audio_transcription?: unknown }; output?: { speed?: number } } } });
+    expect(events()[0]).toMatchObject({ type: 'session.update', session: { audio: { input: { turn_detection: null, transcription: { model: 'gpt-4o-mini-transcribe' } }, output: { speed: 0.95 } } } });
+    expect(events()[0].session?.audio?.input?.input_audio_transcription).toBeUndefined();
     expect(FakeWebSocket.lastHeaders).toEqual({ Authorization: 'Bearer test-openai-key' });
 
     sendOpenAIRealtimePcmAudio(session.sessionId, new Uint8Array(640));

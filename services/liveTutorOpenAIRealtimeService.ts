@@ -128,7 +128,9 @@ export async function createOpenAIRealtimeSession(options: {
             input: {
               format: { type: 'audio/pcm', rate: OPENAI_INPUT_RATE },
               turn_detection: null,
-              input_audio_transcription: { model: process.env.OPENAI_REALTIME_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe' },
+              // `transcription` is the GA Realtime field. The beta API called
+              // this `input_audio_transcription`, which the GA endpoint rejects.
+              transcription: { model: process.env.OPENAI_REALTIME_TRANSCRIBE_MODEL ?? 'gpt-4o-mini-transcribe' },
             },
             output: {
               format: { type: 'audio/pcm', rate: OPENAI_OUTPUT_RATE },

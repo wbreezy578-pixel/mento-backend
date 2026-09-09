@@ -17,6 +17,14 @@ const OPENAI_OUTPUT_RATE = 24_000;
 
 type OpenAIEvent = { type?: string; [key: string]: unknown };
 
+// A response can finish in the interval between the client detecting speech
+// and its interruption reaching OpenAI. The Realtime API reports this as an
+// error even though the desired local cancellation has already happened.
+// It must never end the Live Tutor session or disconnect Simli.
+function isBenignCancellationRace(message: string): boolean {
+  return /cancellation failed:\s*no active response found/i.test(message);
+}
+
 function requiredApiKey(): string {
   const key = process.env.OPENAI_API_KEY?.trim();
   if (!key) throw new Error('OPENAI_API_KEY is required for OpenAI Live Tutor.');
@@ -156,6 +164,13 @@ export async function createOpenAIRealtimeSession(options: {
       if (!sessionConfigured) {
         session.status = 'error';
         rejectSessionConfigured?.(error);
+      } else if (isBenignCancellationRace(detail)) {
+        logger.info('live_tutor_openai_cancel_race_ignored', {
+          sessionId,
+          streamId: session.streamId,
+          generationId: session.generationId,
+          category: 'openai_realtime_lifecycle',
+        });
       } else {
         session.onError?.(error);
       }
@@ -332,7 +347,9 @@ export function interruptOpenAIRealtimeSession(sessionId: string): number {
   session.generationId += 1;
   session.cancelledGenerationId = cancelled;
   session.discardProviderOutput = true;
-  send(socket, { type: 'response.cancel' });
+  // Do not ask OpenAI to cancel a response it has already completed. The
+  // generation fence below still immediately rejects any late output.
+  if (session.responseStarted) send(socket, { type: 'response.cancel' });
   session.inputTurnActive = false;
   session.inputActivityEnded = true;
   session.responseStarted = false;

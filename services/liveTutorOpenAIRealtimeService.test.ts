@@ -80,4 +80,27 @@ describe('OpenAI Realtime Live Tutor adapter', () => {
     FakeWebSocket.latest?.emit('message', Buffer.from(JSON.stringify({ type: 'error', error: { message: 'invalid session schema' } })));
     await expect(creating).rejects.toThrow('invalid session schema');
   });
+
+  it('keeps the session active when a response finishes during cancellation', async () => {
+    const { createOpenAIRealtimeSession, registerOpenAIRealtimeSession, sendOpenAIRealtimePcmAudio, endOpenAIRealtimePcmAudio, interruptOpenAIRealtimeSession, closeOpenAIRealtimeSession } = await import('./liveTutorOpenAIRealtimeService');
+    const errors: Error[] = [];
+    const session = await createOpenAIRealtimeSession({ onError: (error) => errors.push(error) });
+    registerOpenAIRealtimeSession(session);
+    const socket = (session as typeof session & { openAiSocket: FakeWebSocket }).openAiSocket;
+
+    sendOpenAIRealtimePcmAudio(session.sessionId, new Uint8Array(640));
+    endOpenAIRealtimePcmAudio(session.sessionId);
+    socket.emit('message', Buffer.from(JSON.stringify({ type: 'response.created' })));
+    interruptOpenAIRealtimeSession(session.sessionId);
+    socket.emit('message', Buffer.from(JSON.stringify({
+      type: 'error', error: { message: 'Cancellation failed: no active response found' },
+    })));
+
+    expect(errors).toEqual([]);
+    expect(session.status).toBe('active');
+    sendOpenAIRealtimePcmAudio(session.sessionId, new Uint8Array(640));
+    endOpenAIRealtimePcmAudio(session.sessionId);
+    expect(socket.sent.map((item) => JSON.parse(item).type)).toContain('input_audio_buffer.append');
+    await closeOpenAIRealtimeSession(session.sessionId);
+  });
 });

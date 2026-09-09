@@ -7,7 +7,7 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json ./
-RUN npm ci --ignore-scripts
+RUN npm ci --include=dev --ignore-scripts
 
 COPY . .
 RUN ./node_modules/.bin/prisma generate

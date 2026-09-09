@@ -4,11 +4,13 @@ vi.mock('../lib/metrics', () => ({ observeLiveTutorVoiceLatency: vi.fn() }));
 import { isDeviceVoiceEvent, metrics } from './liveTutorVoiceTelemetry';
 it('separates bridge and prebuffer latency without fabricating audible playback', () => {
   const result = metrics({ FRONTEND_FIRST_PCM_RECEIVED: 1000, WEBVIEW_FIRST_PCM_RECEIVED: 1012,
-    SIMLI_FIRST_PCM_SUBMITTED: 1132, SIMLI_SPEAKING_SIGNAL: 1350 });
+    SIMLI_FIRST_PCM_SUBMITTED: 1132, SIMLI_AUDIO_ACK: 1180, SIMLI_SPEAKING_SIGNAL: 1350 });
   expect(isDeviceVoiceEvent('WEBVIEW_FIRST_PCM_RECEIVED')).toBe(true);
   expect(isDeviceVoiceEvent('SIMLI_FIRST_PCM_SUBMITTED')).toBe(true);
+  expect(isDeviceVoiceEvent('SIMLI_AUDIO_ACK')).toBe(true);
   expect(result.frontendToWebviewMs).toBe(12);
   expect(result.webviewPrebufferWaitMs).toBe(120);
+  expect(result.submissionToSimliAckMs).toBe(48);
   expect(result.submissionToSimliSpeakingSignalMs).toBe(218);
   expect(result.frontendReceivedToSimliPlayedMs).toBeNull();
 });

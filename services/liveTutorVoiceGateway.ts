@@ -56,6 +56,7 @@ function compactLiveKitReceiverStats(details: Record<string, unknown> | undefine
     sampledAtMs: typeof details?.timestampMs === 'number' && Number.isFinite(details.timestampMs) ? details.timestampMs : null,
     audioContextSampleRate: typeof details?.audioContextSampleRate === 'number' && Number.isFinite(details.audioContextSampleRate) ? details.audioContextSampleRate : null,
     simliWorkletBufferSamples: typeof details?.simliWorkletBufferSamples === 'number' && Number.isFinite(details.simliWorkletBufferSamples) ? details.simliWorkletBufferSamples : null,
+    estimatedAvPlayoutOffsetMs: typeof details?.estimatedAvPlayoutOffsetMs === 'number' && Number.isFinite(details.estimatedAvPlayoutOffsetMs) ? details.estimatedAvPlayoutOffsetMs : null,
     audio: compactTrack(details?.audio, ['jitter', 'packetsLost', 'concealedSamples', 'concealmentEvents', 'silentConcealedSamples']),
     video: compactTrack(details?.video, ['jitter', 'packetsLost', 'framesReceived', 'framesDecoded', 'framesDropped', 'nackCount', 'pliCount']),
   };
@@ -611,6 +612,25 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
               generationId: gemini?.generationId ?? null,
               ...compactLiveKitReceiverStats(message.details),
               category: 'live_tutor_livekit_receiver_stats',
+            });
+            return;
+          }
+          if (message.type === 'avatar_video_health') {
+            const details = message.details && typeof message.details === 'object' ? message.details : {};
+            const playbackQuality = details.playbackQuality && typeof details.playbackQuality === 'object' ? details.playbackQuality as Record<string, unknown> : {};
+            logger.info('[LiveTutorVoiceGateway] avatar_video_health', {
+              sessionId: gemini?.sessionId ?? null,
+              streamId: durableStreamId,
+              voiceTraceId,
+              turnNumber: gemini?.turnNumber ?? null,
+              generationId: gemini?.generationId ?? null,
+              maxFrameGapMs: typeof details.maxFrameGapMs === 'number' && Number.isFinite(details.maxFrameGapMs) ? details.maxFrameGapMs : null,
+              frameStallCount: typeof details.frameStallCount === 'number' && Number.isFinite(details.frameStallCount) ? details.frameStallCount : null,
+              frameAgeMs: typeof details.frameAgeMs === 'number' && Number.isFinite(details.frameAgeMs) ? details.frameAgeMs : null,
+              droppedVideoFrames: typeof playbackQuality.droppedVideoFrames === 'number' && Number.isFinite(playbackQuality.droppedVideoFrames) ? playbackQuality.droppedVideoFrames : null,
+              audioPaused: details.audioPaused === true,
+              videoPaused: details.videoPaused === true,
+              category: 'live_tutor_avatar_video_health',
             });
             return;
           }

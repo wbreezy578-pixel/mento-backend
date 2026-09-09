@@ -7,15 +7,15 @@ import { completeSimliSessionLifecycle, markLiveTutorSessionUsable } from './sim
 import { getUserFromRequest } from '../app/lib/auth';
 import { getTutorLanguage, buildTutorLanguageInstruction, isTutorLanguage } from '../lib/userSettings';
 import {
-  closeGeminiLiveSession,
-  createGeminiLiveSession,
+  closeLiveTutorVoiceSession,
+  createLiveTutorVoiceSession,
   buildLiveTutorSystemInstruction,
-  updateLiveTutorLanguage,
-  interruptGeminiLiveSession,
-  endRealtimePcmAudio,
-  sendRealtimePcmAudio,
+  updateLiveTutorVoiceLanguage,
+  interruptLiveTutorVoiceSession,
+  endLiveTutorPcmAudio,
+  sendLiveTutorPcmAudio,
   type GeminiLiveSession,
-} from './liveTutorGeminiLiveService';
+} from './liveTutorVoiceProvider';
 import { PCMResampler } from './liveTutorAudioBridge';
 import { LIVE_TUTOR_INPUT_MIME_TYPE, resamplePcm16Mono, parsePcmMimeType, SIMLI_PCM_BYTES_PER_SAMPLE, SIMLI_PCM_FRAME_BYTES, SIMLI_PCM_SAMPLE_RATE, StreamingPcmFrameBuffer, validateLiveTutorPcm16 } from './liveTutorAudioProtocol';
 import logger from '../lib/logger';
@@ -228,7 +228,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
       const terminalDisconnect = reason === 'mobile_disconnect' || reason === 'user_ended_session' || reason === 'session_expired';
       const canResume = Boolean(authenticated && gemini && durableStreamId && !terminalDisconnect && gemini.status === 'active');
       if (gemini && !canResume) {
-        await closeGeminiLiveSession(gemini.sessionId, reason);
+        await closeLiveTutorVoiceSession(gemini.sessionId, reason);
         clearLiveTutorVoiceTelemetry(gemini.sessionId);
         if (durableStreamId) voiceSessionRuntimes.delete(durableStreamId);
       }
@@ -265,7 +265,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
           pendingReconnectFinalizations.delete(streamIdForFinalization);
           const runtime = voiceSessionRuntimes.get(streamIdForFinalization);
           if (runtime?.gemini) {
-            void closeGeminiLiveSession(runtime.gemini.sessionId, 'Voice WebSocket reconnect grace expired');
+            void closeLiveTutorVoiceSession(runtime.gemini.sessionId, 'Voice WebSocket reconnect grace expired');
             clearLiveTutorVoiceTelemetry(runtime.gemini.sessionId);
           }
           voiceSessionRuntimes.delete(streamIdForFinalization);
@@ -362,7 +362,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
           };
           if (canResumeRuntime && resumableRuntime) {
             gemini = resumableRuntime.gemini;
-            if (isTutorLanguage(message.tutorLanguage)) updateLiveTutorLanguage(gemini.sessionId, message.tutorLanguage);
+            if (isTutorLanguage(message.tutorLanguage)) updateLiveTutorVoiceLanguage(gemini.sessionId, message.tutorLanguage);
             socketRef = resumableRuntime.socketRef;
             activeRef = resumableRuntime.activeRef;
             socketRef.current = socket;
@@ -381,7 +381,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
             return;
           }
           geminiConnecting = true;
-          gemini = await createGeminiLiveSession({
+          gemini = await createLiveTutorVoiceSession({
             userId: identity.userId,
             streamId: identity.streamId,
             conversationContext: (await getLiveTutorConversationContext(identity.conversationId, identity.userId)) ?? undefined,
@@ -581,7 +581,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
           if (!usableSession) return reject(socket, 'live_tutor_session_not_usable');
           sendVoiceReady(usableSession);
           for (const pendingAudio of pendingPcm.splice(0)) {
-            sendRealtimePcmAudio(gemini.sessionId, pendingAudio, LIVE_TUTOR_INPUT_MIME_TYPE);
+            sendLiveTutorPcmAudio(gemini.sessionId, pendingAudio, LIVE_TUTOR_INPUT_MIME_TYPE);
           }
           socket.send(JSON.stringify({ type: 'connected', sessionId: gemini.sessionId }));
           return;
@@ -591,7 +591,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
           const message = JSON.parse(payload.toString()) as { type?: string; tutorLanguage?: unknown; token?: string; streamId?: string; event?: string; eventTimestampMs?: number; turnNumber?: number; generationId?: number; queueDepthMs?: unknown; details?: Record<string, unknown> };
           if (message.type === 'language') {
             if (!gemini || !isTutorLanguage(message.tutorLanguage)) return reject(socket, 'invalid_tutor_language');
-            updateLiveTutorLanguage(gemini.sessionId, message.tutorLanguage);
+            updateLiveTutorVoiceLanguage(gemini.sessionId, message.tutorLanguage);
             return;
           }
           logger.info('[LiveTutorVoiceBackend] message received', { type: message.type ?? 'unknown', category: 'live_tutor_voice_message' });
@@ -653,7 +653,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
             if (gemini) {
               const identity = { sessionId: gemini.sessionId, streamId: durableStreamId, voiceTraceId, turnNumber: gemini.turnNumber, generationId: gemini.generationId };
               recordLiveTutorVoiceEvent('CLIENT_SPEECH_END_RECEIVED', identity);
-              endRealtimePcmAudio(gemini.sessionId);
+              endLiveTutorPcmAudio(gemini.sessionId);
               recordLiveTutorVoiceEvent('GEMINI_AUDIO_STREAM_END_SENT', identity);
             }
             return;
@@ -661,7 +661,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
           if (message.type === 'interrupt') {
             streamingResampler?.reset();
             deliveryQueue.clear();
-            const replacementGenerationId = gemini ? interruptGeminiLiveSession(gemini.sessionId) : 0;
+            const replacementGenerationId = gemini ? interruptLiveTutorVoiceSession(gemini.sessionId) : 0;
             const cancelledGenerationId = gemini?.cancelledGenerationId ?? replacementGenerationId;
             logger.info('live_tutor_barge_in_detected', {
               streamId: durableStreamId,
@@ -698,7 +698,7 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
           if (pendingPcm.length < 8) pendingPcm.push(audio);
           return;
         }
-        sendRealtimePcmAudio(gemini.sessionId, audio, LIVE_TUTOR_INPUT_MIME_TYPE);
+        sendLiveTutorPcmAudio(gemini.sessionId, audio, LIVE_TUTOR_INPUT_MIME_TYPE);
       } catch (error) {
         logger.error('[LiveTutorVoiceServer] error', { voiceTraceId, stage: geminiConnecting ? 'gemini_connect' : 'message', error: error instanceof Error ? error.message : String(error), category: 'live_tutor_voice_error' });
         reject(socket, 'voice_transport_error');

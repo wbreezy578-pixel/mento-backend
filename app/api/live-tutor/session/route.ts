@@ -15,6 +15,7 @@ import logger from '../../../../lib/logger';
 import { attachLiveTutorConversation, createLiveTutorConversation, getOwnedLiveTutorConversation } from '../../../../services/liveTutorConversationService';
 import type { BillingDecision } from '../../../../services/billingService';
 import { getLiveTutorMaxSessionSecondsForUser, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS } from '../../../../lib/liveTutorLimits';
+import { LIVE_TUTOR_AVATAR_TRANSPORTS, resolveLiveTutorAvatarTransport } from '../../../../services/liveTutorAvatarTransportPolicy';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -42,6 +43,19 @@ export async function GET(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
     const requestUrl = new URL(req.url);
+    const avatarTransport = resolveLiveTutorAvatarTransport(requestUrl.searchParams.get('avatarTransport'));
+    if (!avatarTransport.ok) {
+      return NextResponse.json(
+        { error: avatarTransport.reason === 'invalid_transport' ? 'Invalid Live Tutor avatar transport.' : 'Live Tutor experiment unavailable.' },
+        { status: avatarTransport.reason === 'invalid_transport' ? 400 : 404 },
+      );
+    }
+    if (avatarTransport.transport === LIVE_TUTOR_AVATAR_TRANSPORTS.liveKitPoc) {
+      return NextResponse.json(
+        { error: 'The LiveKit avatar proof of concept is enabled but its isolated worker is not installed yet.' },
+        { status: 501 },
+      );
+    }
     const requestedVoiceProfile = requestUrl.searchParams.get('avatarVoiceProfile');
     const requestedConversationId = requestUrl.searchParams.get('conversationId')?.trim() || null;
     const avatarVoiceProfile = requestedVoiceProfile === null
@@ -156,6 +170,7 @@ export async function GET(req: Request) {
       expiresAt: session.expiresAt,
       avatarVoiceProfile,
       conversationId,
+      avatarTransport: avatarTransport.transport,
       billing: billingDecision,
       limits: {
         maxSessionSeconds,

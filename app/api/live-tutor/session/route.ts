@@ -14,9 +14,10 @@ import {
 import logger from '../../../../lib/logger';
 import { attachLiveTutorConversation, createLiveTutorConversation, getOwnedLiveTutorConversation } from '../../../../services/liveTutorConversationService';
 import type { BillingDecision } from '../../../../services/billingService';
-import { getLiveTutorMaxSessionSecondsForUser, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS } from '../../../../lib/liveTutorLimits';
+import { LIVE_TUTOR_INACTIVITY_TIMEOUT_MS } from '../../../../lib/liveTutorLimits';
 import { LIVE_TUTOR_AVATAR_TRANSPORTS, resolveLiveTutorAvatarTransport } from '../../../../services/liveTutorAvatarTransportPolicy';
 import { LIVE_TUTOR_VOICE_PROVIDER, validateLiveTutorVoiceProviderHandshake } from '../../../../services/liveTutorVoiceProvider';
+import { getProductPolicy } from '../../../../services/productPolicy';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -113,15 +114,18 @@ export async function GET(req: Request) {
       clientIp,
       feature: 'live_tutor',
       provider: 'Simli',
-      amount: 60,
+      // Establish a pending reservation with one exact second. The session
+      // duration is authorized from the exact balance below, so a final
+      // partial minute remains usable.
+      amount: 1,
       requestId,
       metadata: { streamType: 'avatar-session' },
       pending: true,
       finalize: false,
       callback: async ({ billingDecision }) => {
         const authorizedSeconds = Math.min(
-          getLiveTutorMaxSessionSecondsForUser(user.email),
-          60 + Math.max(0, billingDecision.remainingUsage ?? 0),
+          getProductPolicy('PRO').liveTutor.maxSessionSeconds,
+          Math.max(0, billingDecision.remainingUsage ?? 0),
         );
         return createSimliStreamingAvatarSession({ requestId, userId: user.id, secondsReserved: authorizedSeconds, maxSessionSeconds: authorizedSeconds, avatarVoiceProfile });
       },
@@ -129,12 +133,12 @@ export async function GET(req: Request) {
     const session: SimliStreamingSession = result.result;
     const billingDecision: BillingDecision = result.billingDecision;
     cleanupStreamId = session.streamId;
-    const maxSessionSeconds = getLiveTutorMaxSessionSecondsForUser(user.email);
+    const maxSessionSeconds = getProductPolicy('PRO').liveTutor.maxSessionSeconds;
     const availableSessionSeconds = Math.min(
       maxSessionSeconds,
-      60 + Math.max(0, billingDecision.remainingUsage ?? 0),
+      Math.max(0, billingDecision.remainingUsage ?? 0),
     );
-    const availableBalanceSeconds = 60 + Math.max(0, billingDecision.remainingUsage ?? 0);
+    const availableBalanceSeconds = Math.max(0, billingDecision.remainingUsage ?? 0);
     session.expiresAt = await constrainLiveTutorSessionDuration(session.streamId, user.id, availableSessionSeconds) ?? session.expiresAt;
 
     logger.info('Live Tutor session created successfully', {
@@ -208,12 +212,16 @@ export async function GET(req: Request) {
     claimedRequestId = undefined;
     claimedUserId = undefined;
     if (error instanceof AIRequestGatewayError) {
+      const body = typeof error.body === 'object' && error.body !== null
+        ? error.body as Record<string, unknown>
+        : null;
+      const liveTutorAllowanceExhausted = error.status === 429 && body?.code === 'product_allowance_exhausted';
       logger.info('Live Tutor session request blocked', {
         status: error.status,
-        reason: typeof error.body === 'object' && error.body !== null ? (error.body as Record<string, unknown>).error : 'unknown',
+        reason: body?.error ?? 'unknown',
         category: 'live_tutor_session_blocked',
       });
-      return NextResponse.json(error.body, { status: error.status });
+      return NextResponse.json(error.body, { status: liveTutorAllowanceExhausted ? 402 : error.status });
     }
 
     const message = error instanceof Error ? error.message : 'Internal Server Error';

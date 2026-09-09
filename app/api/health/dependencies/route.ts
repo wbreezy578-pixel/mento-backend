@@ -37,7 +37,18 @@ async function probe(url: string, init?: RequestInit): Promise<ProbeResult> {
   }
 }
 
-export async function GET() {
+export async function GET(req: Request) {
+  const configuredToken = process.env.METRICS_AUTH_TOKEN?.trim();
+  if (process.env.NODE_ENV === 'production' && !configuredToken) {
+    return NextResponse.json({ error: 'Dependency diagnostics are not configured' }, { status: 503 });
+  }
+  if (configuredToken && req.headers.get('authorization') !== `Bearer ${configuredToken}`) {
+    return NextResponse.json(
+      { error: 'Unauthorized' },
+      { status: 401, headers: { 'Cache-Control': 'no-store' } },
+    );
+  }
+
   if (cached && cached.expiresAt > Date.now()) {
     return NextResponse.json({ ...cached.value, cached: true });
   }

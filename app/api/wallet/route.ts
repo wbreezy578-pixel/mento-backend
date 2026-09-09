@@ -11,7 +11,7 @@ export async function GET(req: Request) {
     }
 
     const snapshot = await getEntitlementSnapshot(user.id);
-    const totalLiveSeconds = snapshot.liveTutor.includedSecondsRemaining + snapshot.liveTutor.topUpSecondsRemaining;
+    const totalLiveSeconds = snapshot.liveTutor.availableSeconds;
 
     return NextResponse.json({
       currentPlan: snapshot.plan,
@@ -22,6 +22,7 @@ export async function GET(req: Request) {
       messagesRemainingMonthly: snapshot.normalChat.monthlyRemaining,
       imagesRemaining: snapshot.images.dailyRemaining,
       liveTutorMinutes: Math.floor(totalLiveSeconds / 60),
+      liveTutorSeconds: totalLiveSeconds,
       includedLiveTutorMinutes: Math.floor(snapshot.liveTutor.includedSecondsRemaining / 60),
       topUpLiveTutorMinutes: Math.floor(snapshot.liveTutor.topUpSecondsRemaining / 60),
       resetTime: snapshot.normalChat.dailyResetAt,

@@ -1,5 +1,7 @@
 import type { MetadataRoute } from 'next';
 
+const canonicalOrigin = process.env.AUTH_WEB_BASE_URL || 'https://app.mento.ai';
+
 export default function robots(): MetadataRoute.Robots {
   return {
     rules: {
@@ -7,6 +9,6 @@ export default function robots(): MetadataRoute.Robots {
       allow: '/',
       disallow: ['/api/', '/auth/', '/billing/'],
     },
-    sitemap: '/sitemap.xml',
+    sitemap: new URL('/sitemap.xml', canonicalOrigin).toString(),
   };
 }

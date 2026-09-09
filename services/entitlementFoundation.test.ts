@@ -47,4 +47,20 @@ describe('authoritative entitlement foundation', () => {
     expect(schema).toMatch(/providerExposureUSD\s+Float/);
     expect(schema).toMatch(/userChargeUSD\s+Float/);
   });
+
+  it('uses exact seconds for Live Tutor authorization and final ledger values', () => {
+    const billing = source('services/billingService.ts');
+    const sessionRoute = source('app/api/live-tutor/session/route.ts');
+    expect(billing).toContain('getAvailableLiveTutorSeconds(liveTutorWallet)');
+    expect(billing).toContain('secondsUsed: validatedInput.secondsUsed');
+    expect(sessionRoute).toContain('amount: 1');
+    expect(sessionRoute).toContain("getProductPolicy('PRO').liveTutor.maxSessionSeconds");
+    expect(sessionRoute).toContain('liveTutorAllowanceExhausted');
+  });
+
+  it('keeps legacy minute wallets readable until they are classified', () => {
+    const entitlement = source('services/entitlementService.ts');
+    expect(entitlement).toContain('if (canonicalSeconds > 0) return canonicalSeconds;');
+    expect(entitlement).toContain('wallet?.minutesBalance ?? 0) * 60');
+  });
 });

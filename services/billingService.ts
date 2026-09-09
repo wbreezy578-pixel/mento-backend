@@ -10,7 +10,7 @@ import logger from '../lib/logger';
 import '../lib/metrics';
 import { canStartLiveTutorSession } from './liveTutorBillingPolicy';
 import { evaluateCompletedAllowance, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolvePolicyModel } from './productPolicy';
-import { allocateLiveTutorConsumption } from './entitlementService';
+import { allocateLiveTutorConsumption, getAvailableLiveTutorSeconds } from './entitlementService';
 import { calculateGeminiProviderCostUSD, GEMINI_PRICING_SOURCE, GEMINI_PRICING_VERSION, isSupportedNormalChatModel } from './geminiPricing';
 import {
   assertAndLockGeminiDailyBudget,
@@ -286,7 +286,8 @@ async function getBillingDecision(input: BillingReservationInput): Promise<Billi
 
   if (validatedInput.feature === 'live_tutor') {
     const liveTutorWallet = await prisma.liveTutorWallet.findUnique({ where: { userId: validatedInput.userId } });
-    const availableSeconds = (liveTutorWallet?.minutesBalance ?? 0) * SECONDS_PER_MINUTE;
+    // Authorization uses exact seconds. minutesBalance is only a rounded display value.
+    const availableSeconds = getAvailableLiveTutorSeconds(liveTutorWallet);
     
     const allowed = canStartLiveTutorSession({ planEnabled: plan.liveTutorEnabled, availableSeconds, requestedSeconds: validatedInput.amount });
     const reason = !plan.liveTutorEnabled
@@ -670,7 +671,7 @@ async function createUsageLedgerEntry(
     : typeof input.success === 'boolean'
       ? input.success
       : allowed;
-  const secondsUsed = typeof input.secondsUsed === 'number' ? input.secondsUsed : (input.feature === 'live_tutor' ? (input.amount ?? 1) * 60 : 0);
+  const secondsUsed = typeof input.secondsUsed === 'number' ? input.secondsUsed : (input.feature === 'live_tutor' ? (input.amount ?? 1) : 0);
 
   try {
     const record = await tx.usageLog.create({
@@ -857,7 +858,8 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           },
         });
 
-        const availableSeconds = liveTutorWallet.minutesBalance * SECONDS_PER_MINUTE;
+        // Authorization uses exact seconds. minutesBalance is only a rounded display value.
+        const availableSeconds = getAvailableLiveTutorSeconds(liveTutorWallet);
         const allowed = canStartLiveTutorSession({ planEnabled: effectivePlan.liveTutorEnabled, availableSeconds, requestedSeconds: validatedInput.amount });
         const pendingReservation = validatedInput.pending === true;
         const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
@@ -1346,7 +1348,14 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
         await consumeLiveTutorBalance(tx, liveTutorWallet, validatedInput.amount, `usage:${provider}:${existing.id}`);
         await tx.usageLog.update({
           where: { id: existing.id },
-          data: { success: true },
+          data: {
+            success: true,
+            secondsUsed: validatedInput.secondsUsed,
+            providerCostUSD,
+            userChargeUSD,
+            profitUSD,
+            metadata: finalizedMetadata as InputJsonValue,
+          },
         });
         const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
         const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);

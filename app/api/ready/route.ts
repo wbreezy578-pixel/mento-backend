@@ -40,7 +40,7 @@ function getMemoryHealth() {
   };
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   const startedAt = Date.now();
   const checks: Record<string, unknown> = {};
 
@@ -71,10 +71,16 @@ export async function GET() {
 
   const allHealthy = isReadinessHealthy(checks as Record<string, unknown>);
 
-  return NextResponse.json({
+  const configuredToken = process.env.METRICS_AUTH_TOKEN?.trim();
+  const isOperator = process.env.NODE_ENV !== 'production'
+    ? true
+    : Boolean(configuredToken && req.headers.get('authorization') === `Bearer ${configuredToken}`);
+  const response: Record<string, unknown> = {
     status: allHealthy ? 'ready' : 'degraded',
     timestamp: new Date().toISOString(),
     latencyMs: Date.now() - startedAt,
-    checks,
-  }, { status: allHealthy ? 200 : 503 });
+  };
+  if (isOperator) response.checks = checks;
+
+  return NextResponse.json(response, { status: allHealthy ? 200 : 503 });
 }

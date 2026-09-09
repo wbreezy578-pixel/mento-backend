@@ -43,6 +43,22 @@ export function resolveIncludedSecondsForEvent(input: {
     : input.allowanceSeconds;
 }
 
+/**
+ * Canonical wallets use exact second buckets. Keep a compatibility fallback
+ * for pre-canonical wallets that only have the legacy minute field populated.
+ */
+export function getAvailableLiveTutorSeconds(wallet: {
+  includedSeconds?: number | null;
+  topUpSeconds?: number | null;
+  minutesBalance?: number | null;
+} | null | undefined): number {
+  const includedSeconds = Math.max(0, wallet?.includedSeconds ?? 0);
+  const topUpSeconds = Math.max(0, wallet?.topUpSeconds ?? 0);
+  const canonicalSeconds = includedSeconds + topUpSeconds;
+  if (canonicalSeconds > 0) return canonicalSeconds;
+  return Math.max(0, wallet?.minutesBalance ?? 0) * 60;
+}
+
 function canonicalStatus(raw: string | null | undefined): CanonicalEntitlementStatus {
   switch (String(raw ?? '').toLowerCase()) {
     case 'active': case 'trialing': return 'ACTIVE';
@@ -107,6 +123,7 @@ export async function getEntitlementSnapshot(userId: string, now = new Date()) {
       allowed: entitlement.policy.liveTutor.enabled,
       includedSecondsRemaining: liveWallet?.includedSeconds ?? 0,
       topUpSecondsRemaining: liveWallet?.topUpSeconds ?? 0,
+      availableSeconds: getAvailableLiveTutorSeconds(liveWallet),
       maxConcurrentSessions: entitlement.policy.liveTutor.maxConcurrentSessions,
       maxSessionSeconds: entitlement.policy.liveTutor.maxSessionSeconds,
     },

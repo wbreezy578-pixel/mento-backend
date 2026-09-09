@@ -124,7 +124,7 @@ export function estimateTokenCountFromImage(
   mimeType: string,
 ): { tokens: number; estimated: boolean } {
   // Base tokens for any image
-  let baseTokens = 258;
+  const baseTokens = 258;
 
   // Add tokens based on file size (very rough proxy for dimensions)
   // This is conservative - actual depends on exact dimensions

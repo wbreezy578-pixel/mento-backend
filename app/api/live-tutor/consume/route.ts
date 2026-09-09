@@ -10,6 +10,7 @@ import {
 } from '../../../../lib/aiSecurityGateway';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import logger from '../../../../lib/logger';
+import { getEntitlementSnapshot } from '../../../../services/entitlementService';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
@@ -70,7 +71,27 @@ export async function POST(req: Request) {
         secondsUsed: seconds,
         reason,
       }, user.id);
-      return NextResponse.json({ ok: true, status, streamId }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      let remainingSeconds: number | null = null;
+      try {
+        const snapshot = await getEntitlementSnapshot(user.id);
+        remainingSeconds = Math.max(0, snapshot.liveTutor.availableSeconds);
+      } catch (snapshotError) {
+        // Finalization is already committed. Do not turn a wallet-read outage
+        // into a false terminal failure; the next wallet refresh can recover it.
+        logger.warn('Live Tutor terminal balance read failed after finalization', {
+          userId: user.id,
+          streamId,
+          error: snapshotError instanceof Error ? snapshotError.message : String(snapshotError),
+          category: 'live_tutor_terminal_balance_unavailable',
+        });
+      }
+      return NextResponse.json({
+        ok: true,
+        status,
+        streamId,
+        remainingSeconds,
+        terminalReason: reason ?? null,
+      }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
     if (streamId) {

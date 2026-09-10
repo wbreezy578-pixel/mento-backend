@@ -7,7 +7,7 @@ export const metadata = {
 };
 
 export default function AccountDeletionPage() {
-  return <LegalPage title="Delete your Mento account" updated="August 25, 2026">
+  return <LegalPage title="Delete your Mento account" updated="September 10, 2026">
     <h2>Delete from the app</h2>
     <ol>
       <li>Open Mento and sign in.</li>
@@ -18,6 +18,6 @@ export default function AccountDeletionPage() {
     <h2>If you cannot access the app</h2>
     <p>Email <a href="mailto:mentosupport@gmail.com?subject=Mento%20account%20deletion%20request">mentosupport@gmail.com</a> from the address on your Mento account. We will verify account ownership before deletion.</p>
     <h2>Subscriptions</h2>
-    <p>Google Play subscriptions associated with Mento are cancelled during account deletion when technically available. Confirm their status in Google Play after deletion.</p>
+    <p>Deleting a Mento account does not itself cancel a Google Play subscription. Cancel any active subscription in Google Play to prevent future renewal, then confirm its status there. Google Play controls store purchase records and refund decisions.</p>
   </LegalPage>;
 }

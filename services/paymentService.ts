@@ -7,7 +7,6 @@ import logger from '../lib/logger';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
 import { trackShutdownOperation } from '../lib/crashRecovery';
 import '../lib/metrics';
-import { getProductPolicy } from './productPolicy';
 
 export type PaymentProvider = 'MPESA' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE';
 export type PaymentType = 'SUBSCRIPTION' | 'TOP_UP';
@@ -353,27 +352,12 @@ async function finalizePaymentInternal(input: {
       await ensureUserBillingSetup(current.userId);
       await ensureDefaultPlans();
 
-      if (current.type === 'SUBSCRIPTION') {
-        // Phase 4C: Subscription entitlement state (plan, status, periods, entitlementUpdatedAt)
-        // is now handled solely by applyVerifiedEntitlementEvent() to avoid race conditions.
-        // Finalization is payment-only: it records the transaction success.
-        // The provider adapter (caller) invokes applyVerifiedEntitlementEvent() with
-        // verified provider state (subscription periods, status from provider API).
-        // This ensures canonical entitlement authority is not split between
-        // finalization and applyVerifiedEntitlementEvent().
-
-        const liveTutorWallet = await tx.liveTutorWallet.findUnique({ where: { userId: current.userId } });
-        if (liveTutorWallet) {
-          const includedSeconds = getProductPolicy('PRO').liveTutor.includedSecondsPerPeriod;
-          const updated = await tx.liveTutorWallet.update({ where: { userId: current.userId }, data: { minutesBalance: Math.floor((includedSeconds + liveTutorWallet.topUpSeconds) / 60), includedSeconds } });
-          await tx.liveTutorMinuteLedger.create({ data: {
-            userId: current.userId, walletId: updated.id, idempotencyKey: `subscription:${current.provider}:${current.id}`,
-            entryType: 'SUBSCRIPTION_PERIOD_RESET', source: current.provider,
-            includedSecondsAfter: updated.includedSeconds, topUpSecondsAfter: updated.topUpSeconds,
-          } });
-          logger.info('Reset included Live Tutor allowance for completed Pro transaction', { userId: current.userId, transactionId: current.id, includedSeconds });
-        }
-      }
+      // Subscription entitlement state (plan, status, periods and included
+      // Live Tutor seconds) is applied only by applyVerifiedEntitlementEvent
+      // after the provider response has been verified.  Payment finalization
+      // records the payment; it must not refill a subscription period because
+      // a renewal payment can be retried or observed before its entitlement
+      // event and would otherwise restore already-consumed minutes.
 
       if (current.type === 'TOP_UP') {
         const metadata = asJsonObject(current.metadata);

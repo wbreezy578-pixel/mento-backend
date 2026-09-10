@@ -54,6 +54,8 @@ export default defineConfig({
       "services/billingReservation.test.ts",
       "services/productPolicy.test.ts",
       "services/entitlementFoundation.test.ts",
+      "services/economicsService.test.ts",
+      "services/paymentService.billing.test.ts",
       "services/liveTutorAudioProtocol.test.ts",
       "services/liveTutorAudioBridge.test.ts",
       "services/liveTutorVoiceFoundation.test.ts",

@@ -285,10 +285,11 @@ export async function ensureUserBillingSetup(userId: string): Promise<WalletSumm
 
   await prisma.userWallet.upsert({
     where: { userId },
-    update: {
-      plan: { connect: { id: freePlan.id } },
-      subscriptionStatus: 'active',
-    },
+    // This function only ensures that the billing records exist.  Existing
+    // entitlement state is authoritative and must be changed exclusively by
+    // the verified entitlement boundary.  In particular, a Live Tutor
+    // top-up must never downgrade an active Pro wallet to Free.
+    update: {},
     create: {
       user: {
         connect: { id: userId },

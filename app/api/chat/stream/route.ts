@@ -407,13 +407,22 @@ export async function POST(req: Request) {
             close();
             return;
           }
-          const appError = (() => {
-            const status = typeof err === 'object' && err !== null && 'status' in err && typeof (err as { status?: unknown }).status === 'number' ? (err as { status?: number }).status : undefined;
-            return {
-              message: 'We couldn’t finish that reply right now. Please try again shortly.',
-              status,
-            };
-          })();
+          const gatewayBody = err instanceof AIRequestGatewayError && err.body && typeof err.body === 'object' && !Array.isArray(err.body)
+            ? err.body as Record<string, unknown>
+            : null;
+          const appError = {
+            message: typeof gatewayBody?.error === 'string'
+              ? gatewayBody.error
+              : 'We couldn’t finish that reply right now. Please try again shortly.',
+            status: err instanceof AIRequestGatewayError
+              ? err.status
+              : typeof err === 'object' && err !== null && 'status' in err && typeof (err as { status?: unknown }).status === 'number'
+                ? (err as { status?: number }).status
+                : undefined,
+            code: typeof gatewayBody?.code === 'string' ? gatewayBody.code : 'stream_error',
+            upgradeAvailable: gatewayBody?.upgradeAvailable === true,
+            resetTime: typeof gatewayBody?.resetTime === 'string' ? gatewayBody.resetTime : null,
+          };
           logger.error('Chat stream error', { error: { message: appError.message, status: appError.status } });
           if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'generation_failed' }).catch(() => undefined);
           if (assistantMessageId) {
@@ -429,7 +438,13 @@ export async function POST(req: Request) {
             data: { userId, conversationId, messageId: assistantMessageId, eventType: 'unanswered_question', metadata: { requestId, reason: 'generation_failed' } },
           }).catch(() => undefined);
           if (!isStreamClosed()) {
-            const errPayload = JSON.stringify({ type: 'error', message: appError.message });
+            const errPayload = JSON.stringify({
+              type: 'error',
+              message: appError.message,
+              code: appError.code,
+              upgradeAvailable: appError.upgradeAvailable,
+              resetTime: appError.resetTime,
+            });
             enqueue(encoder.encode(`data: ${errPayload}\n\n`));
           }
           close();

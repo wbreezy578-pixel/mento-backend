@@ -496,6 +496,9 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
       error: 'Your current Mento usage allowance has been reached.',
       code: 'product_allowance_exhausted',
       retryable: false,
+      feature: options.feature,
+      upgradeAvailable: billingDecision.upgradeAvailable,
+      remainingUsage: billingDecision.remainingUsage,
       resetTime: billingDecision.resetTime,
     });
   }

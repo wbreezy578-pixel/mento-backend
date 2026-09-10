@@ -137,4 +137,29 @@ describe('request-scoped AI text security decisions', () => {
     expect(mocks.reserve).not.toHaveBeenCalled();
     expect(callback).not.toHaveBeenCalled();
   });
+
+  it('preserves upgrade availability and reset metadata when product allowance is exhausted', async () => {
+    const resetTime = '2026-09-11T00:00:00.000Z';
+    mocks.reserve.mockResolvedValueOnce({
+      allowed: false,
+      reason: 'Plan usage limit reached.',
+      remainingUsage: 0,
+      resetTime,
+      upgradeAvailable: true,
+      usage: { feature: 'chat', scope: 'day', used: 30, limit: 30, remaining: 0, resetAt: new Date(resetTime) },
+    });
+
+    await expect(executeAIRequest({
+      user: { id: 'user-free' }, clientIp: '127.0.0.1', feature: 'chat', provider: 'Gemini',
+      requestId: 'allowance-exhausted-1', callback: vi.fn(),
+    })).rejects.toMatchObject({
+      status: 429,
+      body: expect.objectContaining({
+        code: 'product_allowance_exhausted',
+        upgradeAvailable: true,
+        remainingUsage: 0,
+        resetTime,
+      }),
+    });
+  });
 });

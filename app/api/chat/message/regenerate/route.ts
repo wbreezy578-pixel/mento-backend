@@ -212,11 +212,22 @@ export async function POST(req: Request) {
             close();
             return;
           }
-          const message = 'We couldn’t regenerate that reply right now. Please try again shortly.';
+          const gatewayBody = err instanceof AIRequestGatewayError && err.body && typeof err.body === 'object' && !Array.isArray(err.body)
+            ? err.body as Record<string, unknown>
+            : null;
+          const message = typeof gatewayBody?.error === 'string'
+            ? gatewayBody.error
+            : 'We couldn’t regenerate that reply right now. Please try again shortly.';
           // Keep the last completed answer intact. The client may show streamed
           // draft text, but failed regeneration must never destroy durable content.
           if (!isStreamClosed()) {
-            const errorPayload = JSON.stringify({ type: 'error', message });
+            const errorPayload = JSON.stringify({
+              type: 'error',
+              message,
+              code: typeof gatewayBody?.code === 'string' ? gatewayBody.code : 'regeneration_error',
+              upgradeAvailable: gatewayBody?.upgradeAvailable === true,
+              resetTime: typeof gatewayBody?.resetTime === 'string' ? gatewayBody.resetTime : null,
+            });
             enqueue(encoder.encode(`data: ${errorPayload}\n\n`));
           }
           close();

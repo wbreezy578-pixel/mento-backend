@@ -228,51 +228,73 @@ export function getActiveSimliSessionForUser(userId: string): SimliStreamingSess
 }
 
 export async function claimLiveTutorSession(userId: string, requestId: string, avatarVoiceProfile: LiveTutorVoiceProfile = DEFAULT_LIVE_TUTOR_VOICE_PROFILE): Promise<boolean> {
-  const preflight = await prisma.liveTutorSession.findUnique({ where: { userId } });
-  if (preflight && isDurableSessionStale(preflight)) {
-    logger.info('[LiveTutorLifecycle] heartbeat_expired', { streamId: preflight.streamId, sessionId: preflight.id, userId, reason: 'claim_preflight_recovery', previousStatus: preflight.status, resultingStatus: 'finalizing', category: 'live_tutor_lifecycle' });
-      await completeSimliSessionLifecycle(preflight.streamId, { status: 'disconnected', timing: 'inactivity_end', reason: 'Heartbeat expired before new session claim' }, userId).catch((error) => {
-      logger.warn('[LiveTutorLifecycle] claim_preflight_recovery_failed', { streamId: preflight.streamId, sessionId: preflight.id, userId, reason: error instanceof Error ? error.message : 'recovery_failed', previousStatus: preflight.status, resultingStatus: 'recovery_required', category: 'live_tutor_lifecycle' });
-    });
-  }
   return prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT id FROM "User" WHERE id = ${userId} FOR UPDATE`;
     const existing = await tx.liveTutorSession.findUnique({ where: { userId } });
     const now = new Date();
-    if (existing?.status === 'recovery_required') {
-      logger.info('[LiveTutorLifecycle] claim_rejected_recovery_required', {
+
+    if (existing && (isGenuinelyActiveSession(existing, now) || isFreshClaimInProgress(existing, now))) {
+      const reason = isGenuinelyActiveSession(existing, now) ? 'genuinely_active_session' : 'claim_in_progress';
+      logger.info('[LiveTutorLifecycle] claim_rejected_active', {
         streamId: existing.streamId,
         sessionId: existing.id,
         userId,
-        reason: isDurableSessionStale(existing, now) ? 'recovery_reconciliation_pending' : 'fresh_recovery_in_progress',
+        reason,
         previousStatus: existing.status,
         resultingStatus: existing.status,
-        category: 'live_tutor_session_rejected_recovery',
+        category: 'live_tutor_lifecycle',
       });
       return false;
     }
-    if (existing && (isGenuinelyActiveSession(existing, now) || isFreshClaimInProgress(existing, now))) {
-      const reason = isGenuinelyActiveSession(existing, now) ? 'genuinely_active_session' : 'claim_in_progress';
-      logger.info('[LiveTutorLifecycle] claim_rejected_active', { streamId: existing.streamId, sessionId: existing.id, userId, reason, previousStatus: existing.status, resultingStatus: existing.status, category: 'live_tutor_lifecycle' });
-      return false;
-    }
-    if (existing && !isTerminalSession(existing.status)) {
-      logger.info('[LiveTutorLifecycle] stale_claim_non_blocking', { streamId: existing.streamId, sessionId: existing.id, userId, reason: isDurableSessionStale(existing, now) ? 'heartbeat_or_expiry_timeout' : 'non_active_lifecycle_state', previousStatus: existing.status, resultingStatus: 'creating', category: 'live_tutor_lifecycle' });
-    }
+
     await tx.liveTutorSession.upsert({
       where: { userId },
       update: {
-        streamId: `pending-${requestId}`, billingRequestId: requestId, avatarVoiceProfile, status: 'creating', createdAt: now,
-        lastActivityAt: now, expiresAt: new Date(now.getTime() + MAX_SESSION_SECONDS * 1000),
-        secondsConsumed: 0, billingFinalized: false, ownerProcessId: LIVE_TUTOR_PROCESS_ID, finalizationStartedAt: null, terminalStatus: null, terminalReason: null, finalizedAt: null,
+        streamId: `pending-${requestId}`,
+        billingRequestId: requestId,
+        avatarVoiceProfile,
+        status: 'creating',
+        createdAt: now,
+        lastActivityAt: now,
+        expiresAt: new Date(now.getTime() + MAX_SESSION_SECONDS * 1000),
+        secondsConsumed: 0,
+        billingFinalized: false,
+        ownerProcessId: LIVE_TUTOR_PROCESS_ID,
+        finalizationStartedAt: null,
+        terminalStatus: null,
+        terminalReason: null,
+        finalizedAt: null,
       },
       create: {
-        userId, streamId: `pending-${requestId}`, billingRequestId: requestId, avatarVoiceProfile, status: 'creating', createdAt: now,
-        lastActivityAt: now, expiresAt: new Date(now.getTime() + MAX_SESSION_SECONDS * 1000), ownerProcessId: LIVE_TUTOR_PROCESS_ID,
+        userId,
+        streamId: `pending-${requestId}`,
+        billingRequestId: requestId,
+        avatarVoiceProfile,
+        status: 'creating',
+        createdAt: now,
+        lastActivityAt: now,
+        expiresAt: new Date(now.getTime() + MAX_SESSION_SECONDS * 1000),
+        ownerProcessId: LIVE_TUTOR_PROCESS_ID,
       },
     });
-    logStatusTransition({ streamId: `pending-${requestId}`, sessionId: existing?.id, userId, previousStatus: existing?.status ?? 'none', resultingStatus: 'creating', reason: 'new_session_claimed' });
-    logger.info('[LiveTutorLifecycle] claim_created', { streamId: `pending-${requestId}`, sessionId: existing?.id ?? null, userId, reason: 'new_session_claimed', previousStatus: existing?.status ?? null, resultingStatus: 'creating', category: 'live_tutor_lifecycle' });
+
+    logStatusTransition({
+      streamId: `pending-${requestId}`,
+      sessionId: existing?.id,
+      userId,
+      previousStatus: existing?.status ?? 'none',
+      resultingStatus: 'creating',
+      reason: 'new_session_claimed',
+    });
+    logger.info('[LiveTutorLifecycle] claim_created', {
+      streamId: `pending-${requestId}`,
+      sessionId: existing?.id ?? null,
+      userId,
+      reason: 'new_session_claimed',
+      previousStatus: existing?.status ?? null,
+      resultingStatus: 'creating',
+      category: 'live_tutor_lifecycle',
+    });
     return true;
   });
 }

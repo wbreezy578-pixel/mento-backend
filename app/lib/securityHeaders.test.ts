@@ -12,10 +12,13 @@ const TEST_NONCE = '0123456789abcdef0123456789abcdef';
 
 describe('web security headers', () => {
   const originalAllowedOrigins = process.env.ALLOWED_ORIGINS;
+  const originalNodeEnv = process.env.NODE_ENV;
 
   afterEach(() => {
     if (originalAllowedOrigins === undefined) delete process.env.ALLOWED_ORIGINS;
     else process.env.ALLOWED_ORIGINS = originalAllowedOrigins;
+    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = originalNodeEnv;
   });
 
   it('allows only configured CORS origins', () => {
@@ -27,8 +30,16 @@ describe('web security headers', () => {
   });
 
   it('keeps local development origins available by default', () => {
+    process.env.NODE_ENV = 'development';
     delete process.env.ALLOWED_ORIGINS;
     expect(buildCorsHeaders('http://10.0.0.7:8082')['Access-Control-Allow-Origin']).toBe('http://10.0.0.7:8082');
+  });
+
+  it('fails CORS closed in production when an explicit origin allowlist is absent', () => {
+    process.env.NODE_ENV = 'production';
+    delete process.env.ALLOWED_ORIGINS;
+    expect(isAllowedOrigin('http://10.0.0.7:8082')).toBe(false);
+    expect(buildCorsHeaders('http://10.0.0.7:8082')['Access-Control-Allow-Origin']).toBeUndefined();
   });
 
   it('builds a strict nonce-based production policy', () => {

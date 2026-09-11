@@ -348,8 +348,9 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
               }
             });
           }, 10_000);
-          const sendVoiceReady = (usableSession: { expiresAt: Date }) => {
-            const remainingMs = Math.max(1, usableSession.expiresAt.getTime() - Date.now());
+          const sendVoiceReady = (expiresAt: Date | null) => {
+            const effectiveExpiresAt = expiresAt ?? new Date(Date.now() + 60_000);
+            const remainingMs = Math.max(1, effectiveExpiresAt.getTime() - Date.now());
             sessionExpiryTimer = setTimeout(() => {
               if (socket.readyState === WebSocket.OPEN) {
                 socket.send(JSON.stringify({ type: 'error', code: 'session_expired' }));
@@ -358,9 +359,11 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
             }, remainingMs);
             clearTimeout(authTimer);
             logger.info('[LiveTutorVoiceServer] voice_auth_validated', { event: 'voice_auth_validated', voiceTraceId, streamId: identity.streamId, category: 'live_tutor_voice_auth' });
-            socket.send(JSON.stringify({ type: 'auth_ok', streamId: identity.streamId, expiresAt: usableSession.expiresAt.toISOString() }));
+            socket.send(JSON.stringify({ type: 'auth_ok', streamId: identity.streamId, expiresAt: effectiveExpiresAt.toISOString() }));
             logger.info('[LiveTutorVoiceServer] voice_auth_ok_sent', { event: 'voice_auth_ok_sent', voiceTraceId, streamId: identity.streamId, category: 'live_tutor_voice_auth' });
           };
+          sendVoiceReady(identity.expiresAt);
+
           if (canResumeRuntime && resumableRuntime) {
             gemini = resumableRuntime.gemini;
             if (isTutorLanguage(message.tutorLanguage)) updateLiveTutorVoiceLanguage(gemini.sessionId, message.tutorLanguage);
@@ -377,7 +380,6 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
             });
             const usableSession = await markLiveTutorSessionUsable(identity.streamId, identity.userId);
             if (!usableSession) return reject(socket, 'live_tutor_session_not_usable');
-            sendVoiceReady(usableSession);
             socket.send(JSON.stringify({ type: 'connected', sessionId: gemini.sessionId, resumed: true }));
             return;
           }
@@ -388,11 +390,6 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
             conversationContext: (await getLiveTutorConversationContext(identity.conversationId, identity.userId)) ?? undefined,
             voiceTraceId: voiceTraceId ?? message.voiceTraceId,
             voiceProfile: identity.voiceProfile,
-            beforeProviderReconnect: async () => {
-              if (!activeRef.current || !await refreshVoiceLease(identity.streamId, leaseOwnerId, {})) throw new Error('Voice ownership unavailable.');
-              const current = await prisma.liveTutorSession.findUnique({ where: { streamId: identity.streamId }, select: { userId: true, expiresAt: true, billingFinalized: true } });
-              if (current?.userId !== identity.userId || current.billingFinalized || !current.expiresAt || current.expiresAt.getTime() <= Date.now()) throw new Error('Voice session expired.');
-            },
             systemInstruction: `${buildLiveTutorSystemInstruction()}\n${buildTutorLanguageInstruction(isTutorLanguage(message.tutorLanguage) ? message.tutorLanguage : await getTutorLanguage(identity.userId))}`,
             onTurnComplete: (turn) => {
               if (!durableConversationId) return;
@@ -580,7 +577,6 @@ export function attachLiveTutorVoiceGateway(server: HttpServer) {
           });
           const usableSession = await markLiveTutorSessionUsable(identity.streamId, identity.userId);
           if (!usableSession) return reject(socket, 'live_tutor_session_not_usable');
-          sendVoiceReady(usableSession);
           for (const pendingAudio of pendingPcm.splice(0)) {
             sendLiveTutorPcmAudio(gemini.sessionId, pendingAudio, LIVE_TUTOR_INPUT_MIME_TYPE);
           }

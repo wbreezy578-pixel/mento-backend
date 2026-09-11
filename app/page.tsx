@@ -6,6 +6,7 @@ export const metadata: Metadata = {
   title: 'Mento — AI learning, made conversational',
   description: 'Mento is an AI learning companion for focused chat, image understanding, and optional Live Tutor conversations.',
   alternates: { canonical: '/' },
+  keywords: ['AI learning', 'study companion', 'Live Tutor', 'image understanding', 'learning assistant'],
 };
 
 const features = [
@@ -33,7 +34,50 @@ const trustLinks = [
   { href: '/legal/account-deletion', label: 'Account Deletion', detail: 'How to permanently delete a Mento account and associated content.' },
 ];
 
+const faqItems = [
+  {
+    question: 'What is Mento?',
+    answer: 'Mento is an AI learning companion that helps adults study through chat, image understanding, and optional Live Tutor voice sessions.',
+  },
+  {
+    question: 'How does Mento handle image analysis?',
+    answer: 'Users can upload an image and ask Mento to explain diagrams, text, or visual questions, with the AI drawing on the uploaded content to provide explanations.',
+  },
+  {
+    question: 'Is Live Tutor available to everyone?',
+    answer: 'Live Tutor is offered as an optional premium experience, and access depends on the account’s current plan and entitlement state.',
+  },
+];
+
 export default function HomePage() {
+  const structuredData = {
+    '@context': 'https://schema.org',
+    '@type': 'WebSite',
+    name: 'Mento',
+    url: 'https://auth.trymentoapp.com',
+    description: 'Mento is an AI learning companion for focused chat, image understanding, and optional Live Tutor conversations.',
+    potentialAction: {
+      '@type': 'SearchAction',
+      target: 'https://auth.trymentoapp.com',
+      'query-input': 'required name=search_term_string',
+    },
+    publisher: {
+      '@type': 'Organization',
+      name: 'Mento',
+      url: 'https://auth.trymentoapp.com',
+    },
+    mainEntity: {
+      '@type': 'FAQPage',
+      mainEntity: faqItems.map((item) => ({
+        '@type': 'Question',
+        name: item.question,
+        acceptedAnswer: {
+          '@type': 'Answer',
+          text: item.answer,
+        },
+      })),
+    },
+  };
   return (
     <main className={styles.page}>
       <nav className={styles.nav} aria-label="Primary navigation">
@@ -79,6 +123,11 @@ export default function HomePage() {
         </aside>
       </section>
 
+      <script
+        type="application/ld+json"
+        dangerouslySetInnerHTML={{ __html: JSON.stringify(structuredData) }}
+      />
+
       <section className={styles.featureSection} aria-labelledby="features-title">
         <div className={styles.sectionHeading}>
           <p className={styles.kicker}>A flexible learning companion</p>
@@ -90,6 +139,22 @@ export default function HomePage() {
               <span>{feature.number}</span>
               <h3>{feature.title}</h3>
               <p>{feature.body}</p>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      <section className={styles.featureSection} aria-labelledby="faq-title">
+        <div className={styles.sectionHeading}>
+          <p className={styles.kicker}>Answers you can rely on</p>
+          <h2 id="faq-title">Frequently asked questions.</h2>
+        </div>
+        <div className={styles.featureGrid}>
+          {faqItems.map((item) => (
+            <article className={styles.featureCard} key={item.question}>
+              <span>FAQ</span>
+              <h3>{item.question}</h3>
+              <p>{item.answer}</p>
             </article>
           ))}
         </div>

@@ -59,6 +59,29 @@ export function getAvailableLiveTutorSeconds(wallet: {
   return Math.max(0, wallet?.minutesBalance ?? 0) * 60;
 }
 
+/**
+ * User-facing Live Tutor balance. Included subscription minutes must never be
+ * exposed after access expires; purchased top-ups remain recorded for a later
+ * reactivation or support reconciliation, but cannot be spent while disabled.
+ */
+export function getEffectiveLiveTutorBalance(input: {
+  allowed: boolean;
+  includedSeconds?: number | null;
+  topUpSeconds?: number | null;
+  minutesBalance?: number | null;
+}) {
+  const includedSeconds = Math.max(0, input.includedSeconds ?? 0);
+  const topUpSeconds = Math.max(0, input.topUpSeconds ?? 0);
+  if (!input.allowed) {
+    return { includedSecondsRemaining: 0, topUpSecondsRemaining: topUpSeconds, availableSeconds: 0 };
+  }
+  return {
+    includedSecondsRemaining: includedSeconds,
+    topUpSecondsRemaining: topUpSeconds,
+    availableSeconds: getAvailableLiveTutorSeconds(input),
+  };
+}
+
 function canonicalStatus(raw: string | null | undefined): CanonicalEntitlementStatus {
   switch (String(raw ?? '').toLowerCase()) {
     case 'active': case 'trialing': return 'ACTIVE';
@@ -102,6 +125,12 @@ export async function getEntitlementSnapshot(userId: string, now = new Date()) {
     prisma.usageLog.count({ where: { userId, feature: 'image', success: true, createdAt: { gte: day.start, lt: day.end } } }),
     prisma.liveTutorWallet.findUnique({ where: { userId } }),
   ]);
+  const liveTutorBalance = getEffectiveLiveTutorBalance({
+    allowed: entitlement.policy.liveTutor.enabled,
+    includedSeconds: liveWallet?.includedSeconds,
+    topUpSeconds: liveWallet?.topUpSeconds,
+    minutesBalance: liveWallet?.minutesBalance,
+  });
   return {
     plan: entitlement.plan,
     status: entitlement.status,
@@ -121,9 +150,7 @@ export async function getEntitlementSnapshot(userId: string, now = new Date()) {
     },
     liveTutor: {
       allowed: entitlement.policy.liveTutor.enabled,
-      includedSecondsRemaining: liveWallet?.includedSeconds ?? 0,
-      topUpSecondsRemaining: liveWallet?.topUpSeconds ?? 0,
-      availableSeconds: getAvailableLiveTutorSeconds(liveWallet),
+      ...liveTutorBalance,
       maxConcurrentSessions: entitlement.policy.liveTutor.maxConcurrentSessions,
       maxSessionSeconds: entitlement.policy.liveTutor.maxSessionSeconds,
     },

@@ -176,5 +176,39 @@ export function loadAndValidateEnvironment(): void {
   validateNonEmpty('SUPABASE_ANON_KEY', resolveEnvValue('SUPABASE_ANON_KEY'));
   validateNonEmpty('PAYMENT_WEBHOOK_AUTH_SECRET', resolveEnvValue('PAYMENT_WEBHOOK_AUTH_SECRET') ?? resolveEnvValue('PAYMENT_WEBHOOK_SECRET'));
 
+  const authWebBaseUrl = resolveEnvValue('AUTH_WEB_BASE_URL');
+  if (process.env.NODE_ENV === 'production') {
+    validateUrl('AUTH_WEB_BASE_URL', authWebBaseUrl, 'https://');
+  } else if (authWebBaseUrl) {
+    validateUrl('AUTH_WEB_BASE_URL', authWebBaseUrl, 'https://');
+  }
+
+  const liveTutorVoiceProvider = resolveEnvValue('LIVE_TUTOR_VOICE_PROVIDER');
+  if (liveTutorVoiceProvider && liveTutorVoiceProvider !== 'openai') {
+    throw new Error('Environment variable "LIVE_TUTOR_VOICE_PROVIDER" must be "openai" when set. Gemini is no longer supported for Live Tutor.');
+  }
+
+  const simliApiKey = resolveEnvValue('SIMLI_API_KEY');
+  const simliAvatarId = resolveEnvValue('SIMLI_AVATAR_ID') ?? resolveEnvValue('SIMLI_FACE_ID');
+  if (simliApiKey || simliAvatarId || liveTutorVoiceProvider) {
+    validateNonEmpty('SIMLI_API_KEY', simliApiKey);
+    validateNonEmpty('SIMLI_AVATAR_ID', simliAvatarId);
+  }
+
+  if (liveTutorVoiceProvider === 'openai') {
+    validateNonEmpty('OPENAI_API_KEY', resolveEnvValue('OPENAI_API_KEY'));
+  }
+
+  if (process.env.NODE_ENV === 'production') {
+    const redisUrl = resolveEnvValue('REDIS_URL') ?? resolveEnvValue('REDIS_HOST');
+    validateNonEmpty('REDIS_URL', redisUrl);
+
+    const trustedProxyProvider = resolveEnvValue('TRUSTED_PROXY_PROVIDER');
+    const validTrustedProxyProviders = new Set(['azure-container-apps', 'vercel', 'none']);
+    if (!trustedProxyProvider || !validTrustedProxyProviders.has(trustedProxyProvider.trim().toLowerCase())) {
+      throw new Error('Environment variable "TRUSTED_PROXY_PROVIDER" must be set to one of "azure-container-apps", "vercel", or "none" in production.');
+    }
+  }
+
   environmentValidated = true;
 }

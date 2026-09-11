@@ -17,7 +17,7 @@ vi.mock('../../../../../lib/rateLimiter', () => ({
   ensureSlidingWindow: mocks.ensureSlidingWindow,
 }));
 vi.mock('../../../../../lib/logger', () => ({
-  default: { error: vi.fn() },
+  default: { warn: vi.fn(), error: vi.fn() },
 }));
 vi.mock('../../../../../lib/prisma', () => {
   const transactionClient = {

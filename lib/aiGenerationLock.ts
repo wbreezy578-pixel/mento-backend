@@ -13,7 +13,19 @@ const localLocks = new Map<string, { ownerId: string; expiresAt: number }>();
 
 if (redisUrl) {
   redis = createRedisClient(redisUrl);
-  redis.on('error', (error) => logger.warn('AI generation lock Redis error', { message: error.message }));
+  redis.on('error', (error) => logger.warn('AI generation lock Redis error', {
+    message: error.message,
+    category: 'ai_generation_lock_redis_error',
+  }));
+}
+
+function markRedisUnavailable(error: unknown, context: string): void {
+  logger.warn('AI generation lock Redis unavailable; falling back to in-memory coordination', {
+    context,
+    message: error instanceof Error ? error.message : String(error),
+    category: 'ai_generation_lock_redis_unavailable',
+  });
+  redis = null;
 }
 
 function lockKey(conversationId: string): string {
@@ -48,7 +60,11 @@ export type AIGenerationLease = {
 
 export async function acquireAIGenerationLock(conversationId: string, ownerId: string): Promise<boolean> {
   if (redis) {
-    return await redis.set(lockKey(conversationId), ownerId, 'PX', GENERATION_LOCK_TTL_MS, 'NX') === 'OK';
+    try {
+      return await redis.set(lockKey(conversationId), ownerId, 'PX', GENERATION_LOCK_TTL_MS, 'NX') === 'OK';
+    } catch (error) {
+      markRedisUnavailable(error, 'acquireAIGenerationLock');
+    }
   }
   if (requireRedis) throw new Error('Redis is required for AI generation coordination.');
   const key = lockKey(conversationId);
@@ -60,8 +76,12 @@ export async function acquireAIGenerationLock(conversationId: string, ownerId: s
 
 export async function releaseAIGenerationLock(conversationId: string, ownerId: string): Promise<void> {
   if (redis) {
-    await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, lockKey(conversationId), ownerId);
-    return;
+    try {
+      await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, lockKey(conversationId), ownerId);
+      return;
+    } catch (error) {
+      markRedisUnavailable(error, 'releaseAIGenerationLock');
+    }
   }
   const key = lockKey(conversationId);
   if (localLocks.get(key)?.ownerId === ownerId) localLocks.delete(key);
@@ -69,8 +89,12 @@ export async function releaseAIGenerationLock(conversationId: string, ownerId: s
 
 export async function renewAIGenerationLock(conversationId: string, ownerId: string): Promise<boolean> {
   if (redis) {
-    const renewed = await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end", 1, lockKey(conversationId), ownerId, GENERATION_LOCK_TTL_MS);
-    return Number(renewed) === 1;
+    try {
+      const renewed = await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end", 1, lockKey(conversationId), ownerId, GENERATION_LOCK_TTL_MS);
+      return Number(renewed) === 1;
+    } catch (error) {
+      markRedisUnavailable(error, 'renewAIGenerationLock');
+    }
   }
   const current = localLocks.get(lockKey(conversationId));
   if (current?.ownerId !== ownerId || current.expiresAt <= Date.now()) return false;
@@ -80,8 +104,12 @@ export async function renewAIGenerationLock(conversationId: string, ownerId: str
 
 export async function verifyAIGenerationLockOwner(conversationId: string, ownerId: string): Promise<boolean> {
   if (redis) {
-    const owned = await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return 1 else return 0 end", 1, lockKey(conversationId), ownerId);
-    return Number(owned) === 1;
+    try {
+      const owned = await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return 1 else return 0 end", 1, lockKey(conversationId), ownerId);
+      return Number(owned) === 1;
+    } catch (error) {
+      markRedisUnavailable(error, 'verifyAIGenerationLockOwner');
+    }
   }
   const current = localLocks.get(lockKey(conversationId));
   return current?.ownerId === ownerId && current.expiresAt > Date.now();

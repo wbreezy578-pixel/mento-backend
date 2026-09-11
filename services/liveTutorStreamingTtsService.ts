@@ -8,8 +8,9 @@ import {
 import { LiveTutorAudioBridge } from './liveTutorAudioBridge';
 
 /**
- * Coordinates Gemini Live streaming TTS with audio resampling.
- * Uses an isolated Gemini session and streams audio chunks immediately.
+ * Legacy streaming TTS helper that uses Gemini Live internally.
+ * This is retained only for backward-compatible endpoints and is not
+ * part of the active OpenAI Realtime + Simli Live Tutor flow.
  */
 export class LiveTutorStreamingTtsService {
   private geminiSession: GeminiLiveSession | null = null;

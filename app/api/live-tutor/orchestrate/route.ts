@@ -10,10 +10,6 @@ import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 
 const CORS_METHODS = 'POST, OPTIONS';
 
-// In-memory orchestrator instances per user
-// TODO: Move to Redis/session cache for production
-const orchestratorInstances = new Map<string, ReturnType<typeof createLiveTutorOrchestrator>>();
-
 export async function OPTIONS(req: Request) {
   return new NextResponse(null, {
     headers: {
@@ -30,13 +26,6 @@ export async function POST(req: Request) {
     ...buildCorsHeaders(origin),
     'Access-Control-Allow-Methods': CORS_METHODS,
   };
-
-  if (process.env.NODE_ENV === 'production') {
-    return NextResponse.json(
-      { error: 'This Live Tutor endpoint is not available in production.' },
-      { status: 410, headers: corsHeaders }
-    );
-  }
 
   try {
     const user = await authenticateAIRequest(req);
@@ -68,47 +57,40 @@ export async function POST(req: Request) {
       messageLength: message?.length ?? 0,
     });
 
-    // Get or create orchestrator for this user session
-    let orchestrator = orchestratorInstances.get(user.id);
-    if (!orchestrator) {
-      orchestrator = createLiveTutorOrchestrator(null, {
-        onStatusChange: (status: LiveTutorStatus) => {
-          logger.info('Orchestrator status changed', {
-            userId: user.id,
-            status,
-          });
-        },
-        onTranscriptChange: (transcript: string, interim: string) => {
-          logger.info('Orchestrator transcript', {
-            userId: user.id,
-            transcriptLength: transcript.length,
-            interimLength: interim.length,
-          });
-        },
-        onSubtitleChange: (subtitle: string) => {
-          logger.info('Orchestrator subtitle', {
-            userId: user.id,
-            subtitleLength: subtitle.length,
-          });
-        },
-        onError: (error: string) => {
-          logger.error('Orchestrator error', {
-            userId: user.id,
-            error,
-          });
-        },
-        onConversationMessage: (msg: { role: 'user' | 'assistant'; text: string }) => {
-          logger.info('Orchestrator conversation', {
-            userId: user.id,
-            role: msg.role,
-            textLength: msg.text.length,
-          });
-        },
-            }, user.id);
-
-      orchestratorInstances.set(user.id, orchestrator);
-      logger.info('Created new orchestrator instance', { userId: user.id });
-    }
+    const orchestrator = createLiveTutorOrchestrator(null, {
+      onStatusChange: (status: LiveTutorStatus) => {
+        logger.info('Orchestrator status changed', {
+          userId: user.id,
+          status,
+        });
+      },
+      onTranscriptChange: (transcript: string, interim: string) => {
+        logger.info('Orchestrator transcript', {
+          userId: user.id,
+          transcriptLength: transcript.length,
+          interimLength: interim.length,
+        });
+      },
+      onSubtitleChange: (subtitle: string) => {
+        logger.info('Orchestrator subtitle', {
+          userId: user.id,
+          subtitleLength: subtitle.length,
+        });
+      },
+      onError: (error: string) => {
+        logger.error('Orchestrator error', {
+          userId: user.id,
+          error,
+        });
+      },
+      onConversationMessage: (msg: { role: 'user' | 'assistant'; text: string }) => {
+        logger.info('Orchestrator conversation', {
+          userId: user.id,
+          role: msg.role,
+          textLength: msg.text.length,
+        });
+      },
+    }, user.id);
 
     if (action === 'send-message') {
       if (!message || typeof message !== 'string' || !message.trim()) {

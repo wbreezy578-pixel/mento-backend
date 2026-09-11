@@ -1,6 +1,6 @@
 import type { MetadataRoute } from 'next';
 
-const canonicalOrigin = process.env.AUTH_WEB_BASE_URL || 'https://app.mento.ai';
+const canonicalOrigin = (process.env.AUTH_WEB_BASE_URL || 'https://auth.trymentoapp.com').replace(/\/$/, '');
 
 export default function robots(): MetadataRoute.Robots {
   return {

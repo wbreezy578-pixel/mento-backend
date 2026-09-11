@@ -14,6 +14,7 @@ export default defineConfig({
       "lib/authSession.test.ts",
       "lib/idorSecurity.test.ts",
       "app/lib/authSecurityIntegration.test.ts",
+      "app/lib/browserAuthPolicy.test.ts",
       "app/api/auth/refresh.security.test.ts",
       "app/api/auth/logout.security.test.ts",
       "app/api/authFlowSecurity.test.ts",

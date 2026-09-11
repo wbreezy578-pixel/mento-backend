@@ -1,5 +1,6 @@
 import { rateLimitAllowed, rateLimitDenied, rateLimitHits } from './metrics';
 import { getRedisUrl } from './env';
+import logger from './logger';
 import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REDIS_URL = getRedisUrl();
@@ -23,6 +24,13 @@ function distributedLimiterUnavailable(type: 'cooldown' | 'sliding' | 'daily') {
   // Dedicated bounded labels make Redis limiter outages alertable without
   // conflating infrastructure failures with legitimate user throttling.
   const outageType = `${type}_unavailable`;
+  logger.warn('[RateLimiter] Distributed limiter unavailable', {
+    type,
+    outageType,
+    category: 'rate_limiter_unavailable',
+    redisConfigured: Boolean(redis),
+    requireDistributed: REQUIRE_DISTRIBUTED_RATE_LIMIT,
+  });
   rateLimitDenied.inc({ type: outageType });
   rateLimitHits.inc({ type: outageType });
 }

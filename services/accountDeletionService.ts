@@ -1,7 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import logger from '../lib/logger';
-import { cancelGooglePlaySubscriptionsForAccountDeletion } from './nativeStoreService';
 import { deleteSupabaseAuthUser } from './supabaseAdminService';
 import {
   type AccountDeletionFailureCode,
@@ -74,11 +73,9 @@ export async function processAccountDeletionJob(jobId: string) {
   let failureCode: AccountDeletionFailureCode = 'internal_delete_failed';
 
   try {
-    if (!job.googlePlayCanceledAt) {
-      failureCode = 'google_play_cancel_failed';
-      await cancelGooglePlaySubscriptionsForAccountDeletion(job.userId);
-      await prisma.accountDeletionJob.update({ where: { id: job.id }, data: { googlePlayCanceledAt: new Date() } });
-    }
+    // Google Play subscriptions are store contracts. Deleting a Mento account
+    // must not silently cancel a user's renewal; the public deletion flow tells
+    // users to manage that subscription in Google Play.
     if (!job.supabaseDeletedAt) {
       failureCode = 'supabase_delete_failed';
       if (job.supabaseUserId) await deleteSupabaseAuthUser(job.supabaseUserId);

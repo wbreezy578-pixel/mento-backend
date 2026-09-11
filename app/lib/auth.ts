@@ -9,6 +9,7 @@ import logger from '../../lib/logger';
 import { NextResponse } from 'next/server';
 import type { ResponseCookies } from 'next/dist/server/web/spec-extension/cookies';
 import { getRateLimitClientKey, getTrustedClientIp } from '../../lib/requestMetadata';
+import { isAllowedOrigin } from '../../lib/securityHeaders';
 
 loadAndValidateEnvironment();
 const JWT_SECRET = getConfiguredJwtSecret();
@@ -37,7 +38,6 @@ export const DUMMY_BCRYPT_HASH = '$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxa
 // Mento currently ships as a native mobile application.  Browser sign-in is
 // deliberately opt-in so the web host used for email actions cannot silently
 // become a second session surface.
-const BROWSER_AUTH_ENABLED = process.env.AUTH_BROWSER_SIGN_IN_ENABLED === 'true';
 const userContext = new AsyncLocalStorage<{ userId: string; sessionId: string } | null>();
 
 export interface JwtPayload {
@@ -91,18 +91,64 @@ export function getLoginPolicyState(user: { failedLoginAttempts?: number | null;
   };
 }
 
-function extractTokenFromRequest(req: Request): { token: string | null; source: 'authorization' | 'cookie' | 'none' } {
+export function isBrowserAuthEnabled(): boolean {
+  return process.env.AUTH_BROWSER_SIGN_IN_ENABLED === 'true';
+}
+
+// Browser-session mode is deliberately selected by server configuration and a
+// browser Origin that passes the server allowlist. It is never a client body
+// flag, so a native client cannot ask the API to skip token delivery or gain a
+// different authorization mode.
+export function isBrowserAuthRequest(req: Request): boolean {
+  return isBrowserAuthEnabled() && isAllowedOrigin(req.headers.get('origin'));
+}
+
+function getCookieValue(req: Request, name: string): string | null {
+  const cookieHeader = req.headers.get('cookie') ?? '';
+  const cookieMatch = cookieHeader.match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+  return cookieMatch?.[1] ? decodeURIComponent(cookieMatch[1]).trim() : null;
+}
+
+export function getRefreshTokenFromBrowserCookie(req: Request): string | null {
+  return isBrowserAuthRequest(req) ? getCookieValue(req, 'mento_refresh_token') : null;
+}
+
+export function buildAuthSessionResponseBody(input: {
+  browserSession: boolean;
+  accessToken: string;
+  refreshToken: string;
+  sessionExpiresAt: string;
+  user: Record<string, unknown>;
+}) {
+  if (input.browserSession) {
+    // Browser sessions authenticate exclusively through the HttpOnly cookies.
+    // Do not serialize either bearer token into a response readable by page JS.
+    return { sessionExpiresAt: input.sessionExpiresAt, user: input.user };
+  }
+  return {
+    token: input.accessToken,
+    refreshToken: input.refreshToken,
+    sessionExpiresAt: input.sessionExpiresAt,
+    user: input.user,
+  };
+}
+
+// Exported for route-level policy tests. Callers must still use
+// getUserFromRequest/requireUser for authentication and session validation.
+export function getAuthTokenFromRequest(req: Request): { token: string | null; source: 'authorization' | 'cookie' | 'none' } {
   const headerValue = req.headers.get('authorization')?.trim() ?? '';
   const headerMatch = headerValue.match(/^Bearer\s+(.+)$/i);
   if (headerMatch?.[1]) {
     return { token: headerMatch[1].trim(), source: 'authorization' };
   }
 
-  if (BROWSER_AUTH_ENABLED) {
-    const cookieHeader = req.headers.get('cookie') ?? '';
-    const cookieMatch = cookieHeader.match(/(?:^|;\s*)mento_access_token=([^;]+)/);
-    if (cookieMatch?.[1]) {
-      return { token: decodeURIComponent(cookieMatch[1]).trim(), source: 'cookie' };
+  // Cookie credentials are a browser-session transport only. Require the
+  // same opt-in + server allowlisted Origin boundary used when issuing them;
+  // do not silently authenticate a cross-origin request from ambient cookies.
+  if (isBrowserAuthRequest(req)) {
+    const token = getCookieValue(req, 'mento_access_token');
+    if (token) {
+      return { token, source: 'cookie' };
     }
   }
 
@@ -110,7 +156,7 @@ function extractTokenFromRequest(req: Request): { token: string | null; source: 
 }
 
 export async function getUserFromRequest(req: Request) {
-  const { token } = extractTokenFromRequest(req);
+  const { token } = getAuthTokenFromRequest(req);
 
   if (!token) {
     userContext.enterWith(null);
@@ -291,10 +337,10 @@ export function buildAuthCookieOptions(params: { isProduction: boolean; maxAgeSe
 
 export function applyAuthCookies(
   response: NextResponse,
-  params: { accessToken: string; refreshToken: string; isProduction: boolean; accessMaxAgeSeconds?: number; refreshMaxAgeSeconds?: number; path?: string }
+  params: { accessToken: string; refreshToken: string; isProduction: boolean; browserSession: boolean; accessMaxAgeSeconds?: number; refreshMaxAgeSeconds?: number; path?: string }
 ) {
   response.headers.set('Cache-Control', 'no-store');
-  if (!BROWSER_AUTH_ENABLED) return response;
+  if (!params.browserSession || !isBrowserAuthEnabled()) return response;
 
   response.cookies.set('mento_access_token', params.accessToken, buildAuthCookieOptions({
     isProduction: params.isProduction,

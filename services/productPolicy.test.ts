@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { evaluateCompletedAllowance, getFreeMonthlyWindow, getProductPolicy, getUtcDayWindow, resolvePolicyModel } from './productPolicy';
-import { allocateLiveTutorConsumption, resolveIncludedSecondsForEvent, shouldApplyEntitlementEvent } from './entitlementService';
+import { evaluateCompletedAllowance, getFreeMonthlyWindow, getProductPolicy, getUtcDayWindow, resolveAllowanceReset, resolvePolicyModel } from './productPolicy';
+import { allocateLiveTutorConsumption, getEffectiveLiveTutorBalance, resolveIncludedSecondsForEvent, shouldApplyEntitlementEvent } from './entitlementService';
 import { classifyLiveTutorFinalizationTiming } from './simliService';
 import { isSubscriptionActive } from './planService';
 
@@ -56,6 +56,15 @@ describe('canonical product policy', () => {
     expect(() => allocateLiveTutorConsumption(10, 10, 21)).toThrow(/exhausted/);
   });
 
+  it('does not expose included Live Tutor time after Pro access expires', () => {
+    expect(getEffectiveLiveTutorBalance({ allowed: false, includedSeconds: 7200, topUpSeconds: 600 })).toEqual({
+      includedSecondsRemaining: 0,
+      topUpSecondsRemaining: 600,
+      availableSeconds: 0,
+    });
+    expect(getEffectiveLiveTutorBalance({ allowed: true, includedSeconds: 7200, topUpSeconds: 600 }).availableSeconds).toBe(7800);
+  });
+
   it('does not let stale events regress entitlement or same-period updates refill usage', () => {
     const periodStart = new Date('2026-09-01T00:00:00.000Z');
     const periodEnd = new Date('2026-10-01T00:00:00.000Z');
@@ -82,6 +91,25 @@ describe('canonical product policy', () => {
     expect(evaluateCompletedAllowance({ dailyUsed: 29, monthlyUsed: 499, dailyLimit: 30, monthlyLimit: 500 })).toEqual({ allowed: true, dailyRemaining: 0, monthlyRemaining: 0 });
     expect(evaluateCompletedAllowance({ dailyUsed: 30, monthlyUsed: 100, dailyLimit: 30, monthlyLimit: 500 }).allowed).toBe(false);
     expect(evaluateCompletedAllowance({ dailyUsed: 1, monthlyUsed: 500, dailyLimit: 30, monthlyLimit: 500 }).allowed).toBe(false);
+  });
+
+  it('reports the first exhausted allowance boundary and its scope', () => {
+    const dailyResetAt = new Date('2026-09-10T00:00:00.000Z');
+    const periodResetAt = new Date('2026-10-01T00:00:00.000Z');
+    expect(resolveAllowanceReset({
+      dailyExceeded: true,
+      periodExceeded: true,
+      dailyResetAt,
+      periodResetAt,
+      periodScope: 'monthly',
+    })).toEqual({ resetAt: dailyResetAt, scope: 'daily' });
+    expect(resolveAllowanceReset({
+      dailyExceeded: false,
+      periodExceeded: true,
+      dailyResetAt,
+      periodResetAt,
+      periodScope: 'subscription_period',
+    })).toEqual({ resetAt: periodResetAt, scope: 'subscription_period' });
   });
 
   it('never lets client model input upgrade a Free request', () => {

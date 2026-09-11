@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../lib/prisma';
 import logger from '../../../lib/logger';
-import { signToken, normalizeEmail, verifyPassword, buildUserSummary, getLoginPolicyState, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, getSessionClientIp, authRateLimitSubject, DUMMY_BCRYPT_HASH } from '../../lib/auth';
+import { signToken, normalizeEmail, verifyPassword, buildUserSummary, getLoginPolicyState, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, getSessionClientIp, authRateLimitSubject, DUMMY_BCRYPT_HASH, isBrowserAuthRequest, buildAuthSessionResponseBody } from '../../lib/auth';
 import { createNotification } from '../../services/notificationService';
 import { createSessionRecord, generateSecureToken, getRefreshSessionExpiry, REFRESH_SESSION_ABSOLUTE_TTL_MS } from '../../../lib/authSession';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
@@ -130,16 +130,19 @@ export async function POST(req: Request) {
       // ignore
     }
 
-    const response = NextResponse.json({
-      token: accessToken,
+    const browserSession = isBrowserAuthRequest(req);
+    const response = NextResponse.json(buildAuthSessionResponseBody({
+      browserSession,
+      accessToken,
       refreshToken: refreshTokenValue,
       sessionExpiresAt: sessionExpiresAt.toISOString(),
       user: buildUserSummary(user),
-    }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }), { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     applyAuthCookies(response, {
       accessToken,
       refreshToken: refreshTokenValue,
       isProduction: process.env.NODE_ENV === 'production',
+      browserSession,
     });
     return response;
   } catch (err: unknown) {

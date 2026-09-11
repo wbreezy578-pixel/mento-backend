@@ -14,7 +14,10 @@ const mocks = vi.hoisted(() => {
     recordSecurityEvent: vi.fn(),
     signToken: vi.fn(() => 'access-token'),
     buildUserSummary: vi.fn((user: unknown) => user),
+    buildAuthSessionResponseBody: vi.fn((input: Record<string, unknown>) => input.browserSession ? { sessionExpiresAt: input.sessionExpiresAt, user: input.user } : { token: input.accessToken, refreshToken: input.refreshToken, sessionExpiresAt: input.sessionExpiresAt, user: input.user }),
     applyAuthCookies: vi.fn(),
+    getRefreshTokenFromBrowserCookie: vi.fn(() => null),
+    isBrowserAuthRequest: vi.fn(() => false),
     findSessionByToken: vi.fn(),
     generateSecureToken: vi.fn(() => 'rotated-refresh-token'),
     getRefreshSessionExpiry: vi.fn(() => new Date('2099-01-02T00:00:00.000Z')),
@@ -32,7 +35,10 @@ vi.mock('../../lib/auth', () => ({
   recordSecurityEvent: mocks.recordSecurityEvent,
   signToken: mocks.signToken,
   buildUserSummary: mocks.buildUserSummary,
+  buildAuthSessionResponseBody: mocks.buildAuthSessionResponseBody,
   applyAuthCookies: mocks.applyAuthCookies,
+  getRefreshTokenFromBrowserCookie: mocks.getRefreshTokenFromBrowserCookie,
+  isBrowserAuthRequest: mocks.isBrowserAuthRequest,
   normalizeEmail: (email: string) => email.trim().toLowerCase(),
 }));
 vi.mock('../../../lib/authSession', () => ({
@@ -103,5 +109,13 @@ describe('refresh-session race and reuse handling', () => {
     const response = await POST(refreshRequest());
     expect(response.status).toBe(500);
     await expect(response.json()).resolves.toEqual({ error: 'Unable to refresh session' });
+  });
+
+  it('uses an HttpOnly-cookie response shape for an allowed browser session', async () => {
+    mocks.isBrowserAuthRequest.mockReturnValue(true);
+    const response = await POST(refreshRequest());
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ sessionExpiresAt: '2099-01-01T00:00:00.000Z', user });
+    expect(mocks.applyAuthCookies).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ browserSession: true }));
   });
 });

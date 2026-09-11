@@ -24,8 +24,10 @@ export interface LiveTutorTtsResponse {
 }
 
 /**
- * Generates speech audio for Live Tutor using Gemini TTS.
- * 
+ * Legacy helper for generating speech audio via Gemini TTS.
+ * It is not part of the active Live Tutor runtime, which now uses
+ * OpenAI Realtime for voice and Simli for avatar playback.
+ *
  * @param text - The text to convert to speech
  * @returns Promise resolving to audio bytes and metadata
  * @throws Error if text is empty or TTS generation fails

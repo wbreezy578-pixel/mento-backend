@@ -2,6 +2,8 @@ import type { NormalChatGeminiModel } from './geminiPricing';
 
 export type CanonicalPlanName = 'FREE' | 'PRO';
 
+export type AllowanceLimitScope = 'daily' | 'monthly' | 'subscription_period';
+
 export interface ProductPolicy {
   name: CanonicalPlanName;
   priceMonthlyUSD: number;
@@ -110,5 +112,27 @@ export function evaluateCompletedAllowance(input: {
     allowed,
     dailyRemaining: Math.max(input.dailyLimit - input.dailyUsed - requested, 0),
     monthlyRemaining: Math.max(input.monthlyLimit - input.monthlyUsed - requested, 0),
+  };
+}
+
+/**
+ * Select the first boundary at which an exhausted allowance may become usable
+ * again. Both boundaries are returned so clients can explain a combined
+ * daily/period limit without guessing which clock applies.
+ */
+export function resolveAllowanceReset(input: {
+  dailyExceeded: boolean;
+  periodExceeded: boolean;
+  dailyResetAt: Date;
+  periodResetAt: Date | null;
+  periodScope: 'monthly' | 'subscription_period';
+}) {
+  const candidates: Array<{ at: Date; scope: AllowanceLimitScope }> = [];
+  if (input.dailyExceeded) candidates.push({ at: input.dailyResetAt, scope: 'daily' });
+  if (input.periodExceeded && input.periodResetAt) candidates.push({ at: input.periodResetAt, scope: input.periodScope });
+  candidates.sort((left, right) => left.at.getTime() - right.at.getTime());
+  return {
+    resetAt: candidates[0]?.at ?? input.dailyResetAt,
+    scope: candidates[0]?.scope ?? null,
   };
 }

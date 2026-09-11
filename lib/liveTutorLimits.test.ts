@@ -1,11 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { clampLiveTutorExpiry, getLiveTutorMaxSessionSecondsForUser, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from './liveTutorLimits';
 
 describe('getLiveTutorMaxSessionSecondsForUser', () => {
-  it('does not allow a deployment test override to shorten paid user sessions', () => {
+  afterEach(() => {
+    delete process.env.LIVE_TUTOR_TEST_MAX_SESSION_SECONDS;
+    delete process.env.LIVE_TUTOR_TEST_USER_EMAILS;
+  });
+
+  it('applies a deployment test override only to explicitly listed users', () => {
     process.env.LIVE_TUTOR_TEST_MAX_SESSION_SECONDS = '120';
     process.env.LIVE_TUTOR_TEST_USER_EMAILS = 'tester@example.com';
-    expect(getLiveTutorMaxSessionSecondsForUser('tester@example.com')).toBe(LIVE_TUTOR_MAX_SESSION_SECONDS);
+    expect(getLiveTutorMaxSessionSecondsForUser('tester@example.com')).toBe(120);
+    expect(getLiveTutorMaxSessionSecondsForUser('other@example.com')).toBe(LIVE_TUTOR_MAX_SESSION_SECONDS);
+    expect(getLiveTutorMaxSessionSecondsForUser('TESTER@EXAMPLE.COM', 60)).toBe(60);
   });
 });
 

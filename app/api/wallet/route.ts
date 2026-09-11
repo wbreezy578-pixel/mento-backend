@@ -26,6 +26,9 @@ export async function GET(req: Request) {
       includedLiveTutorMinutes: Math.floor(snapshot.liveTutor.includedSecondsRemaining / 60),
       topUpLiveTutorMinutes: Math.floor(snapshot.liveTutor.topUpSecondsRemaining / 60),
       resetTime: snapshot.normalChat.dailyResetAt,
+      dailyResetTime: snapshot.normalChat.dailyResetAt,
+      monthlyResetTime: snapshot.normalChat.monthlyResetAt,
+      imageResetTime: snapshot.images.resetAt,
       upgradeAvailable: snapshot.plan !== 'PRO',
       features: {
         chatModel: snapshot.normalChat.modelPolicy,

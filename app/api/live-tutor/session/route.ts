@@ -1,23 +1,23 @@
 import { NextResponse } from 'next/server';
 // Match your exact original exports from simliService
-import { claimLiveTutorSession, completeSimliSessionLifecycle, constrainLiveTutorSessionDuration, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
+import { claimLiveTutorSession, completeSimliSessionLifecycle, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
 import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE } from '../../../../services/liveTutorVoiceProfiles';
 import { resolveLiveTutorVoiceProfile } from '../../../../services/liveTutorVoiceProfiles';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
   enforceAIGatewayRateLimit,
-  executeAIRequest,
   getClientIp,
   buildAIRequestId,
 } from '../../../../lib/aiSecurityGateway';
 import logger from '../../../../lib/logger';
 import { attachLiveTutorConversation, createLiveTutorConversation, getOwnedLiveTutorConversation } from '../../../../services/liveTutorConversationService';
 import type { BillingDecision } from '../../../../services/billingService';
-import { LIVE_TUTOR_INACTIVITY_TIMEOUT_MS } from '../../../../lib/liveTutorLimits';
+import { getLiveTutorMaxSessionSecondsForUser, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS } from '../../../../lib/liveTutorLimits';
 import { LIVE_TUTOR_AVATAR_TRANSPORTS, resolveLiveTutorAvatarTransport } from '../../../../services/liveTutorAvatarTransportPolicy';
-import { LIVE_TUTOR_VOICE_PROVIDER, validateLiveTutorVoiceProviderHandshake } from '../../../../services/liveTutorVoiceProvider';
+import { validateLiveTutorVoiceProviderHandshake } from '../../../../services/liveTutorVoiceProvider';
 import { getProductPolicy } from '../../../../services/productPolicy';
+import { canUseLiveTutor } from '../../../../services/liveTutorBillingService';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -39,6 +39,17 @@ export async function GET(req: Request) {
   let claimedRequestId: string | undefined;
   let claimedUserId: string | undefined;
   let cleanupStreamId: string | undefined;
+  const routePhaseStart = Date.now();
+  const phaseTimers = new Map<string, number>();
+  const markPhase = (name: string) => {
+    const now = Date.now();
+    phaseTimers.set(name, now - routePhaseStart);
+    logger.info('Live Tutor session route phase', {
+      phase: name,
+      elapsedMs: now - routePhaseStart,
+      category: 'live_tutor_session_phase',
+    });
+  };
   try {
     const user = await authenticateAIRequest(req);
     claimedUserId = user.id;
@@ -66,6 +77,10 @@ export async function GET(req: Request) {
     if (!avatarVoiceProfile) {
       return NextResponse.json({ error: 'Invalid Live Tutor avatar voice profile.' }, { status: 400 });
     }
+    const maxSessionSeconds = getLiveTutorMaxSessionSecondsForUser(
+      user.email,
+      getProductPolicy('PRO').liveTutor.maxSessionSeconds,
+    );
     let continuedConversationId: string | null = null;
     if (requestedConversationId) {
       const ownedConversation = await getOwnedLiveTutorConversation(requestedConversationId, user.id);
@@ -81,25 +96,45 @@ export async function GET(req: Request) {
       category: 'live_tutor_session_start',
     });
 
-    if (LIVE_TUTOR_VOICE_PROVIDER === 'openai') {
-      try {
-        await validateLiveTutorVoiceProviderHandshake();
-      } catch (error) {
-        logger.error('Live Tutor OpenAI provider preflight failed', {
-          userId: user.id,
-          message: error instanceof Error ? error.message : String(error),
-          category: 'live_tutor_openai_preflight',
-        });
-        return NextResponse.json({ error: 'Live Tutor voice is temporarily unavailable. Please try again shortly.' }, { status: 503 });
-      }
+    markPhase('request_received');
+
+    try {
+      const providerPreflightStartedAt = Date.now();
+      await validateLiveTutorVoiceProviderHandshake();
+      logger.info('Live Tutor provider preflight completed', {
+        durationMs: Date.now() - providerPreflightStartedAt,
+        category: 'live_tutor_voice_provider_preflight',
+      });
+      markPhase('provider_preflight');
+    } catch (error) {
+      logger.error('Live Tutor OpenAI provider preflight failed', {
+        userId: user.id,
+        message: error instanceof Error ? error.message : String(error),
+        category: 'live_tutor_openai_preflight',
+      });
+      return NextResponse.json({ error: 'Live Tutor voice is temporarily unavailable. Please try again shortly.' }, { status: 503 });
     }
 
+    const staleSessionReconcileStartedAt = Date.now();
     await reconcileStaleLiveTutorSession(user.id);
+    logger.info('Live Tutor stale session reconciliation completed', {
+      durationMs: Date.now() - staleSessionReconcileStartedAt,
+      category: 'live_tutor_stale_session_reconcile',
+    });
+    markPhase('stale_session_reconcile');
 
     const requestId = buildAIRequestId('simli-session');
     claimedRequestId = requestId;
     cleanupStreamId = `pending-${requestId}`;
-    if (!await claimLiveTutorSession(user.id, requestId, avatarVoiceProfile)) {
+    const claimStartedAt = Date.now();
+    const claimResult = await claimLiveTutorSession(user.id, requestId, avatarVoiceProfile);
+    logger.info('Live Tutor session claim completed', {
+      durationMs: Date.now() - claimStartedAt,
+      claimResult,
+      category: 'live_tutor_session_claim',
+    });
+    markPhase('session_claim');
+    if (!claimResult) {
       logger.warn('[LiveTutorLifecycle] claim_rejected_active', { userId: user.id, reason: 'another_genuinely_active_session', resultingStatus: 'active', category: 'live_tutor_session_rejected_active' });
       return NextResponse.json({ error: 'A Live Tutor session is already active on another device.' }, { status: 409 });
     }
@@ -109,37 +144,58 @@ export async function GET(req: Request) {
       category: 'live_tutor_session_creating',
     });
 
-    const result = await executeAIRequest({
-      user,
-      clientIp,
-      feature: 'live_tutor',
-      provider: 'Simli',
-      // Establish a pending reservation with one exact second. The session
-      // duration is authorized from the exact balance below, so a final
-      // partial minute remains usable.
-      amount: 1,
-      requestId,
-      metadata: { streamType: 'avatar-session' },
-      pending: true,
-      finalize: false,
-      callback: async ({ billingDecision }) => {
-        const authorizedSeconds = Math.min(
-          getProductPolicy('PRO').liveTutor.maxSessionSeconds,
-          Math.max(0, billingDecision.remainingUsage ?? 0),
-        );
-        return createSimliStreamingAvatarSession({ requestId, userId: user.id, secondsReserved: authorizedSeconds, maxSessionSeconds: authorizedSeconds, avatarVoiceProfile });
-      },
+    const billingStartedAt = Date.now();
+    const billingDecision: BillingDecision = await canUseLiveTutor(user.id, 1);
+    logger.info('Live Tutor lightweight allowance check completed', {
+      durationMs: Date.now() - billingStartedAt,
+      category: 'live_tutor_lightweight_billing_check',
     });
-    const session: SimliStreamingSession = result.result;
-    const billingDecision: BillingDecision = result.billingDecision;
+    markPhase('lightweight_billing_check');
+
+    if (!billingDecision.allowed) {
+      throw new AIRequestGatewayError(429, {
+        error: 'Your current Mento usage allowance has been reached.',
+        code: 'product_allowance_exhausted',
+        retryable: false,
+        feature: 'live_tutor',
+        upgradeAvailable: billingDecision.upgradeAvailable,
+        remainingUsage: billingDecision.remainingUsage,
+        resetTime: billingDecision.resetTime,
+        dailyResetTime: billingDecision.dailyResetTime,
+        monthlyResetTime: billingDecision.monthlyResetTime,
+        limitScope: billingDecision.limitScope,
+      });
+    }
+
+    const authorizedSeconds = Math.min(
+      maxSessionSeconds,
+      Math.max(0, billingDecision.remainingUsage ?? 0),
+    );
+    const simliCreateStartedAt = Date.now();
+    const session: SimliStreamingSession = await createSimliStreamingAvatarSession({
+      requestId,
+      userId: user.id,
+      secondsReserved: authorizedSeconds,
+      maxSessionSeconds: authorizedSeconds,
+      avatarVoiceProfile,
+    });
+    logger.info('Live Tutor Simli session creation completed', {
+      durationMs: Date.now() - simliCreateStartedAt,
+      streamId: session.streamId,
+      category: 'live_tutor_simli_session_create',
+    });
+    markPhase('simli_session_create');
+    logger.info('Live Tutor session bootstrap completed', {
+      durationMs: Date.now() - simliCreateStartedAt,
+      category: 'live_tutor_session_bootstrap',
+    });
+    markPhase('session_bootstrap');
     cleanupStreamId = session.streamId;
-    const maxSessionSeconds = getProductPolicy('PRO').liveTutor.maxSessionSeconds;
     const availableSessionSeconds = Math.min(
       maxSessionSeconds,
       Math.max(0, billingDecision.remainingUsage ?? 0),
     );
     const availableBalanceSeconds = Math.max(0, billingDecision.remainingUsage ?? 0);
-    session.expiresAt = await constrainLiveTutorSessionDuration(session.streamId, user.id, availableSessionSeconds) ?? session.expiresAt;
 
     logger.info('Live Tutor session created successfully', {
       userId: user.id,
@@ -165,29 +221,14 @@ export async function GET(req: Request) {
 
     // Fixed: Using session.token to seamlessly resolve data payload transmission parameters
     const sessionToken = requireSessionToken(session);
-    let conversationId: string | null = null;
-    try {
-      const conversation = continuedConversationId
-        ? { id: continuedConversationId }
-        : await createLiveTutorConversation(user.id);
-      conversationId = conversation.id;
-      await attachLiveTutorConversation(session.streamId, user.id, conversation.id);
-    } catch (error) {
-      logger.warn('Live Tutor conversation preparation failed; continuing voice session', {
-        userId: user.id,
-        streamId: session.streamId,
-        error: error instanceof Error ? error.message : String(error),
-        category: 'live_tutor_conversation_persistence',
-      });
-    }
-    return NextResponse.json({
+    const responsePayload = {
       sessionToken,
       streamId: session.streamId,
       sessionId: session.sessionId,
       avatarId: session.avatarId,
       expiresAt: session.expiresAt,
       avatarVoiceProfile,
-      conversationId,
+      conversationId: continuedConversationId,
       avatarTransport: avatarTransport.transport,
       billing: billingDecision,
       limits: {
@@ -196,7 +237,41 @@ export async function GET(req: Request) {
         availableBalanceSeconds,
         inactivityTimeoutSeconds: Math.floor(LIVE_TUTOR_INACTIVITY_TIMEOUT_MS / 1000),
       },
+    };
+
+    const conversationStartedAt = Date.now();
+    void (async () => {
+      let conversationId: string | null = continuedConversationId;
+      try {
+        const conversation = continuedConversationId
+          ? { id: continuedConversationId }
+          : await createLiveTutorConversation(user.id);
+        conversationId = conversation.id;
+        await attachLiveTutorConversation(session.streamId, user.id, conversation.id);
+      } catch (error) {
+        logger.warn('Live Tutor conversation preparation failed; continuing voice session', {
+          userId: user.id,
+          streamId: session.streamId,
+          error: error instanceof Error ? error.message : String(error),
+          category: 'live_tutor_conversation_persistence',
+        });
+        return;
+      }
+      logger.info('Live Tutor conversation attachment completed', {
+        durationMs: Date.now() - conversationStartedAt,
+        streamId: session.streamId,
+        conversationId,
+        category: 'live_tutor_conversation_attachment',
+      });
+      markPhase('conversation_attachment');
+    })();
+
+    logger.info('Live Tutor route completed', {
+      totalElapsedMs: Date.now() - routePhaseStart,
+      phaseBreakdown: Object.fromEntries(phaseTimers.entries()),
+      category: 'live_tutor_session_route_complete',
     });
+    return NextResponse.json(responsePayload);
   } catch (error: unknown) {
     const errorRequestId = claimedRequestId;
     if (claimedUserId && cleanupStreamId) {

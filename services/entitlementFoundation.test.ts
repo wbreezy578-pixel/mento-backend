@@ -53,7 +53,7 @@ describe('authoritative entitlement foundation', () => {
     const sessionRoute = source('app/api/live-tutor/session/route.ts');
     expect(billing).toContain('getAvailableLiveTutorSeconds(liveTutorWallet)');
     expect(billing).toContain('secondsUsed: validatedInput.secondsUsed');
-    expect(sessionRoute).toContain('amount: 1');
+    expect(sessionRoute).toContain('canUseLiveTutor(user.id, 1)');
     expect(sessionRoute).toContain("getProductPolicy('PRO').liveTutor.maxSessionSeconds");
     expect(sessionRoute).toContain('liveTutorAllowanceExhausted');
   });

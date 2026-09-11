@@ -17,9 +17,9 @@ const LEGACY_ROUTE_HEADERS = {
 };
 
 /**
- * Streaming TTS endpoint using persistent Gemini Live sessions.
- * Returns audio chunks as they arrive from Gemini Live (resampled to 16kHz).
- * Uses Server-Sent Events (SSE) for streaming chunks to client.
+ * Legacy streaming TTS endpoint retained for backward compatibility.
+ * This route is no longer part of the active Live Tutor voice path,
+ * which now uses OpenAI Realtime plus Simli playback.
  *
  * Request: POST { text: string, streamId?: string }
  * Response: Stream of events with resampled 16kHz PCM chunks

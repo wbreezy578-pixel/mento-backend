@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getUserFromRequest, getActiveSessionId } from '../../../lib/auth';
+import { getUserFromRequest, getActiveSessionId, getRefreshTokenFromBrowserCookie } from '../../../lib/auth';
 import { findSessionByToken, revokeAllUserSessions, revokeSession } from '../../../../lib/authSession';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 
@@ -15,7 +15,8 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
     const user = await getUserFromRequest(req);
     if (!user) {
-      const refreshToken = typeof body?.refreshToken === 'string' ? body.refreshToken.trim() : '';
+      const refreshToken = getRefreshTokenFromBrowserCookie(req)
+        ?? (typeof body?.refreshToken === 'string' ? body.refreshToken.trim() : '');
       const refreshSession = refreshToken ? await findSessionByToken(refreshToken) : null;
       if (!refreshSession) return NextResponse.json({ error: 'Unauthorized' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
       await revokeSession(refreshSession.id);

@@ -9,7 +9,7 @@ import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/mon
 import logger from '../lib/logger';
 import '../lib/metrics';
 import { canStartLiveTutorSession } from './liveTutorBillingPolicy';
-import { evaluateCompletedAllowance, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolvePolicyModel } from './productPolicy';
+import { evaluateCompletedAllowance, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolveAllowanceReset, resolvePolicyModel, type AllowanceLimitScope } from './productPolicy';
 import { allocateLiveTutorConsumption, getAvailableLiveTutorSeconds } from './entitlementService';
 import { calculateGeminiProviderCostUSD, GEMINI_PRICING_SOURCE, GEMINI_PRICING_VERSION, isSupportedNormalChatModel } from './geminiPricing';
 import {
@@ -30,6 +30,9 @@ export interface BillingDecision {
   reason: string;
   remainingUsage: number | null;
   resetTime: string | null;
+  dailyResetTime?: string | null;
+  monthlyResetTime?: string | null;
+  limitScope?: AllowanceLimitScope | null;
   upgradeAvailable: boolean;
   modelUsed?: string | null;
   usage: UsageSnapshot;
@@ -223,12 +226,21 @@ function buildDecision(
   userChargeUSD?: number,
   profitUSD?: number,
   modelUsed?: string | null,
+  allowanceTiming?: {
+    resetAt?: Date | null;
+    dailyResetAt?: Date | null;
+    monthlyResetAt?: Date | null;
+    limitScope?: AllowanceLimitScope | null;
+  },
 ): BillingDecision {
   return {
     allowed,
     reason: normalizeReason(reason),
     remainingUsage,
-    resetTime: usage.resetAt?.toISOString() ?? null,
+    resetTime: (allowanceTiming?.resetAt ?? usage.resetAt)?.toISOString() ?? null,
+    dailyResetTime: allowanceTiming?.dailyResetAt?.toISOString() ?? null,
+    monthlyResetTime: allowanceTiming?.monthlyResetAt?.toISOString() ?? null,
+    limitScope: allowanceTiming?.limitScope ?? null,
     upgradeAvailable: plan.name !== 'PRO',
     modelUsed: modelUsed ?? plan.chatModel,
     usage,
@@ -279,40 +291,154 @@ function getUsageWindow(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tuto
   };
 }
 
+function toPlanRecordFromWallet(plan: {
+  id: string;
+  name: string;
+  price: number;
+  messageLimit: number | null;
+  imageLimit: number | null;
+  chatModel: string;
+  fairUseEnabled: boolean;
+  imageDailyLimit: number;
+  priority: number;
+  liveTutorEnabled: boolean;
+  features: InputJsonValue | Prisma.JsonValue | null;
+}): PlanRecord {
+  return {
+    id: plan.id,
+    name: plan.name,
+    price: plan.price,
+    messageLimit: plan.messageLimit,
+    imageLimit: plan.imageLimit,
+    chatModel: plan.chatModel,
+    fairUseEnabled: plan.fairUseEnabled,
+    imageDailyLimit: plan.imageDailyLimit,
+    priority: plan.priority,
+    liveTutorEnabled: plan.liveTutorEnabled,
+    features: plan.features && typeof plan.features === 'object' && !Array.isArray(plan.features)
+      ? plan.features as Record<string, unknown>
+      : {},
+  };
+}
+
+function buildDefaultPlanRecord(name: 'FREE' | 'PRO'): PlanRecord {
+  const policy = getProductPolicy(name);
+  return {
+    id: `${name.toLowerCase()}-default-plan`,
+    name,
+    price: name === 'PRO' ? policy.priceMonthlyUSD : 0,
+    messageLimit: null,
+    imageLimit: null,
+    chatModel: policy.normalChat.model,
+    fairUseEnabled: true,
+    imageDailyLimit: policy.normalChat.imageQuestionsPerDay,
+    priority: name === 'PRO' ? 1 : 0,
+    liveTutorEnabled: name === 'PRO',
+    features: {
+      chatModel: policy.normalChat.model,
+      imageModel: policy.normalChat.model,
+      availableModels: [...policy.normalChat.allowedModels],
+      chatDailyLimit: policy.normalChat.dailyCompletedMessages,
+      chatMonthlyLimit: policy.normalChat.monthlyCompletedMessages,
+      fairUseChatLimit: policy.normalChat.dailyCompletedMessages,
+      fairUseImageLimit: policy.normalChat.imageQuestionsPerDay,
+      imageDailyLimit: policy.normalChat.imageQuestionsPerDay,
+      liveTutorEnabled: name === 'PRO',
+      includedLiveTutorSeconds: policy.liveTutor.includedSecondsPerPeriod,
+      liveTutorMaxSessionSeconds: policy.liveTutor.maxSessionSeconds,
+    },
+  };
+}
+
+async function getLiveTutorAccessPlan(userId: string): Promise<PlanRecord> {
+  const walletLookupStartedAt = Date.now();
+  const wallet = await prisma.userWallet.findUnique({
+    where: { userId },
+    select: {
+      subscriptionStatus: true,
+      subscriptionExpiresAt: true,
+      subscriptionPeriodStart: true,
+      subscriptionStartedAt: true,
+      plan: {
+        select: {
+          id: true,
+          name: true,
+          price: true,
+          messageLimit: true,
+          imageLimit: true,
+          chatModel: true,
+          fairUseEnabled: true,
+          imageDailyLimit: true,
+          priority: true,
+          liveTutorEnabled: true,
+          features: true,
+        },
+      },
+    },
+  });
+  logger.info('Live Tutor billing user-wallet lookup completed', {
+    userId,
+    durationMs: Date.now() - walletLookupStartedAt,
+    category: 'live_tutor_billing_user_wallet_lookup',
+  });
+
+  const hasActivePlan = Boolean(wallet?.plan)
+    && isSubscriptionActive(
+      wallet?.subscriptionStatus as string | null,
+      wallet?.subscriptionExpiresAt,
+      wallet?.subscriptionPeriodStart ?? wallet?.subscriptionStartedAt,
+    );
+
+  if (hasActivePlan && wallet?.plan) {
+    return toPlanRecordFromWallet(wallet.plan);
+  }
+
+  return buildDefaultPlanRecord('FREE');
+}
+
 async function getBillingDecision(input: BillingReservationInput): Promise<BillingDecision> {
   const validatedInput = validateBillingReservationInput(input);
-  const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
-  await ensureDefaultPlans();
 
   if (validatedInput.feature === 'live_tutor') {
-    const liveTutorWallet = await prisma.liveTutorWallet.findUnique({ where: { userId: validatedInput.userId } });
+    const billingLookupStartedAt = Date.now();
+    const [resolvedPlan, liveTutorWallet] = await Promise.all([
+      getLiveTutorAccessPlan(validatedInput.userId),
+      prisma.liveTutorWallet.findUnique({ where: { userId: validatedInput.userId } }),
+    ]);
+    logger.info('Live Tutor billing lookup completed', {
+      userId: validatedInput.userId,
+      durationMs: Date.now() - billingLookupStartedAt,
+      category: 'live_tutor_billing_lookup',
+    });
+
     // Authorization uses exact seconds. minutesBalance is only a rounded display value.
     const availableSeconds = getAvailableLiveTutorSeconds(liveTutorWallet);
-    
-    const allowed = canStartLiveTutorSession({ planEnabled: plan.liveTutorEnabled, availableSeconds, requestedSeconds: validatedInput.amount });
-    const reason = !plan.liveTutorEnabled
+
+    const allowed = canStartLiveTutorSession({ planEnabled: resolvedPlan.liveTutorEnabled, availableSeconds, requestedSeconds: validatedInput.amount });
+    const reason = !resolvedPlan.liveTutorEnabled
       ? 'Live Tutor requires an active Pro plan.'
       : allowed
         ? 'Live tutor seconds available.'
         : 'Live tutor balance is exhausted.';
-    
+
     const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, 0, null);
 
     return buildDecision(
       allowed,
       reason,
       usage,
-      plan,
+      resolvedPlan,
       Math.max(availableSeconds - validatedInput.amount, 0),
       null,
       false,
       0,
       0,
       0,
-      validatedInput.modelUsed ?? plan.chatModel,
+      validatedInput.modelUsed ?? resolvedPlan.chatModel,
     );
   }
 
+  const plan = validatedInput.planOverride ?? await getEffectivePlanForUser(validatedInput.userId);
   const resolvedModel = resolvePlanModel(plan, validatedInput.feature, validatedInput.modelUsed);
   const usageWindow = getUsageWindow(plan, validatedInput.feature, resolvedModel, validatedInput.scope);
   const windowStart = usageWindow.windowStart;
@@ -1002,6 +1128,27 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           : validatedInput.success === false
             ? 'Usage rollback requested.'
             : 'Plan usage limit reached.';
+      const dailyExceeded = typeof usageLimit === 'number'
+        ? used + validatedInput.amount > usageLimit
+        : false;
+      const periodExceeded = monthlyLimit !== null
+        ? monthlyUsed + validatedInput.amount > monthlyLimit
+        : false;
+      const allowanceReset = validatedInput.feature === 'chat' || validatedInput.feature === 'image'
+        ? resolveAllowanceReset({
+            dailyExceeded,
+            periodExceeded,
+            dailyResetAt: usageWindow.resetAt,
+            periodResetAt: monthlyLimit !== null ? monthlyEnd : null,
+            periodScope: effectivePlan.name === 'PRO' ? 'subscription_period' : 'monthly',
+          })
+        : { resetAt: usageWindow.resetAt, scope: null };
+      const allowanceTiming = {
+        resetAt: allowanceReset.resetAt,
+        dailyResetAt: usageWindow.resetAt,
+        monthlyResetAt: monthlyLimit !== null ? monthlyEnd : null,
+        limitScope: allowanceReset.scope,
+      };
       const usage = buildUsageSnapshot(
         validatedInput.feature,
         validatedInput.scope,
@@ -1047,6 +1194,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           0,
           0,
           resolvedModel,
+          allowanceTiming,
         );
       }
 
@@ -1107,6 +1255,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         successRecord.userChargeUSD,
         successRecord.profitUSD,
         resolvedModel,
+        allowanceTiming,
       );
     });
   } catch (error) {

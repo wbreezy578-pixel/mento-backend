@@ -198,16 +198,33 @@ async function assertTokenOwnership(userId: string, purchaseToken: string): Prom
 
 async function removeNativeSubscriptionEntitlement(userId: string): Promise<void> {
   const now = new Date();
-  const [otherActive, freePlan] = await Promise.all([
-    prisma.storePurchase.findFirst({
-      where: { userId, purchaseType: 'SUBSCRIPTION', expiresAt: { gt: now }, status: { in: ['SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD', 'SUBSCRIPTION_STATE_CANCELED', 'ACTIVE'] } },
-      select: { id: true },
-    }),
-    prisma.plan.findUnique({ where: { name: 'FREE' }, select: { id: true } }),
-  ]);
-  if (!otherActive && freePlan) {
-    await prisma.userWallet.update({ where: { userId }, data: { planId: freePlan.id, subscriptionStatus: 'inactive', subscriptionExpiresAt: null } });
-  }
+  await prisma.$transaction(async (tx) => {
+    const [otherActive, freePlan] = await Promise.all([
+      tx.storePurchase.findFirst({
+        where: { userId, purchaseType: 'SUBSCRIPTION', expiresAt: { gt: now }, status: { in: ['SUBSCRIPTION_STATE_ACTIVE', 'SUBSCRIPTION_STATE_IN_GRACE_PERIOD', 'SUBSCRIPTION_STATE_CANCELED', 'ACTIVE'] } },
+        select: { id: true },
+      }),
+      tx.plan.findUnique({ where: { name: 'FREE' }, select: { id: true } }),
+    ]);
+    if (!otherActive && freePlan) {
+      await tx.userWallet.updateMany({ where: { userId }, data: { planId: freePlan.id, subscriptionStatus: 'inactive', subscriptionExpiresAt: null } });
+      const liveWallet = await tx.liveTutorWallet.findUnique({ where: { userId } });
+      if (liveWallet) {
+        // Included minutes belong to the subscription period. Purchased
+        // top-ups remain durable, while the rounded legacy balance is kept in
+        // sync with those exact seconds for the next eligible period.
+        await tx.liveTutorWallet.update({
+          where: { userId },
+          data: {
+            includedSeconds: 0,
+            includedPeriodStart: null,
+            includedPeriodEnd: null,
+            minutesBalance: Math.floor(Math.max(0, liveWallet.topUpSeconds) / 60),
+          },
+        });
+      }
+    }
+  });
 }
 
 export async function verifyGooglePlayPurchase(input: {

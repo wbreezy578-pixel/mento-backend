@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { signToken, normalizeEmail, recordSecurityEvent, buildUserSummary, applyAuthCookies, getClientIp, getSessionClientIp } from '../../../lib/auth';
+import { signToken, normalizeEmail, recordSecurityEvent, buildUserSummary, applyAuthCookies, getClientIp, getSessionClientIp, getRefreshTokenFromBrowserCookie, isBrowserAuthRequest, buildAuthSessionResponseBody } from '../../../lib/auth';
 import { findSessionByToken, generateSecureToken, getRefreshSessionExpiry, isRefreshSessionExpired, RefreshSessionAlreadyUsedError, revokeSessionFamily, rotateRefreshSession } from '../../../../lib/authSession';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
@@ -17,7 +17,8 @@ export async function POST(req: Request) {
     const limit = await ensureSlidingWindow(`refresh:ip:${getClientIp(req)}`, 60, 15 * 60);
     if (!limit.ok) return NextResponse.json({ error: 'Too many refresh attempts. Please try again later.' }, { status: 429, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     const body = await req.json();
-    const refreshToken = typeof body?.refreshToken === 'string' ? body.refreshToken.trim() : '';
+    const refreshToken = getRefreshTokenFromBrowserCookie(req)
+      ?? (typeof body?.refreshToken === 'string' ? body.refreshToken.trim() : '');
     if (!refreshToken) {
       return NextResponse.json({ error: 'Refresh token required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
@@ -57,16 +58,19 @@ export async function POST(req: Request) {
 
     await recordSecurityEvent(user.id, 'token_refresh');
 
-    const response = NextResponse.json({
-      token: accessToken,
+    const browserSession = isBrowserAuthRequest(req);
+    const response = NextResponse.json(buildAuthSessionResponseBody({
+      browserSession,
+      accessToken,
       refreshToken: rotatedRefreshToken,
       sessionExpiresAt: newSession.expiresAt.toISOString(),
       user: buildUserSummary(user),
-    }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }), { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     applyAuthCookies(response, {
       accessToken,
       refreshToken: rotatedRefreshToken,
       isProduction: process.env.NODE_ENV === 'production',
+      browserSession,
     });
     return response;
   } catch (error) {

@@ -27,6 +27,14 @@ describe('rate-limit failure safety', () => {
 
     const primitiveLimiter = source('lib/rateLimiter.ts');
     expect(primitiveLimiter).toContain('`${type}_unavailable`');
+    expect(primitiveLimiter).toContain("category: 'rate_limiter_unavailable'");
+  });
+
+  it('documents the production trusted proxy mode in the example environment', () => {
+    const envExample = source('.env.example');
+
+    expect(envExample).toContain('TRUSTED_PROXY_PROVIDER=azure-container-apps');
+    expect(envExample).toContain('Keep this aligned with the current deployment');
   });
 
   it('reports required Redis failures as readiness degradation', () => {

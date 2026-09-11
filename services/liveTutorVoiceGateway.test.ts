@@ -37,14 +37,16 @@ describe('voice readiness ordering', () => {
     expect(events).toEqual(['provider_session_ended', 'closed', 'cleanup']);
     expect(activeRef.current).toBe(false);
   });
-  it('marks usability only after voice-provider/runtime registration and before connected', () => {
+  it('sends auth acknowledgement before provider session setup', () => {
     const source = readFileSync('services/liveTutorVoiceGateway.ts', 'utf8');
+    const authSent = source.indexOf("type: 'auth_ok'");
     const providerCreated = source.indexOf('gemini = await createLiveTutorVoiceSession');
     const runtimeRegistered = source.indexOf('voiceSessionRuntimes.set(identity.streamId', providerCreated);
     const usableMarked = source.indexOf('markLiveTutorSessionUsable(identity.streamId, identity.userId)', runtimeRegistered);
     const connectedSent = source.indexOf("socket.send(JSON.stringify({ type: 'connected', sessionId: gemini.sessionId }))", usableMarked);
 
-    expect(providerCreated).toBeGreaterThanOrEqual(0);
+    expect(authSent).toBeGreaterThanOrEqual(0);
+    expect(providerCreated).toBeGreaterThan(authSent);
     expect(runtimeRegistered).toBeGreaterThan(providerCreated);
     expect(usableMarked).toBeGreaterThan(runtimeRegistered);
     expect(connectedSent).toBeGreaterThan(usableMarked);

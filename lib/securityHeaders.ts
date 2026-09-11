@@ -12,7 +12,11 @@ const CSP_NONCE_PATTERN = /^[A-Za-z0-9+/_-]{16,128}={0,2}$/;
 
 function normalizeAllowedOrigins() {
   const configured = process.env.ALLOWED_ORIGINS?.split(',').map((entry) => entry.trim()).filter(Boolean) ?? [];
-  return configured.length > 0 ? configured : DEFAULT_ALLOWED_ORIGINS;
+  if (configured.length > 0) return configured;
+  // Development needs a practical local allowlist. Production must never
+  // silently inherit those origins: a missing deployment setting fails CORS
+  // closed until the intended browser origin is configured explicitly.
+  return process.env.NODE_ENV === 'production' ? [] : DEFAULT_ALLOWED_ORIGINS;
 }
 
 export function isAllowedOrigin(origin: string | null | undefined) {

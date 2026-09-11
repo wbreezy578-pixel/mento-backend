@@ -117,9 +117,33 @@ export async function assertRealtimeRedisReadyForProduction(): Promise<void> {
 export async function checkRealtimeRedisHealth(): Promise<'ok' | 'not_configured' | 'fail'> {
   try {
     const client = assertRedisAvailable();
-    if (!client) return 'not_configured';
-    return (await client.ping()) === 'PONG' ? 'ok' : 'fail';
-  } catch {
+    if (!client) {
+      logger.warn('[RealtimeRedis] Redis health check skipped because it is not configured', {
+        configured: false,
+        required: requireRedis || process.env.NODE_ENV === 'production',
+        category: 'realtime_redis_health',
+      });
+      return 'not_configured';
+    }
+
+    const pong = await client.ping();
+    if (pong !== 'PONG') {
+      logger.warn('[RealtimeRedis] Redis health check failed', {
+        configured: true,
+        pong,
+        required: requireRedis || process.env.NODE_ENV === 'production',
+        category: 'realtime_redis_health',
+      });
+      return 'fail';
+    }
+
+    return 'ok';
+  } catch (error) {
+    logger.warn('[RealtimeRedis] Redis health check failed', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+      required: requireRedis || process.env.NODE_ENV === 'production',
+      category: 'realtime_redis_health',
+    });
     return 'fail';
   }
 }

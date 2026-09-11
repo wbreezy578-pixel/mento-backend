@@ -3,7 +3,7 @@ import { connection } from 'next/server';
 import type { ReactNode } from 'react';
 
 export const metadata: Metadata = {
-  metadataBase: new URL(process.env.AUTH_WEB_BASE_URL || 'https://app.mento.ai'),
+  metadataBase: new URL(process.env.AUTH_WEB_BASE_URL || 'https://auth.trymentoapp.com'),
   title: 'Mento',
   description: 'Mento is an AI learning companion for focused chat, image understanding, and optional Live Tutor conversations.',
   openGraph: {

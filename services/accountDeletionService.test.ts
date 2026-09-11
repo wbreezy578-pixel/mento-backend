@@ -19,19 +19,15 @@ const mocks = vi.hoisted(() => {
   };
   return {
     prisma,
-    cancelPaddleSubscriptionForAccountDeletion: vi.fn(),
-    cancelGooglePlaySubscriptionsForAccountDeletion: vi.fn(),
     deleteSupabaseAuthUser: vi.fn(),
   };
 });
 
 vi.mock('../lib/prisma', () => ({ prisma: mocks.prisma }));
-vi.mock('./paddleService', () => ({ cancelPaddleSubscriptionForAccountDeletion: mocks.cancelPaddleSubscriptionForAccountDeletion }));
-vi.mock('./nativeStoreService', () => ({ cancelGooglePlaySubscriptionsForAccountDeletion: mocks.cancelGooglePlaySubscriptionsForAccountDeletion }));
 vi.mock('./supabaseAdminService', () => ({ deleteSupabaseAuthUser: mocks.deleteSupabaseAuthUser }));
 vi.mock('../lib/logger', () => ({ default: { warn: vi.fn(), error: vi.fn(), info: vi.fn() } }));
 
-import { AccountDeletionPendingError, processAccountDeletionJob } from './accountDeletionService';
+import { processAccountDeletionJob } from './accountDeletionService';
 
 const job = {
   id: 'deletion-job-a',
@@ -61,23 +57,11 @@ describe('durable account deletion retries', () => {
     mocks.prisma.paymentReceipt.updateMany.mockResolvedValue({ count: 0 });
     mocks.prisma.paymentLedgerEntry.updateMany.mockResolvedValue({ count: 0 });
     mocks.prisma.storePurchase.updateMany.mockResolvedValue({ count: 0 });
-    mocks.cancelGooglePlaySubscriptionsForAccountDeletion.mockResolvedValue(0);
     mocks.deleteSupabaseAuthUser.mockResolvedValue(undefined);
   });
 
-  it('marks a transient provider failure pending and completes on a later retry', async () => {
-    mocks.cancelGooglePlaySubscriptionsForAccountDeletion
-      .mockRejectedValueOnce(new Error('temporary Google Play outage'))
-      .mockResolvedValueOnce(0);
-
-    await expect(processAccountDeletionJob('deletion-job-a')).rejects.toBeInstanceOf(AccountDeletionPendingError);
-    expect(mocks.prisma.accountDeletionJob.update).toHaveBeenCalledWith({
-      where: { id: 'deletion-job-a' },
-      data: { status: 'PENDING', lastError: 'google_play_cancel_failed' },
-    });
-
+  it('deletes Mento data without cancelling the separate Google Play subscription', async () => {
     await expect(processAccountDeletionJob('deletion-job-a')).resolves.toEqual(job);
-    expect(mocks.cancelGooglePlaySubscriptionsForAccountDeletion).toHaveBeenCalledTimes(2);
     expect(mocks.deleteSupabaseAuthUser).toHaveBeenCalledWith('supabase-a');
     expect(mocks.prisma.user.delete).toHaveBeenCalledWith({ where: { id: 'user-a' } });
   });

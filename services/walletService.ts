@@ -1,6 +1,8 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { getEffectivePlanForUser, getPlanById, getPlanByName } from './planService';
+import { getPlanById, getPlanByName } from './planService';
+import { getEntitlementSnapshot } from './entitlementService';
+import { getProductPolicy } from './productPolicy';
 
 export interface WalletSummary {
   userId: string;
@@ -306,20 +308,21 @@ export async function downgradePlan(userId: string, planName: string): Promise<U
 }
 
 export async function getWalletSummary(userId: string): Promise<WalletSummary> {
-  const wallet = await getWallet(userId);
-  const liveTutorWallet = await getLiveTutorWallet(userId);
-  const plan = await getEffectivePlanForUser(userId);
+  // Compatibility API: counters come from the canonical entitlement snapshot.
+  // Keep this shape for older callers while preventing a second source of truth.
+  const snapshot = await getEntitlementSnapshot(userId);
+  const policy = getProductPolicy(snapshot.plan);
 
   return {
     userId,
-    planName: plan.name,
-    subscriptionStatus: plan.name !== 'FREE' ? 'active' : 'inactive',
-    liveTutorMinutesBalance: liveTutorWallet?.minutesBalance ?? 0,
-    imageLimit: plan.imageLimit ?? plan.imageDailyLimit ?? null,
-    messageLimit: plan.messageLimit ?? null,
-    fairUseEnabled: plan.fairUseEnabled ?? false,
-    liveTutorEnabled: plan.liveTutorEnabled,
-    priority: plan.priority ?? 0,
+    planName: snapshot.plan,
+    subscriptionStatus: snapshot.status,
+    liveTutorMinutesBalance: Math.floor(snapshot.liveTutor.availableSeconds / 60),
+    imageLimit: policy.normalChat.imageQuestionsPerDay,
+    messageLimit: policy.normalChat.dailyCompletedMessages,
+    fairUseEnabled: true,
+    liveTutorEnabled: snapshot.liveTutor.allowed,
+    priority: snapshot.plan === 'PRO' ? 1 : 0,
   };
 }
 

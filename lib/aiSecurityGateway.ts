@@ -500,6 +500,9 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
       upgradeAvailable: billingDecision.upgradeAvailable,
       remainingUsage: billingDecision.remainingUsage,
       resetTime: billingDecision.resetTime,
+      dailyResetTime: billingDecision.dailyResetTime,
+      monthlyResetTime: billingDecision.monthlyResetTime,
+      limitScope: billingDecision.limitScope,
     });
   }
 

@@ -14,6 +14,32 @@ const OPENAI_REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL ?? 'gpt-realtime
 const OPENAI_REALTIME_URL = process.env.OPENAI_REALTIME_URL ?? 'wss://api.openai.com/v1/realtime';
 const OPENAI_INPUT_RATE = 24_000;
 const OPENAI_OUTPUT_RATE = 24_000;
+const OPENAI_REALTIME_HANDSHAKE_CACHE_MS = Number(process.env.OPENAI_REALTIME_HANDSHAKE_CACHE_MS ?? '300000');
+
+const OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS = Number.isFinite(OPENAI_REALTIME_HANDSHAKE_CACHE_MS) && OPENAI_REALTIME_HANDSHAKE_CACHE_MS > 0
+  ? OPENAI_REALTIME_HANDSHAKE_CACHE_MS
+  : 0;
+
+function getHandshakeCacheState(): { validatedAt: number; expiresAt: number } | undefined {
+  const globalState = globalThis as typeof globalThis & {
+    __mentoOpenAIRealtimeHandshakeCache?: { validatedAt: number; expiresAt: number };
+  };
+  const cache = globalState.__mentoOpenAIRealtimeHandshakeCache;
+  if (!cache) return undefined;
+  const now = Date.now();
+  if (cache.expiresAt <= now) {
+    delete globalState.__mentoOpenAIRealtimeHandshakeCache;
+    return undefined;
+  }
+  return cache;
+}
+
+function setHandshakeCacheState(validatedAt: number, expiresAt: number): void {
+  const globalState = globalThis as typeof globalThis & {
+    __mentoOpenAIRealtimeHandshakeCache?: { validatedAt: number; expiresAt: number };
+  };
+  globalState.__mentoOpenAIRealtimeHandshakeCache = { validatedAt, expiresAt };
+}
 
 type OpenAIEvent = { type?: string; [key: string]: unknown };
 
@@ -291,10 +317,32 @@ export async function createOpenAIRealtimeSession(options: {
  * session configuration are accepted before an avatar session is allocated.
  */
 export async function validateOpenAIRealtimeHandshake(): Promise<void> {
+  const cached = getHandshakeCacheState();
+  if (cached && OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS > 0) {
+    logger.info('live_tutor_openai_handshake_cached', {
+      cacheAgeMs: Date.now() - cached.validatedAt,
+      cacheTtlMs: OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS,
+      category: 'live_tutor_voice_provider_preflight',
+    });
+    return;
+  }
+
+  const validationStartedAt = Date.now();
   const session = await createOpenAIRealtimeSession();
   session.isClosingGracefully = true;
   session.status = 'closed';
   socketFor(session)?.close();
+
+  if (OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS > 0) {
+    const validatedAt = Date.now();
+    setHandshakeCacheState(validatedAt, validatedAt + OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS);
+  }
+
+  logger.info('live_tutor_openai_handshake_validated', {
+    durationMs: Date.now() - validationStartedAt,
+    cacheTtlMs: OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS,
+    category: 'live_tutor_voice_provider_preflight',
+  });
 }
 
 function socketFor(session: GeminiLiveSession): WebSocket | undefined {

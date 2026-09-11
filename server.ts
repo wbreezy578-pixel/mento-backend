@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import next from 'next';
 import { registerShutdownTask } from './lib/crashRecovery';
+import { loadAndValidateEnvironment } from './lib/env';
 import { attachLiveTutorVoiceGateway } from './services/liveTutorVoiceGateway';
 import { assertRealtimeRedisReadyForProduction, shutdownRealtimeRedis } from './lib/realtimeRedis';
 
@@ -25,6 +26,7 @@ async function startBackgroundLifecycleTasks(): Promise<void> {
 }
 
 app.prepare().then(async () => {
+  loadAndValidateEnvironment();
   await assertRealtimeRedisReadyForProduction();
   const server = createServer((request, response) => handle(request, response));
   const shutdownVoiceGateway = attachLiveTutorVoiceGateway(server);

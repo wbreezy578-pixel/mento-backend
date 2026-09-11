@@ -1,14 +1,4 @@
-import {
-  buildLiveTutorSystemInstruction,
-  closeGeminiLiveSession,
-  createGeminiLiveSession,
-  endRealtimePcmAudio,
-  getGeminiLiveSession,
-  interruptGeminiLiveSession,
-  sendRealtimePcmAudio,
-  updateLiveTutorLanguage,
-  type GeminiLiveSession,
-} from './liveTutorGeminiLiveService';
+import type { GeminiLiveSession } from './liveTutorGeminiLiveService';
 import {
   closeOpenAIRealtimeSession,
   createOpenAIRealtimeSession,
@@ -21,23 +11,22 @@ import {
 } from './liveTutorOpenAIRealtimeService';
 
 export type { GeminiLiveSession } from './liveTutorGeminiLiveService';
-export { buildLiveTutorSystemInstruction };
+export { buildLiveTutorSystemInstruction } from './liveTutorGeminiLiveService';
 
-export const LIVE_TUTOR_VOICE_PROVIDER = process.env.LIVE_TUTOR_VOICE_PROVIDER === 'openai' ? 'openai' : 'gemini';
+export const LIVE_TUTOR_VOICE_PROVIDER = 'openai';
 
-export const createLiveTutorVoiceSession = async (options: Parameters<typeof createGeminiLiveSession>[0] = {}): Promise<GeminiLiveSession> => {
-  if (LIVE_TUTOR_VOICE_PROVIDER === 'openai') {
-    const session = await createOpenAIRealtimeSession(options);
-    registerOpenAIRealtimeSession(session);
-    return session;
-  }
-  return createGeminiLiveSession(options);
+export const createLiveTutorVoiceSession = async (options: Parameters<typeof createOpenAIRealtimeSession>[0] = {}): Promise<GeminiLiveSession> => {
+  const session = await createOpenAIRealtimeSession(options);
+  registerOpenAIRealtimeSession(session);
+  return session;
 };
 
-export const getLiveTutorVoiceSession = (sessionId: string): GeminiLiveSession | undefined => LIVE_TUTOR_VOICE_PROVIDER === 'openai' ? getOpenAIRealtimeSession(sessionId) : getGeminiLiveSession(sessionId);
-export const closeLiveTutorVoiceSession = (sessionId: string, reason?: string): Promise<void> => LIVE_TUTOR_VOICE_PROVIDER === 'openai' ? closeOpenAIRealtimeSession(sessionId) : closeGeminiLiveSession(sessionId, reason);
-export const interruptLiveTutorVoiceSession = (sessionId: string): number => LIVE_TUTOR_VOICE_PROVIDER === 'openai' ? interruptOpenAIRealtimeSession(sessionId) : interruptGeminiLiveSession(sessionId);
-export const sendLiveTutorPcmAudio = (sessionId: string, pcm: Uint8Array, mimeType?: string): void => LIVE_TUTOR_VOICE_PROVIDER === 'openai' ? sendOpenAIRealtimePcmAudio(sessionId, pcm) : sendRealtimePcmAudio(sessionId, pcm, mimeType);
-export const endLiveTutorPcmAudio = (sessionId: string): void => LIVE_TUTOR_VOICE_PROVIDER === 'openai' ? endOpenAIRealtimePcmAudio(sessionId) : endRealtimePcmAudio(sessionId);
-export const updateLiveTutorVoiceLanguage = (sessionId: string, language: Parameters<typeof updateLiveTutorLanguage>[1]): void => { if (LIVE_TUTOR_VOICE_PROVIDER === 'gemini') updateLiveTutorLanguage(sessionId, language); };
-export const validateLiveTutorVoiceProviderHandshake = (): Promise<void> => LIVE_TUTOR_VOICE_PROVIDER === 'openai' ? validateOpenAIRealtimeHandshake() : Promise.resolve();
+export const getLiveTutorVoiceSession = (sessionId: string): GeminiLiveSession | undefined => getOpenAIRealtimeSession(sessionId);
+export const closeLiveTutorVoiceSession = (sessionId: string, _reason?: string): Promise<void> => closeOpenAIRealtimeSession(sessionId);
+export const interruptLiveTutorVoiceSession = (sessionId: string): number => interruptOpenAIRealtimeSession(sessionId);
+export const sendLiveTutorPcmAudio = (sessionId: string, pcm: Uint8Array, _mimeType?: string): void => sendOpenAIRealtimePcmAudio(sessionId, pcm);
+export const endLiveTutorPcmAudio = (sessionId: string): void => endOpenAIRealtimePcmAudio(sessionId);
+export const updateLiveTutorVoiceLanguage = (_sessionId: string, _language?: unknown): void => {
+  // No-op: Live Tutor is now OpenAI-only and does not use Gemini Live session language updates.
+};
+export const validateLiveTutorVoiceProviderHandshake = (): Promise<void> => validateOpenAIRealtimeHandshake();

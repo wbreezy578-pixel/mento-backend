@@ -19,6 +19,7 @@ const OPENAI_REALTIME_HANDSHAKE_CACHE_MS = Number(process.env.OPENAI_REALTIME_HA
 const OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS = Number.isFinite(OPENAI_REALTIME_HANDSHAKE_CACHE_MS) && OPENAI_REALTIME_HANDSHAKE_CACHE_MS > 0
   ? OPENAI_REALTIME_HANDSHAKE_CACHE_MS
   : 0;
+let handshakeInFlight: Promise<void> | null = null;
 
 function getHandshakeCacheState(): { validatedAt: number; expiresAt: number } | undefined {
   const globalState = globalThis as typeof globalThis & {
@@ -327,22 +328,33 @@ export async function validateOpenAIRealtimeHandshake(): Promise<void> {
     return;
   }
 
-  const validationStartedAt = Date.now();
-  const session = await createOpenAIRealtimeSession();
-  session.isClosingGracefully = true;
-  session.status = 'closed';
-  socketFor(session)?.close();
-
-  if (OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS > 0) {
-    const validatedAt = Date.now();
-    setHandshakeCacheState(validatedAt, validatedAt + OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS);
+  if (handshakeInFlight) {
+    await handshakeInFlight;
+    return;
   }
 
-  logger.info('live_tutor_openai_handshake_validated', {
-    durationMs: Date.now() - validationStartedAt,
-    cacheTtlMs: OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS,
-    category: 'live_tutor_voice_provider_preflight',
+  handshakeInFlight = (async () => {
+    const validationStartedAt = Date.now();
+    const session = await createOpenAIRealtimeSession();
+    session.isClosingGracefully = true;
+    session.status = 'closed';
+    socketFor(session)?.close();
+
+    if (OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS > 0) {
+      const validatedAt = Date.now();
+      setHandshakeCacheState(validatedAt, validatedAt + OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS);
+    }
+
+    logger.info('live_tutor_openai_handshake_validated', {
+      durationMs: Date.now() - validationStartedAt,
+      cacheTtlMs: OPENAI_REALTIME_HANDSHAKE_CACHE_TTL_MS,
+      category: 'live_tutor_voice_provider_preflight',
+    });
+  })().finally(() => {
+    handshakeInFlight = null;
   });
+
+  await handshakeInFlight;
 }
 
 function socketFor(session: GeminiLiveSession): WebSocket | undefined {

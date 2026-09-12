@@ -1,14 +1,5 @@
-import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
-import type { Room } from '@livekit/rtc-node';
 import { createLiveTutorSimliLiveKitAvatarSession } from './liveTutorSimliLiveKitAvatarSession';
-
-class FakeRoom extends EventEmitter {
-  remoteParticipants = new Map();
-  isConnected = false;
-  connect = vi.fn(async () => { this.isConnected = true; });
-  disconnect = vi.fn(async () => { this.isConnected = false; });
-}
 
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -31,34 +22,21 @@ const config = {
 };
 
 describe('Live Tutor Simli LiveKit avatar session', () => {
-  it('attaches Simli with an on-behalf token and targets its private audio stream', async () => {
-    const room = new FakeRoom();
-    room.remoteParticipants.set('simli-avatar-agent', { identity: 'simli-avatar-agent' });
+  it('attaches Simli with an on-behalf token and returns the session payload', async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const request = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       requests.push({ url: String(url), init });
       return requests.length === 1 ? response({ session_token: 'simli-session-token' }) : response({ ok: true });
     }) as unknown as typeof fetch;
-    const output = {
-      captureFrame: vi.fn(async () => undefined),
-      clearBuffer: vi.fn(),
-      flush: vi.fn(),
-      waitForPlayout: vi.fn(async () => ({ playbackPosition: 0, interrupted: false })),
-    };
-    const createAudioOutput = vi.fn(() => output);
-
     const session = await createLiveTutorSimliLiveKitAvatarSession(config, undefined, {
       fetch: request,
-      createRoom: () => room as unknown as Room,
-      createAudioOutput,
     });
 
-    expect(room.connect).toHaveBeenCalledOnce();
     expect(requests.map(({ url }) => url)).toEqual([
       'https://api.simli.ai/compose/token',
       'https://api.simli.ai/integrations/livekit/agents',
     ]);
-    expect(JSON.parse(String(requests[0].init?.body))).toMatchObject({ faceId: 'face-123', handleSilence: true });
+    expect(JSON.parse(String(requests[0].init?.body))).toMatchObject({ faceId: 'face-123', handleSilence: true, maxSessionLength: 600 });
     const attachment = JSON.parse(String(requests[1].init?.body)) as Record<string, string>;
     expect(attachment.session_token).toBe('simli-session-token');
     expect(attachment.livekit_url).toBe(config.liveKitUrl);
@@ -67,30 +45,24 @@ describe('Live Tutor Simli LiveKit avatar session', () => {
       kind: 'agent',
       attributes: { 'lk.publish_on_behalf': 'mento-gemini-agent' },
     });
-    expect(createAudioOutput).toHaveBeenCalledWith(room, 'simli-avatar-agent');
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    expect((jwtPayload(attachment.livekit_token).exp as number) - nowSeconds).toBeGreaterThanOrEqual(659);
+    expect((jwtPayload(attachment.livekit_token).exp as number) - nowSeconds).toBeLessThanOrEqual(661);
     expect(session.avatarIdentity).toBe('simli-avatar-agent');
     expect(jwtPayload(session.subscriberToken)).toMatchObject({ sub: 'android-test-client' });
+    expect((jwtPayload(session.subscriberToken).exp as number) - nowSeconds).toBeGreaterThanOrEqual(659);
+    expect((jwtPayload(session.subscriberToken).exp as number) - nowSeconds).toBeLessThanOrEqual(661);
 
     await session.close();
-    expect(output.clearBuffer).toHaveBeenCalledOnce();
-    expect(output.flush).toHaveBeenCalledOnce();
-    expect(room.disconnect).toHaveBeenCalledOnce();
   });
 
-  it('disconnects the room and does not create audio output when Simli attachment fails', async () => {
-    const room = new FakeRoom();
+  it('throws when Simli attachment fails', async () => {
     const request = vi.fn()
       .mockResolvedValueOnce(response({ session_token: 'simli-session-token' }))
       .mockResolvedValueOnce(response({ message: 'unavailable' }, 503)) as unknown as typeof fetch;
-    const createAudioOutput = vi.fn();
 
     await expect(createLiveTutorSimliLiveKitAvatarSession(config, undefined, {
       fetch: request,
-      createRoom: () => room as unknown as Room,
-      createAudioOutput,
     })).rejects.toThrow('Simli LiveKit attachment failed with status 503.');
-
-    expect(createAudioOutput).not.toHaveBeenCalled();
-    expect(room.disconnect).toHaveBeenCalledOnce();
   });
 });

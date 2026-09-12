@@ -23,11 +23,11 @@ export interface SimliStreamingSession {
 
 interface SessionRecord extends SimliStreamingSession {
   createdAt: string;
-  lastHeartbeatAt?: string;
+  secondsReserved: number;
   lastActivityAt?: string;
+  lastHeartbeatAt?: string;
   billingRequestId?: string;
   userId?: string;
-  secondsReserved?: number;
   maxSessionSeconds?: number;
   secondsConsumed?: number;
   billingFinalized?: boolean;
@@ -73,6 +73,7 @@ export function classifyLiveTutorFinalizationTiming(reason: string | undefined):
     || normalized === 'session time elapsed'
     || normalized === 'session_expired'
     || normalized === 'server shutdown'
+    || normalized.startsWith('live tutor connection timed out after ')
   ) return 'active_end';
   throw new Error(`Unknown Live Tutor finalization reason: ${reason}`);
 }
@@ -320,10 +321,13 @@ export async function reconcileStaleLiveTutorSession(userId: string): Promise<bo
 export async function createSimliStreamingAvatarSession(options: {
   requestId?: string;
   userId?: string;
-  secondsReserved?: number;
+  secondsReserved: number;
   maxSessionSeconds?: number;
   avatarVoiceProfile?: LiveTutorVoiceProfile;
-} = {}): Promise<SimliStreamingSession> {
+}): Promise<SimliStreamingSession> {
+  if (!Number.isSafeInteger(options.secondsReserved) || options.secondsReserved <= 0) {
+    throw new Error('Live Tutor session requires a positive secondsReserved value.');
+  }
   const existing = findSessionByUser(options.userId);
   if (existing && existing.billingRequestId === options.requestId) {
     saveSession({
@@ -414,7 +418,7 @@ export async function createSimliStreamingAvatarSession(options: {
       ...sessionInfo,
       billingRequestId: options.requestId,
       userId: options.userId,
-      secondsReserved: options.secondsReserved ?? 60,
+      secondsReserved: options.secondsReserved,
       secondsConsumed: 0,
       billingFinalized: false,
       avatarVoiceProfile: options.avatarVoiceProfile ?? DEFAULT_LIVE_TUTOR_VOICE_PROFILE,
@@ -422,7 +426,7 @@ export async function createSimliStreamingAvatarSession(options: {
     });
     await prisma.liveTutorSession.update({
       where: { userId: options.userId },
-      data: { streamId: sessionInfo.streamId, avatarVoiceProfile: options.avatarVoiceProfile ?? DEFAULT_LIVE_TUTOR_VOICE_PROFILE, status: 'active', ownerProcessId: LIVE_TUTOR_PROCESS_ID, finalizationStartedAt: null, lastActivityAt: new Date(now), expiresAt: new Date(sessionInfo.expiresAt) },
+      data: { streamId: sessionInfo.streamId, avatarVoiceProfile: options.avatarVoiceProfile ?? DEFAULT_LIVE_TUTOR_VOICE_PROFILE, status: 'active', ownerProcessId: LIVE_TUTOR_PROCESS_ID, finalizationStartedAt: null, lastActivityAt: new Date(now), expiresAt: new Date(sessionInfo.expiresAt), secondsReserved: options.secondsReserved },
     });
     logStatusTransition({ streamId: sessionInfo.streamId, userId: options.userId ?? 'unknown', previousStatus: 'creating', resultingStatus: 'active', reason: 'simli_session_created' });
     simliBreaker.recordSuccess();
@@ -470,7 +474,11 @@ export async function markSimliSessionConnected(streamId: string): Promise<void>
 export async function markLiveTutorSessionUsable(streamId: string, userId: string): Promise<{ usableAt: Date; expiresAt: Date } | null> {
   const now = new Date();
   const durable = await prisma.liveTutorSession.findUnique({ where: { streamId }, select: { secondsReserved: true } });
-  const expiresAt = new Date(now.getTime() + (durable?.secondsReserved ?? 60) * 1000);
+  if (!durable || !Number.isSafeInteger(durable.secondsReserved) || durable.secondsReserved <= 0) {
+    logger.error('[LiveTutorLifecycle] session_missing_reserved_duration', { streamId, userId, category: 'live_tutor_duration_invariant' });
+    return null;
+  }
+  const expiresAt = new Date(now.getTime() + durable.secondsReserved * 1000);
   const result = await prisma.liveTutorSession.updateMany({
     where: {
       streamId,
@@ -519,7 +527,7 @@ export async function reconnectSimliSession(streamId: string): Promise<SimliStre
   const replacement = await createSimliStreamingAvatarSession({
     requestId: previousSession?.billingRequestId,
     userId: previousSession?.userId,
-    secondsReserved: previousSession?.secondsReserved ?? 60,
+    secondsReserved: previousSession?.secondsReserved ?? 0,
   });
   if (previousSession?.streamId) {
     removeSession(previousSession.streamId);
@@ -676,7 +684,7 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
     ? Math.max(0, Math.floor(options.secondsUsed ?? 0))
     : 0;
   const authoritativeSeconds = Math.max(durable.secondsConsumed, elapsedSeconds, clientReportedSeconds);
-  const secondsUsed = Math.min(durable.secondsReserved || 60, authoritativeSeconds);
+  const secondsUsed = Math.min(durable.secondsReserved, authoritativeSeconds);
   const billableSeconds = Math.max(1, secondsUsed);
   const usable = durable.usableAt !== null;
   

@@ -21,6 +21,7 @@ import { LIVE_TUTOR_AVATAR_TRANSPORTS, resolveLiveTutorAvatarTransport } from '.
 import { validateLiveTutorVoiceProviderHandshake } from '../../../../services/liveTutorVoiceProvider';
 import { getProductPolicy } from '../../../../services/productPolicy';
 import { canUseLiveTutor } from '../../../../services/liveTutorBillingService';
+import { resolveLiveTutorAgentNameForUser } from '../../../../lib/liveTutorAgentRouting';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -213,15 +214,16 @@ export async function GET(req: Request) {
         apiKey: liveKitConfig.liveKitApiKey,
         secret: liveKitConfig.liveKitApiSecret,
       });
+      const agentName = resolveLiveTutorAgentNameForUser(user.email);
       const dispatch = await liveKitApi.agentDispatch.createDispatch(
         liveKitSession.roomName,
-        'mento-live-tutor-staging',
+        agentName,
         { metadata: JSON.stringify({ requestId, userId: user.id, conversationId: liveTutorConversation.id, mobileParticipantIdentity: liveKitConfig.subscriberIdentity, sessionExpiresAt: serverSessionExpiresAt.toISOString() }) },
       );
       logger.info('Live Tutor LiveKit agent dispatched', {
         roomName: liveKitSession.roomName,
         dispatchId: dispatch.id,
-        agentName: 'mento-live-tutor-staging',
+        agentName,
         category: 'live_tutor_livekit_agent_dispatch',
       });
       await prisma.liveTutorSession.updateMany({

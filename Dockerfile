@@ -21,6 +21,7 @@ RUN DATABASE_URL=postgresql://build:build@localhost:5432/build \
 	PAYMENT_WEBHOOK_AUTH_SECRET=build-only-placeholder \
 	SIMLI_API_KEY=build-only-placeholder \
 	SIMLI_AVATAR_ID=build-only-placeholder \
+	REDIS_URL=redis://build-only-placeholder:6379 \
 	AUTH_WEB_BASE_URL=https://auth.trymentoapp.com \
 	npm run build
 

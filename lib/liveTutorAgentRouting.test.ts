@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { DEFAULT_LIVE_TUTOR_AGENT_NAME, resolveLiveTutorAgentNameForUser } from './liveTutorAgentRouting';
+import { DEFAULT_LIVE_TUTOR_AGENT_NAME, isLiveTutorCloudCanaryUser, resolveLiveTutorAgentNameForUser } from './liveTutorAgentRouting';
 
 describe('Live Tutor Cloud agent canary routing', () => {
   afterEach(() => {
@@ -19,5 +19,7 @@ describe('Live Tutor Cloud agent canary routing', () => {
     expect(resolveLiveTutorAgentNameForUser('MENTOTEST99@gmail.com')).toBe('mento-live-tutor-production');
     expect(resolveLiveTutorAgentNameForUser('other@example.com')).toBe(DEFAULT_LIVE_TUTOR_AGENT_NAME);
     expect(resolveLiveTutorAgentNameForUser()).toBe(DEFAULT_LIVE_TUTOR_AGENT_NAME);
+    expect(isLiveTutorCloudCanaryUser('mentotest99@gmail.com')).toBe(true);
+    expect(isLiveTutorCloudCanaryUser('other@example.com')).toBe(false);
   });
 });

@@ -15,13 +15,15 @@ function configuredEmails(): Set<string> {
  */
 export function resolveLiveTutorAgentNameForUser(email?: string | null): string {
   const productionAgentName = process.env.LIVE_TUTOR_CLOUD_AGENT_NAME?.trim();
-  const normalizedEmail = email?.trim().toLowerCase();
 
-  if (productionAgentName && normalizedEmail && configuredEmails().has(normalizedEmail)) {
-    return productionAgentName;
-  }
+  if (productionAgentName && isLiveTutorCloudCanaryUser(email)) return productionAgentName;
 
   return DEFAULT_LIVE_TUTOR_AGENT_NAME;
+}
+
+export function isLiveTutorCloudCanaryUser(email?: string | null): boolean {
+  const normalizedEmail = email?.trim().toLowerCase();
+  return Boolean(process.env.LIVE_TUTOR_CLOUD_AGENT_NAME?.trim() && normalizedEmail && configuredEmails().has(normalizedEmail));
 }
 
 export { DEFAULT_LIVE_TUTOR_AGENT_NAME };

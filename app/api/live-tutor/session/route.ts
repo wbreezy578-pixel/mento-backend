@@ -21,7 +21,7 @@ import { LIVE_TUTOR_AVATAR_TRANSPORTS, resolveLiveTutorAvatarTransport } from '.
 import { validateLiveTutorVoiceProviderHandshake } from '../../../../services/liveTutorVoiceProvider';
 import { getProductPolicy } from '../../../../services/productPolicy';
 import { canUseLiveTutor } from '../../../../services/liveTutorBillingService';
-import { resolveLiveTutorAgentNameForUser } from '../../../../lib/liveTutorAgentRouting';
+import { isLiveTutorCloudCanaryUser, resolveLiveTutorAgentNameForUser } from '../../../../lib/liveTutorAgentRouting';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -60,7 +60,10 @@ export async function GET(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
     const requestUrl = new URL(req.url);
-    const avatarTransport = resolveLiveTutorAvatarTransport(requestUrl.searchParams.get('avatarTransport'));
+    const avatarTransport = resolveLiveTutorAvatarTransport(
+      requestUrl.searchParams.get('avatarTransport'),
+      process.env.LIVE_TUTOR_LIVEKIT_POC_ENABLED === 'true' || isLiveTutorCloudCanaryUser(user.email),
+    );
     if (!avatarTransport.ok) {
       return NextResponse.json(
         { error: avatarTransport.reason === 'invalid_transport' ? 'Invalid Live Tutor avatar transport.' : 'Live Tutor experiment unavailable.' },

@@ -7,7 +7,7 @@ export const metadata = {
 };
 
 export default function TermsPage() {
-  return <LegalPage title="Terms of Service" updated="September 10, 2026">
+  return <LegalPage title="Terms of Service" updated="September 14, 2026">
     <p>These Terms of Service and End User Licence Agreement are between you and VALD MWAGHALI MALUSHA, the operator of Mento in Kenya. By creating an account or using Mento, you agree to them.</p>
     <h2>The service</h2>
     <p>Mento provides AI-assisted learning, chat, image analysis, an optional Live Tutor avatar, and advertising on eligible free accounts. AI output may be incomplete or incorrect and must not be treated as professional medical, legal, financial, or emergency advice.</p>

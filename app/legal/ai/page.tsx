@@ -7,7 +7,7 @@ export const metadata = {
 };
 
 export default function AiInformationPage() {
-  return <LegalPage title="AI and Provider Information" updated="September 10, 2026">
+  return <LegalPage title="AI and Provider Information" updated="September 14, 2026">
     <p>Mento is an AI tutor, not a human. It can misunderstand requests, produce incomplete or incorrect answers, and generate inappropriate output despite safety controls. Check important information independently.</p>
     <h2>How features work</h2>
     <ul>

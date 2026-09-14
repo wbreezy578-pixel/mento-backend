@@ -7,7 +7,7 @@ export const metadata = {
 };
 
 export default function PrivacyPolicyPage() {
-  return <LegalPage title="Privacy Policy" updated="September 10, 2026">
+  return <LegalPage title="Privacy Policy" updated="September 14, 2026">
     <p>Mento is an AI learning application operated in Kenya by VALD MWAGHALI MALUSHA. This policy explains what information Mento processes, why it is used, and the choices available to you.</p>
     <h2>Information we process</h2>
     <ul>
@@ -16,17 +16,17 @@ export default function PrivacyPolicyPage() {
       <li>Live Tutor voice while a session is active, related transcript/conversation content, and technical session identifiers needed to deliver audio and avatar video.</li>
       <li>Purchase identifiers, subscription state, receipts, and an accounting ledger. Mento does not receive or store your full card number.</li>
       <li>Operational information such as request identifiers, error events, feature usage, device/app version, and abuse-prevention signals.</li>
-      <li>For free accounts, advertising information processed by Google Mobile Ads/AdMob, which may include device, app, network, advertising identifier, and ad-interaction information under Google&apos;s policies and your consent choices.</li>
+      <li>Information processed by Google Mobile Ads/AdMob to support advertising, which may include your device IP address (and an estimate of general location from it), app interactions, diagnostic information, and device or account identifiers, under Google&apos;s policies and your consent choices.</li>
     </ul>
     <h2>Camera and microphone</h2>
     <p>Camera or photo access is used only when you choose an image for tutoring. Microphone access is used only for Live Tutor voice conversations. Mento does not activate either permission in the background.</p>
     <h2>Advertising</h2>
-    <p>Free accounts may display clearly labelled banner advertising supplied through Google Mobile Ads (AdMob). Google may process advertising and device information to serve, measure, limit, and protect advertising, subject to its own terms, privacy policy, and any consent choices presented in the app. Where required, Mento uses Google&apos;s consent flow before requesting ads. Paid features are not a request for advertising consent.</p>
+    <p>Free accounts may display clearly labelled banner advertising supplied through Google Mobile Ads (AdMob). To support this feature, the Android app may initialize Google&apos;s advertising tools and request applicable consent. Google may process IP-derived approximate location, app interactions, diagnostics, and device or account identifiers to serve, measure, limit, and protect advertising, subject to its own terms, privacy policy, and any consent choices presented in the app. Paid features are not a request for advertising consent.</p>
     <h2>Service providers</h2>
     <p>Mento uses Google Gemini to analyze Normal Chat prompts and images; OpenAI Realtime to process Live Tutor voice and generate realtime tutoring audio; and Simli and its realtime media infrastructure to render and stream the Live Tutor avatar. Mento also uses Supabase for sign-in; PostgreSQL for account and learning data; Redis for short-lived coordination; Microsoft Azure for backend hosting; Google Mobile Ads/AdMob for advertising; and Google Play for Android purchases. These providers may process information in countries outside Kenya under their own privacy and security commitments.</p>
     <p>Live Tutor voice is transmitted while the session is active to provide the feature. Mento does not intentionally retain raw microphone recordings after transient delivery, but conversation/transcript content and provider processing may be retained or handled as described in this policy and the relevant provider&apos;s terms. Do not submit passwords, financial account details, government identifiers, health records, or other highly sensitive personal information in chat, images, or Live Tutor.</p>
     <h2>Retention and deletion</h2>
-    <p>Conversations and their messages are automatically deleted after one year without an update. You may delete individual conversations sooner. Account data remains while your account is active. You can delete your account in Mento under Settings → Delete Account. Deletion removes account content and credentials; limited payment, security, fraud-prevention, and legally required records may be retained. Google Play controls store subscription records, and Google/other providers may retain data under their own policies.</p>
+    <p>Conversations and their messages are automatically deleted after one year without an update. You may delete individual conversations sooner. Account data remains while your account is active. You can delete your account in Mento under Settings → Delete Account. We process deletion requests promptly; if an identity or service provider is temporarily unavailable, the request is kept securely for retry. Deletion removes account content and credentials; limited payment, security, fraud-prevention, and legally required records may be retained. Google Play controls store subscription records, and Google or other providers may retain data under their own policies.</p>
     <h2>Your choices</h2>
     <p>You may access or update account details in the app, delete conversations, revoke camera or microphone permissions in device settings, restore purchases through Google Play, and request account deletion. For access, correction, deletion, objection, or another privacy request, email <a href="mailto:mentosupport@gmail.com">mentosupport@gmail.com</a>.</p>
     <h2>Children</h2>

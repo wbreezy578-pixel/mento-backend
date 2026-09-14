@@ -53,6 +53,7 @@ COPY --from=build /workspace/mento/prisma ./prisma
 COPY --from=build /workspace/mento/app ./app
 COPY --from=build /workspace/mento/lib ./lib
 COPY --from=build /workspace/mento/services ./services
+COPY --from=build /workspace/mento/scripts ./scripts
 COPY --from=build /workspace/mento/server.ts ./server.ts
 COPY --from=build /workspace/mento/instrumentation.ts ./instrumentation.ts
 COPY --from=build /workspace/mento/instrumentation.node.ts ./instrumentation.node.ts

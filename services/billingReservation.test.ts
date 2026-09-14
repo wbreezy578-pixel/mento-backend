@@ -26,10 +26,31 @@ describe('Normal Chat billing reservation path', () => {
     const body = reserveUsageBody();
     const walletRead = body.indexOf('resolveWalletAndPlanInTransaction(');
     const helperStart = billingSource.indexOf('async function resolveWalletAndPlanInTransaction(');
-    const lockedWalletQuery = billingSource.indexOf('FOR UPDATE', helperStart);
+    const lockedWalletQuery = billingSource.indexOf('await lockWalletRow(tx, userId);', helperStart);
 
     expect(lockedWalletQuery).toBeGreaterThan(walletRead);
     expect(body).toContain('const { wallet, plan: effectivePlan } = await resolveWalletAndPlanInTransaction');
+  });
+
+  it('uses Prisma transaction reads for wallet and allowance counts', () => {
+    const helperStart = billingSource.indexOf('async function resolveWalletAndPlanInTransaction(');
+    const helperEnd = billingSource.indexOf('\nasync function createOrFindUserWallet', helperStart);
+    const helper = billingSource.slice(helperStart, helperEnd);
+    const body = reserveUsageBody();
+
+    expect(helper).toContain('tx.userWallet.findUnique({');
+    expect(helper).not.toContain('INNER JOIN "Plan"');
+    expect(body).toContain('const usageWhere = {');
+    expect(body).toContain('await tx.usageLog.count({');
+  });
+
+  it('keeps a safe diagnostic stage if an unclassified Gemini reservation error occurs', () => {
+    const body = reserveUsageBody();
+
+    expect(body).toContain("let reservationStage = 'transaction_start';");
+    expect(body).toContain('stage: reservationStage');
+    expect(body).toContain("reservationStage = 'ledger_write';");
+    expect(body).toContain('throw new GeminiDailyBudgetUnavailableError();');
   });
 
   it('uses the authoritative in-transaction plan for idempotency, limits, and model binding', () => {

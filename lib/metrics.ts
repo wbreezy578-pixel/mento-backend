@@ -19,6 +19,7 @@ type MetricsState = {
   providerSuccesses: client.Counter<'provider'>;
   monitoringLatency: client.Histogram<'metric' | 'provider' | 'route' | 'operation' | 'feature'>;
   monitoringFailures: client.Counter<'metric' | 'provider' | 'route' | 'operation' | 'feature' | 'status' | 'source' | 'reason'>;
+  liveTutorVoiceLatency: client.Histogram<'stage'>;
 };
 
 declare global {
@@ -138,6 +139,14 @@ function initializeMetrics(): MetricsState {
     registers: [register],
   }));
 
+  const liveTutorVoiceLatency = createMetric(register, 'live_tutor_voice_latency_ms', () => new client.Histogram({
+    name: 'live_tutor_voice_latency_ms',
+    help: 'Live Tutor latency by privacy-safe voice pipeline stage in milliseconds',
+    labelNames: ['stage'] as const,
+    buckets: [25, 50, 100, 200, 350, 500, 750, 1000, 1500, 2500, 4000, 7000, 10000],
+    registers: [register],
+  }));
+
   const state: MetricsState = {
     register,
     rateLimitHits,
@@ -152,6 +161,7 @@ function initializeMetrics(): MetricsState {
     providerSuccesses,
     monitoringLatency,
     monitoringFailures,
+    liveTutorVoiceLatency,
   };
 
   (globalThis as typeof globalThis & { __mentoPromClientMetrics__?: MetricsState })[GLOBAL_METRIC_STATE] = state;
@@ -198,6 +208,12 @@ export const providerFailures = metrics.providerFailures;
 export const providerSuccesses = metrics.providerSuccesses;
 export const monitoringLatency = metrics.monitoringLatency;
 export const monitoringFailures = metrics.monitoringFailures;
+export const liveTutorVoiceLatency = metrics.liveTutorVoiceLatency;
+
+export function observeLiveTutorVoiceLatency(stage: string, durationMs: number): void {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  metrics.liveTutorVoiceLatency.labels(stage).observe(durationMs);
+}
 
 export function observeRequestLatency(route: string, durationMs: number) {
   metrics.requestLatency.labels(route).observe(durationMs);

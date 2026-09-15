@@ -1,11 +1,16 @@
 import { NextResponse } from 'next/server';
 import { getUserFromRequest, buildUserSummary } from '../../lib/auth';
 
+const authJson = (body: unknown, init: ResponseInit = {}) => NextResponse.json(body, {
+  ...init,
+  headers: { 'Cache-Control': 'no-store', ...(init.headers ?? {}) },
+});
+
 export async function GET(req: Request) {
   const user = await getUserFromRequest(req);
   if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    return authJson({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  return NextResponse.json({ user: buildUserSummary(user) });
+  return authJson({ user: buildUserSummary(user) });
 }

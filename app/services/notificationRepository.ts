@@ -112,7 +112,12 @@ export async function upsertNotification(userId: string, data: CreateNotificatio
 
   if (normalizedData.externalId) {
     return prisma.notification.upsert({
-      where: { externalId: normalizedData.externalId },
+      where: {
+        userId_externalId: {
+          userId,
+          externalId: normalizedData.externalId,
+        },
+      },
       update: {
         title: normalizedData.title,
         body: normalizedData.body,

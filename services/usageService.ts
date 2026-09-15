@@ -1,7 +1,8 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { getEffectiveLimit, getPlanForUser } from './planService';
+import { getEffectiveLimit, getEffectivePlanForUser } from './planService';
 import { reserveUsage } from './billingService';
+import { getFreeMonthlyWindow, getUtcDayWindow } from './productPolicy';
 
 export interface BillingDecision {
   allowed: boolean;
@@ -46,27 +47,27 @@ function normalizeReason(value: string | null | undefined): string {
 function getResetTime(scope: UsageScope): Date {
   const now = new Date();
   if (scope === 'month') {
-    return new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    return getFreeMonthlyWindow(now).end;
   }
 
   if (scope === 'rolling') {
     return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
   }
 
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  return getUtcDayWindow(now).end;
 }
 
 function getWindowStart(scope: UsageScope): Date {
   const now = new Date();
   if (scope === 'month') {
-    return new Date(now.getFullYear(), now.getMonth(), 1);
+    return getFreeMonthlyWindow(now).start;
   }
 
   if (scope === 'rolling') {
     return new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
   }
 
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return getUtcDayWindow(now).start;
 }
 
 function toUsageFeature(feature: UsageFeature): string {
@@ -79,19 +80,22 @@ function getDefaultProvider(feature: UsageFeature): string {
   return 'Gemini';
 }
 
+/** @deprecated Use getEntitlementSnapshot or reserveUsage. Kept for old integrations. */
 async function getUsageCount(userId: string, feature: UsageFeature, scope: UsageScope, windowStart?: Date): Promise<number> {
   const start = windowStart ?? getWindowStart(scope);
   return prisma.usageLog.count({
     where: {
       userId,
       feature: toUsageFeature(feature),
+      success: true,
       createdAt: { gte: start },
     },
   });
 }
 
+/** @deprecated Use getEntitlementSnapshot for display and reserveUsage for enforcement. */
 export async function getUsage(userId: string, feature: UsageFeature, scope: UsageScope = 'day'): Promise<UsageSnapshot> {
-  const plan = await getPlanForUser(userId);
+  const plan = await getEffectivePlanForUser(userId);
   const windowStart = getWindowStart(scope);
   const resetAt = getResetTime(scope);
   const used = await getUsageCount(userId, feature, scope, windowStart);
@@ -134,7 +138,7 @@ export async function isLimitReached(userId: string, feature: UsageFeature, amou
 }
 
 export async function checkUsage(userId: string, feature: UsageFeature, amount = 1, scope: UsageScope = 'day'): Promise<UsageCheckResult> {
-  const plan = await getPlanForUser(userId);
+  const plan = await getEffectivePlanForUser(userId);
   const usage = await getUsage(userId, feature, scope);
   const remaining = typeof usage.limit === 'number' ? Math.max(usage.limit - usage.used - amount, 0) : null;
 

@@ -1,8 +1,9 @@
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { getEffectiveLimit, getPlan } from './planService';
+import { getPlan } from './planService';
+import { getProductPolicy } from './productPolicy';
 
-export type BillingPlan = 'FREE' | 'PRO' | 'PREMIUM';
+export type BillingPlan = 'FREE' | 'PRO';
 export type UsageFeature = 'chat' | 'live_tutor' | 'speech' | 'image' | string;
 export type UsageProvider = 'Gemini' | 'Simli' | 'OpenAI' | 'Azure' | 'ImageGen' | string;
 
@@ -138,6 +139,7 @@ async function getPricingConfig(): Promise<Record<string, number>> {
   return initializePricingConfig();
 }
 
+/** @deprecated Billing limits are defined by productPolicy and enforced by billingService. */
 export async function getPlanLimits(plan: BillingPlan | string | null | undefined): Promise<PlanLimits> {
   const normalizedPlan = typeof plan === 'string' ? plan.toUpperCase() : 'FREE';
   const planRecord = await getPlan(normalizedPlan);
@@ -149,27 +151,30 @@ export async function getPlanLimits(plan: BillingPlan | string | null | undefine
     };
   }
 
-  const dailyChatLimit = getEffectiveLimit(planRecord, 'chat') ?? 0;
+  const policy = getProductPolicy(normalizedPlan);
+  const dailyChatLimit = policy.normalChat.dailyCompletedMessages;
   return {
     dailyChatLimit,
-    monthlyChatLimit: dailyChatLimit,
+    monthlyChatLimit: policy.normalChat.monthlyCompletedMessages,
   };
 }
 
 export async function countDailyChatUsage(userId: string): Promise<number> {
   const startOfDay = new Date();
-  startOfDay.setHours(0, 0, 0, 0);
+  startOfDay.setUTCHours(0, 0, 0, 0);
 
   return await prisma.usageLog.count({
     where: {
       userId,
       feature: 'chat',
       provider: 'Gemini',
+      success: true,
       createdAt: { gte: startOfDay },
     },
   });
 }
 
+/** @deprecated Use reserveUsage/executeAIRequest so daily and period limits are atomic. */
 export async function canUseAIChat(userId: string, amount = 1) {
   const wallet = await ensureWallet(userId);
   const planLimits = await getPlanLimits(wallet.plan);
@@ -179,7 +184,7 @@ export async function canUseAIChat(userId: string, amount = 1) {
   if (used + amount > planLimits.dailyChatLimit) {
     return {
       ok: false,
-      message: `Daily AI request limit reached for the ${wallet.plan} plan. Upgrade to Pro or Premium for more usage.`,
+      message: `Daily AI request limit reached for the ${wallet.plan} plan. Upgrade to Pro for more usage.`,
       status: 402,
       limit: planLimits.dailyChatLimit,
       used,
@@ -285,10 +290,11 @@ export async function ensureUserBillingSetup(userId: string): Promise<WalletSumm
 
   await prisma.userWallet.upsert({
     where: { userId },
-    update: {
-      plan: { connect: { id: freePlan.id } },
-      subscriptionStatus: 'active',
-    },
+    // This function only ensures that the billing records exist.  Existing
+    // entitlement state is authoritative and must be changed exclusively by
+    // the verified entitlement boundary.  In particular, a Live Tutor
+    // top-up must never downgrade an active Pro wallet to Free.
+    update: {},
     create: {
       user: {
         connect: { id: userId },
@@ -318,6 +324,7 @@ export async function ensureWallet(userId: string): Promise<WalletSummary> {
   return ensureUserBillingSetup(userId);
 }
 
+/** @deprecated Use reserveUsage; this helper cannot account for provider completion safely. */
 export async function deductCredits(userId: string, options: { feature: UsageFeature; amount?: number }): Promise<boolean> {
   await ensureUserBillingSetup(userId);
   const amount = options.amount ?? 1;

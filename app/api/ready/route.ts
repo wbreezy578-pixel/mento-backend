@@ -2,13 +2,13 @@ import { NextResponse } from 'next/server';
 import fs from 'fs';
 import os from 'os';
 import { prisma } from '../../../lib/prisma';
-import { runGeminiStartupHealthCheck } from '../../../services/geminiService';
-import { getActiveSimliSession } from '../../../services/simliService';
+import { getActiveSimliSessionCount } from '../../../services/simliService';
 import { getCircuitBreaker } from '../../../lib/resilience';
+import { isReadinessHealthy } from './healthStatus';
+import { checkRealtimeRedisHealth } from '../../../lib/realtimeRedis';
 
 const geminiBreaker = getCircuitBreaker('gemini', 5, 30000);
 const simliBreaker = getCircuitBreaker('simli', 3, 30000);
-const stripeBreaker = getCircuitBreaker('payment:stripe', 3, 60000);
 const mpesaBreaker = getCircuitBreaker('payment:mpesa', 3, 60000);
 
 function getDiskHealth() {
@@ -40,7 +40,7 @@ function getMemoryHealth() {
   };
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   const startedAt = Date.now();
   const checks: Record<string, unknown> = {};
 
@@ -51,39 +51,36 @@ export async function GET() {
     checks.database = { status: 'fail' };
   }
 
-  try {
-    const geminiHealth = await runGeminiStartupHealthCheck();
-    checks.gemini = geminiHealth;
-  } catch {
-    checks.gemini = { status: 'fail', success: false };
-  }
-
-  checks.simli = {
-    status: simliBreaker.isOpen() ? 'fail' : 'ok',
-    circuitState: simliBreaker.getState(),
-    activeSessions: getActiveSimliSession('') ? 1 : 0,
+  checks.gemini = {
+    status: geminiBreaker.isOpen() ? 'circuit_open' : 'not_probed',
+    circuitState: geminiBreaker.getState(),
   };
 
-  checks.redis = { status: 'not_configured' };
+  checks.simli = {
+    status: simliBreaker.isOpen() ? 'circuit_open' : 'not_probed',
+    circuitState: simliBreaker.getState(),
+    activeSessions: getActiveSimliSessionCount(),
+  };
+
+  checks.redis = { status: await checkRealtimeRedisHealth() };
   checks.paymentProviders = {
-    stripe: { status: stripeBreaker.isOpen() ? 'fail' : 'ok', circuitState: stripeBreaker.getState() },
-    mpesa: { status: mpesaBreaker.isOpen() ? 'fail' : 'ok', circuitState: mpesaBreaker.getState() },
+    mpesa: { status: mpesaBreaker.isOpen() ? 'circuit_open' : 'not_probed', circuitState: mpesaBreaker.getState() },
   };
   checks.disk = getDiskHealth();
   checks.memory = getMemoryHealth();
 
-  const allHealthy = [checks.database, checks.gemini, checks.simli, checks.paymentProviders].every((value) => {
-    if (!value || typeof value !== 'object') return false;
-    if (Array.isArray(value)) return false;
-    const record = value as Record<string, unknown>;
-    const status = typeof record.status === 'string' ? record.status : undefined;
-    return status === 'ok' || status === 'not_configured';
-  });
+  const allHealthy = isReadinessHealthy(checks as Record<string, unknown>);
 
-  return NextResponse.json({
+  const configuredToken = process.env.METRICS_AUTH_TOKEN?.trim();
+  const isOperator = process.env.NODE_ENV !== 'production'
+    ? true
+    : Boolean(configuredToken && req.headers.get('authorization') === `Bearer ${configuredToken}`);
+  const response: Record<string, unknown> = {
     status: allHealthy ? 'ready' : 'degraded',
     timestamp: new Date().toISOString(),
     latencyMs: Date.now() - startedAt,
-    checks,
-  }, { status: allHealthy ? 200 : 503 });
+  };
+  if (isOperator) response.checks = checks;
+
+  return NextResponse.json(response, { status: allHealthy ? 200 : 503 });
 }

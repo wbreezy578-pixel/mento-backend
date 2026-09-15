@@ -3,7 +3,7 @@
 // =======================================
 
 export const AI_CONFIG = {
-  CHAT_MODEL: "gemini-3.5-flash",
+  CHAT_MODEL: "gemini-3.5-flash-lite",
   IMAGE_MODEL: "gemini-3.5-flash",
   LIVE_TUTOR_MODEL: "gemini-3.5-flash",
   TITLE_MODEL: "gemini-3.5-flash",
@@ -18,7 +18,7 @@ export const AI_CONFIG = {
 
   MAX_OUTPUT_TOKENS: 1024,
   CHAT_MAX_OUTPUT_TOKENS: 1024,
-  LIVE_TUTOR_MAX_OUTPUT_TOKENS: 2048,
+  LIVE_TUTOR_MAX_OUTPUT_TOKENS: 512,
   IMAGE_MAX_OUTPUT_TOKENS: 4096,
 
   // Retry

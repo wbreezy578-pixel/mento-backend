@@ -10,7 +10,7 @@ export async function PATCH(req: Request, context: { params: { id: string } }) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    const notificationId = context.params.id;
+    const notificationId = context.params?.id;
     if (!notificationId) {
       return NextResponse.json({ error: 'Notification id is required' }, { status: 400 });
     }

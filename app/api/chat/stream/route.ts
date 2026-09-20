@@ -336,10 +336,17 @@ export async function POST(req: Request) {
                 }
                 if (!firstTokenObserved) {
                   firstTokenObserved = true;
+                  const firstTokenAt = Date.now();
                   observeMonitoringLatency('gemini', Date.now() - geminiStartedAt, {
                     provider: 'Gemini',
                     operation: 'first-token',
                     status: 'success',
+                  });
+                  logger.info('Chat stream first Gemini token', {
+                    requestId,
+                    conversationId,
+                    endToEndElapsedMs: firstTokenAt - requestStartedAt,
+                    geminiElapsedMs: firstTokenAt - geminiStartedAt,
                   });
                 }
                 assistantText += token;

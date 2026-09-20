@@ -27,6 +27,7 @@ describe('Live Tutor Redis leases', () => {
     expire.mockReset();
     ping.mockReset();
     vi.stubEnv('NODE_ENV', 'test');
+    vi.stubEnv('REDIS_STARTUP_RETRY_DELAY_MS', '0');
   });
 
   it('places owner and session keys in the same Redis Cluster hash slot', async () => {
@@ -45,12 +46,29 @@ describe('Live Tutor Redis leases', () => {
     );
   });
 
-  it('fails closed when production realtime Redis is unavailable', async () => {
+  it('releases an owner-safe lease when session metadata cannot be persisted', async () => {
+    evalCommand.mockResolvedValueOnce(1).mockResolvedValueOnce(1);
+    hset.mockRejectedValueOnce(new Error('Redis metadata unavailable'));
+    const { acquireVoiceLease } = await import('./realtimeRedis');
+
+    await expect(acquireVoiceLease('stream-456', 'owner-2', { status: 'active' }))
+      .rejects.toThrow('Redis metadata unavailable');
+
+    expect(evalCommand).toHaveBeenLastCalledWith(
+      expect.any(String),
+      2,
+      'voice:{stream-456}:owner',
+      'voice:{stream-456}:session',
+      'owner-2',
+    );
+  });
+
+  it('keeps the HTTP server available when production realtime Redis is unavailable', async () => {
     vi.stubEnv('NODE_ENV', 'production');
     ping.mockRejectedValue(new Error('Redis unavailable'));
     const { assertRealtimeRedisReadyForProduction } = await import('./realtimeRedis');
 
-    await expect(assertRealtimeRedisReadyForProduction()).rejects.toThrow('refusing to start');
+    await expect(assertRealtimeRedisReadyForProduction()).resolves.toBeUndefined();
   });
 
   it('allows production startup when realtime Redis is healthy', async () => {

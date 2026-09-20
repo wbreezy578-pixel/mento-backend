@@ -25,6 +25,16 @@ class FakeWebSocket extends EventEmitter {
 }
 
 vi.mock('ws', () => ({ WebSocket: FakeWebSocket }));
+vi.mock('../lib/env', () => ({
+  getGeminiApiKey: () => 'test-gemini-key',
+  loadAndValidateEnvironment: () => undefined,
+}));
+// The adapter imports the shared tutor-language helpers through the legacy
+// Gemini types. Keep this unit test independent of Prisma and DATABASE_URL.
+vi.mock('../lib/userSettings', () => ({
+  isTutorLanguage: (value: unknown) => ['en', 'sw', 'es', 'fr', 'ar'].includes(String(value)),
+  buildTutorLanguageInstruction: (language: string) => `Respond in ${language}.`,
+}));
 
 describe('OpenAI Realtime Live Tutor adapter', () => {
   beforeEach(() => {

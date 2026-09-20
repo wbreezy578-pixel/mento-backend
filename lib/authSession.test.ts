@@ -13,10 +13,15 @@ const emailActionToken = {
   findFirst: vi.fn(),
   updateMany: vi.fn(),
 };
+const loginChallenge = {
+  findFirst: vi.fn(),
+  update: vi.fn(),
+  updateMany: vi.fn(),
+};
 
 vi.mock('./prisma', () => ({
   prisma: {
-    $transaction: vi.fn(async (operation: (transaction: { session: typeof session; passwordResetToken: typeof passwordResetToken; emailActionToken: typeof emailActionToken }) => unknown) => operation({ session, passwordResetToken, emailActionToken })),
+    $transaction: vi.fn(async (operation: (transaction: { session: typeof session; passwordResetToken: typeof passwordResetToken; emailActionToken: typeof emailActionToken; loginChallenge: typeof loginChallenge }) => unknown) => operation({ session, passwordResetToken, emailActionToken, loginChallenge })),
   },
 }));
 
@@ -24,7 +29,38 @@ vi.mock('./logger', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { consumeEmailActionToken, consumePasswordResetToken, getRefreshSessionExpiry, isRefreshSessionExpired, REFRESH_SESSION_IDLE_TTL_MS, RefreshSessionAlreadyUsedError, rotateRefreshSession } from './authSession';
+import { consumeEmailActionToken, consumeLoginMfaChallenge, consumePasswordResetToken, detectRefreshContextChange, getRefreshSessionExpiry, hashClientDeviceId, hashToken, hasSessionDeviceMismatch, isRefreshSessionExpired, LoginMfaChallengeContextMismatchError, REFRESH_SESSION_IDLE_TTL_MS, RefreshSessionAlreadyUsedError, rotateRefreshSession } from './authSession';
+
+describe('refresh context signals', () => {
+  it('hashes a valid opaque installation identifier and rejects malformed values', () => {
+    expect(hashClientDeviceId('f47ac10b-58cc-4372-a567-0e02b2c3d479')).toBe(hashToken('f47ac10b-58cc-4372-a567-0e02b2c3d479'));
+    expect(hashClientDeviceId('short')).toBeNull();
+  });
+
+  it('uses a device mismatch as a hard boundary while allowing legacy sessions to migrate', () => {
+    expect(hasSessionDeviceMismatch(hashToken('device-a-device-a'), hashToken('device-a-device-a'))).toBe(false);
+    expect(hasSessionDeviceMismatch(hashToken('device-a-device-a'), hashToken('device-b-device-b'))).toBe(true);
+    expect(hasSessionDeviceMismatch(null, hashToken('device-a-device-a'))).toBe(false);
+  });
+
+  it('detects network and client changes without treating them as authentication failures', () => {
+    expect(detectRefreshContextChange({
+      previousIpAddress: '198.51.100.10',
+      currentIpAddress: '203.0.113.25',
+      previousUserAgent: 'okhttp/4.12.0',
+      currentUserAgent: 'okhttp/4.13.0',
+    })).toEqual({ changed: true, ipChanged: true, userAgentChanged: true });
+  });
+
+  it('does not flag a missing context value as a mobile session change', () => {
+    expect(detectRefreshContextChange({
+      previousIpAddress: '198.51.100.10',
+      currentIpAddress: null,
+      previousUserAgent: 'okhttp/4.12.0',
+      currentUserAgent: 'okhttp/4.12.0',
+    })).toEqual({ changed: false, ipChanged: false, userAgentChanged: false });
+  });
+});
 
 describe('refresh session lifetime', () => {
   it('enforces the rolling idle deadline without exceeding the absolute deadline', () => {
@@ -124,5 +160,52 @@ describe('one-time authentication token consumption', () => {
 
     expect(results.filter(Boolean)).toHaveLength(1);
     expect(emailActionToken.updateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects expired or already-used MFA challenges', async () => {
+    loginChallenge.findFirst.mockResolvedValue(null);
+
+    await expect(consumeLoginMfaChallenge('challenge-token', '123456')).resolves.toBeNull();
+
+    expect(loginChallenge.update).not.toHaveBeenCalled();
+    expect(loginChallenge.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('allows only one successful MFA challenge consumption under replay', async () => {
+    let claimed = false;
+    loginChallenge.findFirst.mockResolvedValue({
+      id: 'challenge-1',
+      codeHash: hashToken('123456'),
+      attempts: 0,
+      user: { id: 'user-1', accountStatus: 'ACTIVE', emailVerified: true },
+    });
+    loginChallenge.updateMany.mockImplementation(async () => {
+      if (claimed) return { count: 0 };
+      claimed = true;
+      return { count: 1 };
+    });
+
+    const results = await Promise.all([
+      consumeLoginMfaChallenge('challenge-token', '123456'),
+      consumeLoginMfaChallenge('challenge-token', '123456'),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(loginChallenge.updateMany).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects an MFA code presented from a different bound device', async () => {
+    loginChallenge.findFirst.mockResolvedValue({
+      id: 'challenge-2',
+      userId: 'user-1',
+      codeHash: hashToken('123456'),
+      deviceIdHash: hashToken('device-a-device-a'),
+      attempts: 0,
+      user: { id: 'user-1', accountStatus: 'ACTIVE', emailVerified: true },
+    });
+
+    await expect(consumeLoginMfaChallenge('challenge-token', '123456', hashToken('device-b-device-b')))
+      .rejects.toBeInstanceOf(LoginMfaChallengeContextMismatchError);
+    expect(loginChallenge.updateMany).not.toHaveBeenCalled();
   });
 });

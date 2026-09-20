@@ -4,6 +4,9 @@ import { createHash } from 'node:crypto';
 
 export const REFRESH_SESSION_IDLE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const REFRESH_SESSION_ABSOLUTE_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+export const LOGIN_MFA_TTL_MS = 10 * 60 * 1000;
+export const LOGIN_MFA_MAX_ATTEMPTS = 5;
+const DEVICE_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
 
 export function getRefreshSessionExpiry(absoluteExpiresAt: Date, now = new Date()): Date {
   return new Date(Math.min(now.getTime() + REFRESH_SESSION_IDLE_TTL_MS, absoluteExpiresAt.getTime()));
@@ -20,11 +23,52 @@ export function hashToken(token: string) {
   return createHash('sha256').update(token).digest('hex');
 }
 
+/**
+ * Native clients send an opaque, per-installation identifier in a header. We
+ * only persist its hash, so it cannot be used to identify a device outside
+ * Mento. Browser sessions intentionally remain cookie-bound instead.
+ */
+export function hashClientDeviceId(value: string | null | undefined): string | null {
+  const normalized = value?.trim() ?? '';
+  return DEVICE_ID_PATTERN.test(normalized) ? hashToken(normalized) : null;
+}
+
+export function hasSessionDeviceMismatch(previousDeviceIdHash: string | null | undefined, currentDeviceIdHash: string | null | undefined): boolean {
+  // Old sessions predate device binding. Let their next successful refresh
+  // adopt the device identifier rather than suddenly signing out users.
+  if (!previousDeviceIdHash) return false;
+  return previousDeviceIdHash !== (currentDeviceIdHash ?? null);
+}
+
+export function detectRefreshContextChange(input: {
+  previousIpAddress?: string | null;
+  currentIpAddress?: string | null;
+  previousUserAgent?: string | null;
+  currentUserAgent?: string | null;
+}) {
+  const previousIpAddress = input.previousIpAddress?.trim() ?? '';
+  const currentIpAddress = input.currentIpAddress?.trim() ?? '';
+  const previousUserAgent = input.previousUserAgent?.trim() ?? '';
+  const currentUserAgent = input.currentUserAgent?.trim() ?? '';
+
+  // These values are deliberately risk signals, not authentication factors.
+  // Mobile clients can legitimately change networks and User-Agent versions.
+  const ipChanged = Boolean(previousIpAddress && currentIpAddress && previousIpAddress !== currentIpAddress);
+  const userAgentChanged = Boolean(previousUserAgent && currentUserAgent && previousUserAgent !== currentUserAgent);
+
+  return {
+    changed: ipChanged || userAgentChanged,
+    ipChanged,
+    userAgentChanged,
+  };
+}
+
 export async function createSessionRecord(input: {
   userId: string;
   token: string;
   userAgent?: string | null;
   ipAddress?: string | null;
+  deviceIdHash?: string | null;
   expiresAt: Date;
   familyId?: string;
   parentSessionId?: string | null;
@@ -38,6 +82,7 @@ export async function createSessionRecord(input: {
       tokenHash: hashToken(input.token),
       userAgent: input.userAgent ?? null,
       ipAddress: input.ipAddress ?? null,
+      deviceIdHash: input.deviceIdHash ?? null,
       expiresAt: input.expiresAt,
       familyId,
       parentSessionId: input.parentSessionId ?? null,
@@ -156,6 +201,7 @@ export async function rotateRefreshSession(input: {
   expiresAt: Date;
   userAgent?: string | null;
   ipAddress?: string | null;
+  deviceIdHash?: string | null;
   familyId: string;
   absoluteExpiresAt: Date;
 }) {
@@ -186,6 +232,7 @@ export async function rotateRefreshSession(input: {
         expiresAt: input.expiresAt,
         userAgent: input.userAgent ?? null,
         ipAddress: input.ipAddress ?? null,
+        deviceIdHash: input.deviceIdHash ?? null,
         familyId: input.familyId,
         parentSessionId: input.sessionId,
         absoluteExpiresAt: input.absoluteExpiresAt,
@@ -221,4 +268,63 @@ export async function revokeAllUserSessions(userId: string) {
 
 export function generateSecureToken(bytes = 32) {
   return crypto.randomBytes(bytes).toString('hex');
+}
+
+export async function createLoginMfaChallenge(userId: string, input?: { deviceIdHash?: string | null }) {
+  const challengeToken = generateSecureToken(32);
+  const code = crypto.randomInt(100000, 1000000).toString();
+  const now = new Date();
+  await prisma.$transaction([
+    prisma.loginChallenge.updateMany({
+      where: { userId, usedAt: null, expiresAt: { gt: now } },
+      data: { usedAt: now },
+    }),
+    prisma.loginChallenge.create({
+      data: {
+        userId,
+        challengeHash: hashToken(challengeToken),
+        codeHash: hashToken(code),
+        deviceIdHash: input?.deviceIdHash ?? null,
+        expiresAt: new Date(now.getTime() + LOGIN_MFA_TTL_MS),
+      },
+    }),
+  ]);
+  return { challengeToken, code };
+}
+
+export class LoginMfaChallengeContextMismatchError extends Error {
+  constructor(public readonly userId: string) {
+    super('Login MFA challenge was presented from a different device.');
+    this.name = 'LoginMfaChallengeContextMismatchError';
+  }
+}
+
+export async function consumeLoginMfaChallenge(challengeToken: string, code: string, deviceIdHash?: string | null) {
+  return prisma.$transaction(async (tx) => {
+    const challenge = await tx.loginChallenge.findFirst({
+      where: {
+        challengeHash: hashToken(challengeToken),
+        usedAt: null,
+        expiresAt: { gt: new Date() },
+      },
+      include: { user: true },
+    });
+    if (!challenge || challenge.attempts >= LOGIN_MFA_MAX_ATTEMPTS) return null;
+
+    if (challenge.deviceIdHash && challenge.deviceIdHash !== (deviceIdHash ?? null)) {
+      throw new LoginMfaChallengeContextMismatchError(challenge.userId);
+    }
+
+    const matches = hashToken(code) === challenge.codeHash;
+    if (!matches) {
+      await tx.loginChallenge.update({ where: { id: challenge.id }, data: { attempts: { increment: 1 } } });
+      return null;
+    }
+
+    const claimed = await tx.loginChallenge.updateMany({
+      where: { id: challenge.id, usedAt: null, expiresAt: { gt: new Date() }, attempts: { lt: LOGIN_MFA_MAX_ATTEMPTS } },
+      data: { usedAt: new Date() },
+    });
+    return claimed.count === 1 ? challenge : null;
+  });
 }

@@ -84,7 +84,7 @@ export async function GET(req: Request, { params }: { params: Promise<{ id: stri
       include: { messages: messagesQuery },
     });
 
-    if (!conv || conv.userId !== user.id || conv.source !== 'chat') {
+    if (!conv || conv.userId !== user.id || !['chat', 'live_tutor'].includes(conv.source)) {
       return NextResponse.json({ error: 'Not found' }, { status: 404, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 

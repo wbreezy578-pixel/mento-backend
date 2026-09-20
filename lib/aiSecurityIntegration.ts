@@ -22,9 +22,8 @@
 
 import { getAISecurityLayer, AIRequestSecurityContext, SecurityLayerConfig, SecurityAssessmentResult } from './aiSecurityLayer';
 import { getRequestAuditor, SECURITY_EVENTS } from './requestAuditor';
-import { createSecureError, getHttpStatus, formatSecureErrorResponse } from './secureErrorHandler';
+import { createSecureError, formatSecureErrorResponse } from './secureErrorHandler';
 import logger from './logger';
-import { getRateLimitClientKey } from './requestMetadata';
 
 export interface ChatSecurityCheckResult {
   allowed: boolean;
@@ -206,66 +205,6 @@ export function getSecurityMetrics(result: ChatSecurityCheckResult): Record<stri
     warningCount: result.warnings.length,
     processingTimeMs: result.processingTimeMs,
   };
-}
-
-/**
- * Middleware wrapper for Express/Next.js
- *
- * Usage in route handler:
- * ```typescript
- * export async function POST(req: NextRequest) {
- *   const securityCheck = await createSecurityCheckMiddleware(req);
- *   if (!securityCheck.passed) {
- *     return NextResponse.json(securityCheck.error, { status: securityCheck.statusCode });
- *   }
- *
- *   // Use securityCheck.sanitizedInput
- * }
- * ```
- */
-export async function createSecurityCheckMiddleware(
-  request: Request & { json: () => Promise<Record<string, unknown>> }
-): Promise<{
-  passed: boolean;
-  sanitizedInput?: string;
-  error?: Record<string, unknown>;
-  statusCode?: number;
-  requestId?: string;
-}> {
-  try {
-    const body = await request.json();
-    const userInput = typeof body?.message === 'string' ? body.message : '';
-
-    if (!userInput) {
-      return {
-        passed: false,
-        error: { error: 'Message is required' },
-        statusCode: 400,
-      };
-    }
-
-    // Extract context from request
-    const userId = body?.userId || request.headers.get('x-user-id') || 'anonymous';
-    const requestId = body?.requestId || `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const ip = getRateLimitClientKey(request.headers);
-
-    const result = await assessAndSecureChatRequest(userInput, { userId, requestId, ip });
-
-    return {
-      passed: result.allowed,
-      sanitizedInput: result.sanitizedInput,
-      error: result.errorResponse,
-      statusCode: result.statusCode,
-      requestId: result.requestId,
-    };
-  } catch (error) {
-    logger.error('Security middleware error', { error });
-    return {
-      passed: false,
-      error: { error: 'Request could not be processed' },
-      statusCode: 400,
-    };
-  }
 }
 
 /**

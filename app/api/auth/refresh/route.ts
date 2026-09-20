@@ -1,10 +1,25 @@
 import { NextResponse } from 'next/server';
 import { signToken, normalizeEmail, recordSecurityEvent, buildUserSummary, applyAuthCookies, getClientIp, getSessionClientIp, getRefreshTokenFromBrowserCookie, isBrowserAuthRequest, buildAuthSessionResponseBody } from '../../../lib/auth';
-import { findSessionByToken, generateSecureToken, getRefreshSessionExpiry, isRefreshSessionExpired, RefreshSessionAlreadyUsedError, revokeSessionFamily, rotateRefreshSession } from '../../../../lib/authSession';
+import { detectRefreshContextChange, findSessionByToken, generateSecureToken, getRefreshSessionExpiry, hashClientDeviceId, hasSessionDeviceMismatch, isRefreshSessionExpired, RefreshSessionAlreadyUsedError, revokeSessionFamily, rotateRefreshSession } from '../../../../lib/authSession';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import { ensureSlidingWindow } from '../../../../lib/rateLimiter';
+import { createNotification } from '../../../services/notificationService';
 
 const CORS_METHODS = 'POST, OPTIONS';
+
+async function notifySessionSecurity(userId: string, body: string, externalId?: string) {
+  try {
+    await createNotification(userId, {
+      title: 'Session security alert',
+      body,
+      type: 'security',
+      category: 'SECURITY',
+      externalId,
+    });
+  } catch {
+    // Security notifications are best-effort and must never change auth behavior.
+  }
+}
 
 export async function OPTIONS(req: Request) {
   const corsHeaders = buildCorsHeaders(req.headers.get('origin'));
@@ -32,6 +47,11 @@ export async function POST(req: Request) {
     if (sessionRecord.revokedAt || sessionRecord.replacedBySessionId) {
       await revokeSessionFamily(sessionRecord.familyId);
       await recordSecurityEvent(sessionRecord.userId, 'refresh_token_reuse_detected', { familyId: sessionRecord.familyId });
+      await notifySessionSecurity(
+        sessionRecord.userId,
+        'A reused sign-in session was blocked. Please sign in again if this was you.',
+        `security:refresh-token-reuse:${sessionRecord.familyId}`,
+      );
       return NextResponse.json({ error: 'Session security check failed. Please sign in again.' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
@@ -41,6 +61,44 @@ export async function POST(req: Request) {
 
     const user = sessionRecord.user;
     if (!user.emailVerified || user.accountStatus !== 'ACTIVE') return NextResponse.json({ error: 'Account is not active.' }, { status: 403, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    const currentDeviceIdHash = hashClientDeviceId(req.headers.get('x-mento-device-id'));
+    if (hasSessionDeviceMismatch(sessionRecord.deviceIdHash, currentDeviceIdHash)) {
+      await revokeSessionFamily(sessionRecord.familyId);
+      await recordSecurityEvent(user.id, 'refresh_device_mismatch', {
+        sessionId: sessionRecord.id,
+        familyId: sessionRecord.familyId,
+        deviceIdProvided: Boolean(currentDeviceIdHash),
+      });
+      await notifySessionSecurity(
+        user.id,
+        'A sign-in session was blocked on an unrecognized device. Please sign in again if this was you.',
+        `security:refresh-device-mismatch:${sessionRecord.familyId}`,
+      );
+      return NextResponse.json({ error: 'Session security check failed. Please sign in again.' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }
+    const currentUserAgent = req.headers.get('user-agent') ?? null;
+    const currentIpAddress = getSessionClientIp(req);
+    const contextChange = detectRefreshContextChange({
+      previousIpAddress: sessionRecord.ipAddress,
+      currentIpAddress,
+      previousUserAgent: sessionRecord.userAgent,
+      currentUserAgent,
+    });
+    if (contextChange.changed) {
+      await recordSecurityEvent(user.id, 'refresh_context_changed', {
+        sessionId: sessionRecord.id,
+        familyId: sessionRecord.familyId,
+        ipChanged: contextChange.ipChanged,
+        userAgentChanged: contextChange.userAgentChanged,
+      });
+      // Do not block refresh on notification persistence, especially when a
+      // mobile carrier changes the client's IP between requests.
+      void notifySessionSecurity(
+        user.id,
+        'Your Mento session was refreshed from a different network or app version. If this was not you, sign in again and review your sessions.',
+        `security:refresh-context:${sessionRecord.id}`,
+      );
+    }
     const rotatedRefreshToken = generateSecureToken();
     const rollingExpiry = getRefreshSessionExpiry(sessionRecord.absoluteExpiresAt);
 
@@ -49,8 +107,9 @@ export async function POST(req: Request) {
       userId: user.id,
       rotatedToken: rotatedRefreshToken,
       expiresAt: rollingExpiry,
-      userAgent: req.headers.get('user-agent') ?? null,
-      ipAddress: getSessionClientIp(req),
+      userAgent: currentUserAgent,
+      ipAddress: currentIpAddress,
+      deviceIdHash: currentDeviceIdHash,
       familyId: sessionRecord.familyId,
       absoluteExpiresAt: sessionRecord.absoluteExpiresAt,
     });
@@ -81,6 +140,11 @@ export async function POST(req: Request) {
       if (sessionRecord) {
         await revokeSessionFamily(sessionRecord.familyId).catch(() => undefined);
         await recordSecurityEvent(sessionRecord.userId, 'refresh_token_reuse_detected', { familyId: sessionRecord.familyId, source: 'rotation_race' });
+        await notifySessionSecurity(
+          sessionRecord.userId,
+          'A reused sign-in session was blocked. Please sign in again if this was you.',
+          `security:refresh-token-reuse:${sessionRecord.familyId}`,
+        );
       }
       return NextResponse.json({ error: 'Refresh token expired' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }

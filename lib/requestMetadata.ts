@@ -1,6 +1,6 @@
 import { isIP } from 'node:net';
 
-export type TrustedProxyProvider = 'azure-container-apps' | 'vercel' | 'development' | 'none';
+export type TrustedProxyProvider = 'azure-container-apps' | 'cloud-run' | 'vercel' | 'development' | 'none';
 
 function normalizeIp(value: string | null | undefined): string {
   const candidate = value?.trim() ?? '';
@@ -17,6 +17,7 @@ function forwardedAddresses(headers: Headers): string[] {
 export function resolveTrustedProxyProvider(environment: NodeJS.ProcessEnv = process.env): TrustedProxyProvider {
   const configured = environment.TRUSTED_PROXY_PROVIDER?.trim().toLowerCase();
   if (configured === 'azure' || configured === 'azure-container-apps') return 'azure-container-apps';
+  if (configured === 'cloud-run' || configured === 'google-cloud-run') return 'cloud-run';
   if (configured === 'vercel') return 'vercel';
   if (configured === 'none') return 'none';
   if (environment.VERCEL === '1') return 'vercel';
@@ -38,8 +39,9 @@ export function getTrustedClientIp(headers: Headers, environment: NodeJS.Process
     return vercelForwarded || '';
   }
 
-  if (provider === 'azure-container-apps') {
-    // Azure appends its trusted client address after caller-supplied values.
+  if (provider === 'azure-container-apps' || provider === 'cloud-run') {
+    // Azure Container Apps and Cloud Run append their trusted client address
+    // after caller-supplied values.
     return forwarded.at(-1) || '';
   }
 

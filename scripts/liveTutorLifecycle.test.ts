@@ -234,8 +234,15 @@ async function main() {
     assert.equal(hungTerminal?.billingFinalized, true, 'finalizing records must not short-circuit before billing');
     assert.equal(await prisma.usageLog.count({ where: { userId: user.id, provider: 'Simli', requestId: hungTerminalRequest } }), 1, 'finalizing recovery must record one billing outcome');
 
-    const noCredit = await prisma.liveTutorWallet.upsert({ where: { userId: otherUser.id }, update: { minutesBalance: 0 }, create: { userId: otherUser.id, minutesBalance: 0 } });
+    const noCredit = await prisma.liveTutorWallet.upsert({
+      where: { userId: otherUser.id },
+      // minutesBalance is a legacy rounded display field. Authorization must
+      // test the canonical exact-second balances instead.
+      update: { minutesBalance: 0, includedSeconds: 0, topUpSeconds: 0 },
+      create: { userId: otherUser.id, minutesBalance: 0, includedSeconds: 0, topUpSeconds: 0 },
+    });
     assert.equal(noCredit.minutesBalance, 0);
+    assert.equal(noCredit.includedSeconds + noCredit.topUpSeconds, 0);
     const denied = await reserveUsage({ userId: otherUser.id, feature: 'live_tutor', amount: 60, provider: 'Simli', requestId: `${requestId}-denied`, pending: true });
     if (process.env.DEV_LIVE_TUTOR_FREE !== 'true') {
       assert.equal(denied.allowed, false, 'insufficient credits must reject reservation');

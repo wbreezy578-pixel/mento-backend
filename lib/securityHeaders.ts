@@ -95,7 +95,7 @@ export function buildCspRequestHeaders(
 export function buildCorsHeaders(origin: string | null | undefined): Record<string, string> {
   const headers: Record<string, string> = {
     'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Mento-Device-Id',
     'Access-Control-Allow-Credentials': 'true',
     'Cache-Control': 'no-store',
     Vary: 'Origin',

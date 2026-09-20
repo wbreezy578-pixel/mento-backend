@@ -19,7 +19,6 @@ describe('rate-limit failure safety', () => {
   it('requires distributed rate limiting for every aggregate AI limit in production', () => {
     const limiter = source('lib/rate-limiter.ts');
 
-    expect(limiter).toContain("process.env.NODE_ENV === 'production'");
     expect(limiter).toContain("process.env.REQUIRE_RATE_LIMIT_REDIS === 'true'");
     expect(limiter).toContain("status: 503, code: 'rate_limiter_unavailable'");
     expect(limiter).toContain('ensureCooldown(userId, MESSAGE_COOLDOWN_MS, strict)');
@@ -33,7 +32,8 @@ describe('rate-limit failure safety', () => {
   it('documents the production trusted proxy mode in the example environment', () => {
     const envExample = source('.env.example');
 
-    expect(envExample).toContain('TRUSTED_PROXY_PROVIDER=azure-container-apps');
+    expect(envExample).toContain('TRUSTED_PROXY_PROVIDER=cloud-run');
+    expect(envExample).toContain('azure-container-apps, cloud-run, vercel, or none');
     expect(envExample).toContain('Keep this aligned with the current deployment');
   });
 

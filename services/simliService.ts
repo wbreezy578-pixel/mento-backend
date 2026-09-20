@@ -8,6 +8,7 @@ import { prisma } from '../lib/prisma';
 import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE, type LiveTutorVoiceProfile } from './liveTutorVoiceProfiles';
 import '../lib/metrics';
 import { clampLiveTutorExpiry, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from '../lib/liveTutorLimits';
+import { resolveLiveTutorFinalizationUsage } from './liveTutorSessionBilling';
 
 export interface SimliStreamingSession {
   token: string;
@@ -683,10 +684,15 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
   const clientReportedSeconds = Number.isFinite(options.secondsUsed)
     ? Math.max(0, Math.floor(options.secondsUsed ?? 0))
     : 0;
-  const authoritativeSeconds = Math.max(durable.secondsConsumed, elapsedSeconds, clientReportedSeconds);
-  const secondsUsed = Math.min(durable.secondsReserved, authoritativeSeconds);
-  const billableSeconds = Math.max(1, secondsUsed);
   const usable = durable.usableAt !== null;
+  const finalizationUsage = resolveLiveTutorFinalizationUsage({
+    secondsReserved: durable.secondsReserved,
+    durableSecondsConsumed: durable.secondsConsumed,
+    elapsedSeconds,
+    clientReportedSeconds,
+    usable,
+    status: options.status,
+  });
   
   logger.info('Simli session lifecycle event', {
     provider: 'simli',
@@ -695,7 +701,9 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
     status: options.status,
     reason: options.reason ?? 'No reason provided',
     secondsReserved: durable.secondsReserved,
-    secondsUsed,
+    observedSeconds: finalizationUsage.observedSeconds,
+    chargedSeconds: finalizationUsage.chargedSeconds,
+    billingAction: finalizationUsage.rollbackRequired ? 'rollback' : 'finalize',
     category: `simli_session_${options.status}`,
   });
 
@@ -703,19 +711,20 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
   const billingUserId = durable.userId;
   if (billingRequestId && billingUserId) {
     try {
-      if (!usable || options.status === 'failed') {
+      if (finalizationUsage.rollbackRequired) {
         logger.warn('Simli session failed, rolling back usage', {
           provider: 'simli',
           streamId,
           userId: billingUserId,
-          secondsUsed,
+          observedSeconds: finalizationUsage.observedSeconds,
+          chargedSeconds: 0,
           reason: options.reason ?? 'Session failed',
           category: 'simli_session_failed_rollback',
         });
         await rollbackUsage({
           userId: billingUserId,
           feature: 'live_tutor',
-          amount: usable ? billableSeconds : 1,
+          amount: finalizationUsage.rollbackAmount,
           provider: 'Simli',
           requestId: billingRequestId,
           metadata: { streamId, status: options.status, reason: options.reason ?? 'Session failed', usableAt: durable.usableAt?.toISOString() ?? null },
@@ -727,19 +736,19 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
           streamId,
           userId: billingUserId,
           secondsReserved: durable.secondsReserved,
-          secondsUsed,
+          secondsUsed: finalizationUsage.chargedSeconds,
           reason: options.reason ?? 'Session ended',
           category: 'simli_session_completed_finalized',
         });
         await finalizeUsage({
           userId: billingUserId,
           feature: 'live_tutor',
-          amount: billableSeconds,
+          amount: finalizationUsage.chargedSeconds,
           provider: 'Simli',
           requestId: billingRequestId,
           metadata: { streamId, status: options.status, reason: options.reason ?? 'Session ended' },
           pending: true,
-          secondsUsed,
+          secondsUsed: finalizationUsage.chargedSeconds,
         });
       }
 
@@ -761,7 +770,7 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
     }
   }
 
-  await prisma.liveTutorSession.update({ where: { streamId }, data: { status: 'ended', terminalStatus: options.status, terminalReason: options.reason, secondsConsumed: usable ? billableSeconds : 0, billingFinalized: true, finalizationStartedAt: null, finalizedAt: new Date() } });
+  await prisma.liveTutorSession.update({ where: { streamId }, data: { status: 'ended', terminalStatus: options.status, terminalReason: options.reason, secondsConsumed: finalizationUsage.chargedSeconds, billingFinalized: true, finalizationStartedAt: null, finalizedAt: new Date() } });
   logStatusTransition({ streamId, sessionId: durable.id, userId: durable.userId, previousStatus: 'finalizing', resultingStatus: 'ended', reason: options.reason ?? 'session_ended' });
   logger.info('[LiveTutorLifecycle] live_tutor_terminal_state_committed', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'session_ended', previousStatus: 'finalizing', resultingStatus: 'ended', terminalStatus: options.status, category: 'live_tutor_lifecycle' });
   logger.info('[LiveTutorLifecycle] terminal_finalize_completed', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'session_ended', previousStatus: 'finalizing', resultingStatus: 'ended', category: 'live_tutor_lifecycle' });

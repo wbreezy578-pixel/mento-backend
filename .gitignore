@@ -29,6 +29,13 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+.deploy-*.out
+.deploy-*.err
+.simli-*.out
+.simli-*.err
+build-proof.log
+build.log
+tsconfig.tsbuildinfo
 
 # env files (can opt-in for committing if needed)
 .env*

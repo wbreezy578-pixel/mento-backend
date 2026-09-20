@@ -60,7 +60,6 @@
 - Ready-to-use integration hooks
 - `assessAndSecureChatRequest()` - Main integration function
 - `isRequestSecure()` - Quick boolean check
-- `createSecurityCheckMiddleware()` - Express/Next.js middleware
 - `assessAndSecureChatRequestCached()` - Performance-optimized caching
 - Security metrics extraction
 

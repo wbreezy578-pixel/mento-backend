@@ -45,6 +45,7 @@ model User {
   storePurchases         StorePurchase[]
   securityEvents         SecurityEvent[]
   sessions               Session[]
+  loginChallenges        LoginChallenge[]
   usageLogs              UsageLog[]
   consentRecords         ConsentRecord[]
   chatAnalytics          ChatAnalyticsEvent[]
@@ -300,6 +301,7 @@ model Session {
   tokenHash           String    @unique
   userAgent           String?
   ipAddress           String?
+  deviceIdHash        String?
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
   lastUsedAt          DateTime?
@@ -312,7 +314,24 @@ model Session {
   user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, revokedAt])
+  @@index([userId, deviceIdHash])
   @@index([familyId, revokedAt])
+  @@index([expiresAt])
+}
+
+model LoginChallenge {
+  id            String    @id @default(cuid())
+  userId        String
+  challengeHash String    @unique
+  codeHash      String
+  deviceIdHash  String?
+  attempts      Int       @default(0)
+  createdAt     DateTime  @default(now())
+  expiresAt     DateTime
+  usedAt        DateTime?
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
   @@index([expiresAt])
 }
 

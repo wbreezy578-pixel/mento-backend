@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { applyAuthCookies, authRateLimitSubject, buildAuthSessionResponseBody, buildUserSummary, getClientIp, getSessionClientIp, getUserFromRequest, isBrowserAuthRequest, normalizeEmail, recordSecurityEvent, signToken } from '../app/lib/auth';
-import { createSessionRecord, generateSecureToken, getRefreshSessionExpiry, REFRESH_SESSION_ABSOLUTE_TTL_MS } from '../lib/authSession';
+import { createSessionRecord, generateSecureToken, getRefreshSessionExpiry, hashClientDeviceId, REFRESH_SESSION_ABSOLUTE_TTL_MS } from '../lib/authSession';
 import { getSupabaseClientKey, getSupabaseUrl } from '../lib/env';
 import { buildCorsHeaders } from '../lib/securityHeaders';
 import { createAppleAccount, createGoogleOAuthAccount, InvalidAccountInputError, OAuthAccountLinkRequiredError } from './userAccountService';
@@ -88,7 +88,7 @@ export async function exchangeSupabaseOAuth(req: Request, provider: OAuthProvide
     const refreshToken = generateSecureToken();
     const absoluteExpiresAt = new Date(Date.now() + REFRESH_SESSION_ABSOLUTE_TTL_MS);
     const sessionExpiresAt = getRefreshSessionExpiry(absoluteExpiresAt);
-    const session = await createSessionRecord({ userId: user.id, token: refreshToken, userAgent: req.headers.get('user-agent'), ipAddress: getSessionClientIp(req), expiresAt: sessionExpiresAt, absoluteExpiresAt });
+    const session = await createSessionRecord({ userId: user.id, token: refreshToken, userAgent: req.headers.get('user-agent'), ipAddress: getSessionClientIp(req), deviceIdHash: hashClientDeviceId(req.headers.get('x-mento-device-id')), expiresAt: sessionExpiresAt, absoluteExpiresAt });
     const accessToken = signToken(user.id, profile.email, { sessionId: session.id, expiresInSeconds: 15 * 60 });
     await recordSecurityEvent(user.id, 'oauth_login_success', { provider });
     const browserSession = isBrowserAuthRequest(req);

@@ -3,6 +3,8 @@ import logger from './logger';
 import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REALTIME_LEASE_TTL_SECONDS = 30;
+const REDIS_STARTUP_ATTEMPTS = 4;
+const REDIS_STARTUP_RETRY_DELAYS_MS = [750, 1_500, 3_000];
 const redisUrl = getRedisUrl();
 const requireRedis = process.env.REQUIRE_REALTIME_REDIS === 'true';
 
@@ -50,12 +52,20 @@ export async function acquireVoiceLease(
   );
   if (Number(acquired) !== 1) return false;
 
-  await client.hset(sessionKey(streamId), {
-    ...fields,
-    ownerId,
-    acquiredAt: new Date().toISOString(),
-  });
-  await client.expire(sessionKey(streamId), REALTIME_LEASE_TTL_SECONDS);
+  try {
+    await client.hset(sessionKey(streamId), {
+      ...fields,
+      ownerId,
+      acquiredAt: new Date().toISOString(),
+    });
+    await client.expire(sessionKey(streamId), REALTIME_LEASE_TTL_SECONDS);
+  } catch (error) {
+    // Do not leave a successful owner-key write blocking reconnects after the
+    // accompanying session metadata write failed. The Lua release remains
+    // owner-safe, so it cannot delete a lease that another process acquired.
+    await releaseVoiceLease(streamId, ownerId).catch(() => undefined);
+    throw error;
+  }
   return true;
 }
 
@@ -101,17 +111,46 @@ export function getRealtimeRedisStatus(): { configured: boolean; required: boole
 }
 
 export async function assertRealtimeRedisReadyForProduction(): Promise<void> {
+  // Redis coordinates Live Tutor sessions, but it must never decide whether the
+  // whole HTTP API can boot. A transient DNS/TLS failure previously kept Cloud
+  // Run from listening on PORT, taking sign-in, Chat, Learn and billing down
+  // alongside Live Tutor. Keep the probe/retries for observability, then let
+  // the server start; voice operations still fail closed through
+  // assertRedisAvailable when REQUIRE_REALTIME_REDIS is enabled.
   if (process.env.NODE_ENV !== 'production') return;
 
   const status = getRealtimeRedisStatus();
   if (!status.configured) {
-    throw new Error('Realtime Redis is required for production Live Tutor voice sessions.');
+    logger.error('[RealtimeRedis] Redis is not configured; Live Tutor voice will be unavailable until it is restored', {
+      category: 'realtime_redis_startup_degraded',
+      required: status.required,
+    });
+    return;
   }
 
-  const health = await checkRealtimeRedisHealth();
-  if (health !== 'ok') {
-    throw new Error('Realtime Redis is unavailable; refusing to start the production voice server.');
+  for (let attempt = 1; attempt <= REDIS_STARTUP_ATTEMPTS; attempt += 1) {
+    const health = await checkRealtimeRedisHealth();
+    if (health === 'ok') return;
+
+    if (attempt < REDIS_STARTUP_ATTEMPTS) {
+      const configuredDelay = Number(process.env.REDIS_STARTUP_RETRY_DELAY_MS);
+      const delayMs = Number.isFinite(configuredDelay) && configuredDelay >= 0
+        ? configuredDelay
+        : REDIS_STARTUP_RETRY_DELAYS_MS[attempt - 1] ?? 3_000;
+      logger.warn('[RealtimeRedis] Redis unavailable during production startup; retrying', {
+        attempt,
+        maxAttempts: REDIS_STARTUP_ATTEMPTS,
+        delayMs,
+        category: 'realtime_redis_startup_retry',
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
   }
+
+  logger.error('[RealtimeRedis] Redis is unavailable after startup retries; starting the HTTP API in degraded mode', {
+    category: 'realtime_redis_startup_degraded',
+    required: status.required,
+  });
 }
 
 export async function checkRealtimeRedisHealth(): Promise<'ok' | 'not_configured' | 'fail'> {

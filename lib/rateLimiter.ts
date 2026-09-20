@@ -4,9 +4,13 @@ import logger from './logger';
 import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REDIS_URL = getRedisUrl();
-const REQUIRE_DISTRIBUTED_RATE_LIMIT = process.env.REQUIRE_RATE_LIMIT_REDIS === 'true'
-  || process.env.NODE_ENV === 'production';
+// Redis is the preferred cross-instance limiter. It is opt-in as a strict
+// dependency so a short Redis outage cannot turn into a full application
+// outage. When strict mode is off, the bounded per-instance limiter below
+// protects the service while Redis reconnects.
+const REQUIRE_DISTRIBUTED_RATE_LIMIT = process.env.REQUIRE_RATE_LIMIT_REDIS === 'true';
 let redis: MentoRedisClient | null = null;
+const REDIS_READY_WAIT_MS = 1_500;
 
 export type RateLimitDecision = {
   ok: boolean;
@@ -70,6 +74,36 @@ if (REDIS_URL) {
     redis = null;
   }
 }
+
+async function getReadyRedisClient(): Promise<MentoRedisClient | null> {
+  const client = redis;
+  if (!client) return null;
+  if (client.status === 'ready') return client;
+  if (client.status === 'end') return null;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (ready: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      client.removeListener('ready', onReady);
+      client.removeListener('error', onUnavailable);
+      client.removeListener('end', onUnavailable);
+      resolve(ready && client.status === 'ready' ? client : null);
+    };
+    const onReady = () => settle(true);
+    const onUnavailable = () => settle(false);
+    const timeout = setTimeout(() => settle(client.status === 'ready'), REDIS_READY_WAIT_MS);
+
+    client.once('ready', onReady);
+    client.once('error', onUnavailable);
+    client.once('end', onUnavailable);
+
+    // The client can become ready between the status check above and listener registration.
+    if (client.status === 'ready') settle(true);
+  });
+}
 // Fallback in-memory stores (per-process)
 const inMemoryWindows: Map<string, number[]> = new Map();
 const inMemoryCooldown: Map<string, number> = new Map();
@@ -80,12 +114,13 @@ function pruneWindow(arr: number[], windowMs: number) {
 }
 
 export async function ensureCooldown(userId: string, cooldownMs: number, options?: RateLimitOptions): Promise<RateLimitDecision> {
-  if (redis) {
+  const readyRedis = await getReadyRedisClient();
+  if (readyRedis) {
     const key = `rl:cooldown:${userId}`;
     try {
-      const res = await redis.set(key, '1', 'PX', cooldownMs, 'NX');
+      const res = await readyRedis.set(key, '1', 'PX', cooldownMs, 'NX');
       if (res === 'OK') return { ok: true };
-      const ttl = await redis.pttl(key);
+      const ttl = await readyRedis.pttl(key);
       rateLimitDenied.inc({ type: 'cooldown' });
       rateLimitHits.inc({ type: 'cooldown' });
       return { ok: false, retryAfterSec: Math.ceil(Math.max(ttl, 0) / 1000) };
@@ -124,14 +159,15 @@ export async function ensureSlidingWindow(
   const windowMs = windowSeconds * 1000;
   const redisKey = `${keyPrefix}:${id}`;
 
-  if (redis) {
+  const readyRedis = await getReadyRedisClient();
+  if (readyRedis) {
     const nowTs = Date.now();
     const minTs = nowTs - windowMs;
 
     const member = `${nowTs}-${Math.random().toString(36).slice(2, 10)}`;
 
         try {
-      const result = await (redis as MentoRedisClient & {
+      const result = await (readyRedis as MentoRedisClient & {
         slidingWindowAtomic: (
           key: string,
           nowTs: number,
@@ -247,11 +283,12 @@ export async function ensureDailyQuota(
 ): Promise<{ ok: boolean; remaining?: number; unavailable?: boolean }> {
   const day = todayKeySuffix();
   const key = `rl:daily:${userId}:${day}`;
-  if (redis) {
+  const readyRedis = await getReadyRedisClient();
+  if (readyRedis) {
     try {
-      const val = await redis.incr(key);
+      const val = await readyRedis.incr(key);
       if (val === 1) {
-        await redis.expire(key, secondsUntilTomorrowUTC());
+        await readyRedis.expire(key, secondsUntilTomorrowUTC());
       }
       if (limitPerDay >= 0 && val > limitPerDay) {
         rateLimitDenied.inc({ type: 'daily' });

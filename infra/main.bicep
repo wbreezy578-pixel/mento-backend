@@ -42,6 +42,8 @@ param metricsAuthToken string = ''
 param retentionJobSecret string = ''
 @secure()
 param resendApiKey string = ''
+@secure()
+param edgeOriginSecret string = ''
 param authEmailFrom string = ''
 param authWebBaseUrl string = ''
 param mobileAppScheme string = 'mentomobile'
@@ -147,6 +149,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
           name: 'resend-api-key'
           value: resendApiKey
         }
+        {
+          name: 'edge-origin-secret'
+          value: edgeOriginSecret
+        }
       ]
       registries: empty(containerRegistryServer) ? [] : [
         {
@@ -227,7 +233,9 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
             }
             {
               name: 'REDIS_CLUSTER_MODE'
-              value: 'true'
+              // Upstash provides one TLS endpoint; Redis Cluster discovery is
+              // Azure-specific and causes DNS/slot-discovery failures here.
+              value: 'false'
             }
             {
               name: 'REQUIRE_REALTIME_REDIS'
@@ -340,6 +348,10 @@ resource voiceApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'RESEND_API_KEY'
               secretRef: 'resend-api-key'
+            }
+            {
+              name: 'EDGE_ORIGIN_SECRET'
+              secretRef: 'edge-origin-secret'
             }
             {
               name: 'AUTH_EMAIL_FROM'

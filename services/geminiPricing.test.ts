@@ -15,7 +15,7 @@ describe('Gemini Normal Chat pricing', () => {
 
   it('uses the available Flash model as the fallback', async () => {
     const { NORMAL_CHAT_COST_AWARE_FALLBACKS } = await import('./geminiPricing');
-    expect(NORMAL_CHAT_COST_AWARE_FALLBACKS).toEqual(['gemini-2.5-flash']);
+    expect(NORMAL_CHAT_COST_AWARE_FALLBACKS).toEqual(['gemini-3.5-flash-lite']);
   });
 
   it('prices cached input and thinking output using the actual model', () => {

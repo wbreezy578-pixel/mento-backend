@@ -5,6 +5,7 @@ import {
   LIVE_TUTOR_LIVEKIT_FRAME_BYTES,
   LIVE_TUTOR_LIVEKIT_FRAME_MS,
 } from '../services/liveTutorLiveKitPcmPublisher';
+import { createLiveTutorLiveKitRoomPublisher, getLiveTutorLiveKitRoomConfig } from '../services/liveTutorLiveKitRoomPublisher';
 import {
   createLiveTutorSimliLiveKitAvatarSession,
   getLiveTutorSimliLiveKitConfig,
@@ -40,6 +41,13 @@ async function main() {
     subscriberIdentity: 'mento-phase3-validator',
   });
   const session = await createLiveTutorSimliLiveKitAvatarSession(config);
+  const publisher = await createLiveTutorLiveKitRoomPublisher(
+    getLiveTutorLiveKitRoomConfig({
+      roomName,
+      publisherIdentity: 'mento-phase3-publisher',
+      subscriberIdentity: 'mento-phase3-validator',
+    }),
+  );
   const subscriber = new Room();
   let audioSamples = 0;
   let videoFrames = 0;
@@ -81,21 +89,22 @@ async function main() {
     await Promise.race([tracksReady, wait(15_000).then(() => { throw new Error('Simli did not publish both avatar tracks.'); })]);
 
     const generationId = 1;
-    session.pcm.startGeneration(generationId);
+    publisher.pcm.startGeneration(generationId);
     const completeBytes = pcm.byteLength - (pcm.byteLength % LIVE_TUTOR_LIVEKIT_FRAME_BYTES);
     for (let offset = 0; offset < completeBytes; offset += LIVE_TUTOR_LIVEKIT_FRAME_BYTES) {
-      await session.pcm.enqueue(generationId, pcm.subarray(offset, offset + LIVE_TUTOR_LIVEKIT_FRAME_BYTES));
+      await publisher.pcm.enqueue(generationId, pcm.subarray(offset, offset + LIVE_TUTOR_LIVEKIT_FRAME_BYTES));
       if (offset >= LIVE_TUTOR_LIVEKIT_FRAME_BYTES * 3) await wait(LIVE_TUTOR_LIVEKIT_FRAME_MS);
     }
-    if (!await session.pcm.completeGeneration(generationId)) throw new Error('Phase 3 generation did not complete.');
+    if (!await publisher.pcm.completeGeneration(generationId)) throw new Error('Phase 3 generation did not complete.');
     await wait(500);
-    const metrics = session.pcm.metrics();
+    const metrics = publisher.pcm.metrics();
     if (audioSamples === 0 || videoFrames === 0) throw new Error('Simli avatar tracks contained no media.');
     console.log(JSON.stringify({ result: 'passed', roomName, clipPath, audioSamples, videoFrames, ...metrics }));
   } finally {
     await audioReader?.cancel().catch(() => undefined);
     await videoReader?.cancel().catch(() => undefined);
     await subscriber.disconnect();
+    await publisher.pcm.close();
     await session.close();
     await dispose();
   }

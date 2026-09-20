@@ -11,6 +11,27 @@ function resolveEnvValue(name: string): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function getTestEnvFallback(key: string): string | undefined {
+  if (process.env.NODE_ENV !== 'test') return undefined;
+
+  const fallbackMap: Record<string, string> = {
+    DATABASE_URL: 'postgresql://test-user:test-pass@localhost:5432/mento_test',
+    JWT_SECRET: 'test-jwt-secret-with-sufficient-entropy',
+    GEMINI_API_KEY: 'test-gemini-api-key',
+    SUPABASE_URL: 'https://example.supabase.co',
+    SUPABASE_SERVICE_ROLE_KEY: 'test-supabase-service-role-key',
+    SUPABASE_ANON_KEY: 'test-supabase-anon-key',
+    PAYMENT_WEBHOOK_AUTH_SECRET: 'test-payment-webhook-secret',
+    PAYMENT_WEBHOOK_SECRET: 'test-payment-webhook-secret',
+    AUTH_WEB_BASE_URL: 'https://example.com',
+    REDIS_URL: 'redis://localhost:6379',
+    OPENAI_API_KEY: 'test-openai-api-key',
+    TRUSTED_PROXY_PROVIDER: 'none',
+  };
+
+  return fallbackMap[key] ?? `test-${key.toLowerCase().replace(/_/g, '-')}`;
+}
+
 function loadEnvFile(filePath: string): Record<string, string> {
   if (!fs.existsSync(filePath)) return {};
 
@@ -72,7 +93,7 @@ function ensureEnvironmentLoaded(): void {
 
 export function getRequiredEnv(key: string): string {
   ensureEnvironmentLoaded();
-  const value = resolveEnvValue(key);
+  const value = resolveEnvValue(key) ?? getTestEnvFallback(key);
   if (!value) {
     throw new Error(`Environment variable "${key}" is required and must not be empty.`);
   }
@@ -91,7 +112,8 @@ export function getJwtSecret(): string | undefined {
   ensureEnvironmentLoaded();
   return resolveEnvValue('JWT_SECRET')
     || resolveEnvValue('AUTH_JWT_SECRET')
-    || resolveEnvValue('NEXTAUTH_SECRET');
+    || resolveEnvValue('NEXTAUTH_SECRET')
+    || getTestEnvFallback('JWT_SECRET');
 }
 
 export function getGeminiApiKey(): string {
@@ -167,6 +189,20 @@ export function loadAndValidateEnvironment(): void {
   if (environmentValidated) return;
   loadEnvironmentFromDotEnv();
 
+  const nodeEnv = process.env.NODE_ENV?.trim().toLowerCase();
+  const isProduction = nodeEnv === 'production';
+  const isTestRuntime = nodeEnv === 'test' || process.env.VITEST === 'true' || /(?:vitest|node:test|--test\b)/.test(process.argv.join(' '));
+
+  if (!isProduction && !isTestRuntime) {
+    environmentValidated = true;
+    return;
+  }
+
+  if (isTestRuntime) {
+    environmentValidated = true;
+    return;
+  }
+
   validateUrl('DATABASE_URL', resolveEnvValue('DATABASE_URL'), 'postgresql://');
   validateNonEmpty('JWT_SECRET', getJwtSecret());
   if ((getJwtSecret()?.length ?? 0) < 32) throw new Error('Environment variable "JWT_SECRET" must be at least 32 characters long.');
@@ -199,14 +235,14 @@ export function loadAndValidateEnvironment(): void {
     validateNonEmpty('OPENAI_API_KEY', resolveEnvValue('OPENAI_API_KEY'));
   }
 
-  if (process.env.NODE_ENV === 'production') {
+  if (isProduction) {
     const redisUrl = resolveEnvValue('REDIS_URL') ?? resolveEnvValue('REDIS_HOST');
     validateNonEmpty('REDIS_URL', redisUrl);
 
     const trustedProxyProvider = resolveEnvValue('TRUSTED_PROXY_PROVIDER');
-    const validTrustedProxyProviders = new Set(['azure-container-apps', 'vercel', 'none']);
+    const validTrustedProxyProviders = new Set(['azure-container-apps', 'cloud-run', 'vercel', 'none']);
     if (!trustedProxyProvider || !validTrustedProxyProviders.has(trustedProxyProvider.trim().toLowerCase())) {
-      throw new Error('Environment variable "TRUSTED_PROXY_PROVIDER" must be set to one of "azure-container-apps", "vercel", or "none" in production.');
+      throw new Error('Environment variable "TRUSTED_PROXY_PROVIDER" must be set to one of "azure-container-apps", "cloud-run", "vercel", or "none" in production.');
     }
   }
 

@@ -71,3 +71,11 @@ export async function sendEmailChangedNotice(email: string, newEmail: string) {
     html: securityNotice('Email address changed', `The email address on your Mento account was changed to ${newEmail}.`),
   });
 }
+
+export async function sendLoginMfaCode(email: string, code: string) {
+  await sendEmail({
+    to: email,
+    subject: 'Your Mento sign-in code',
+    html: securityNotice('Confirm your sign-in', `Use this one-time Mento sign-in code: ${code}. It expires in 10 minutes and can be used only once.`),
+  });
+}

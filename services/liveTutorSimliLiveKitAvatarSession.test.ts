@@ -49,6 +49,9 @@ describe('Live Tutor Simli LiveKit avatar session', () => {
     expect((jwtPayload(attachment.livekit_token).exp as number) - nowSeconds).toBeGreaterThanOrEqual(659);
     expect((jwtPayload(attachment.livekit_token).exp as number) - nowSeconds).toBeLessThanOrEqual(661);
     expect(session.avatarIdentity).toBe('simli-avatar-agent');
+    expect(session.startupTimings.tokenPreparationMs).toBeGreaterThanOrEqual(0);
+    expect(session.startupTimings.simliSessionCreateMs).toBeGreaterThanOrEqual(0);
+    expect(session.startupTimings.simliLiveKitAttachMs).toBeGreaterThanOrEqual(0);
     expect(jwtPayload(session.subscriberToken)).toMatchObject({ sub: 'android-test-client' });
     expect((jwtPayload(session.subscriberToken).exp as number) - nowSeconds).toBeGreaterThanOrEqual(659);
     expect((jwtPayload(session.subscriberToken).exp as number) - nowSeconds).toBeLessThanOrEqual(661);
@@ -64,5 +67,18 @@ describe('Live Tutor Simli LiveKit avatar session', () => {
     await expect(createLiveTutorSimliLiveKitAvatarSession(config, undefined, {
       fetch: request,
     })).rejects.toThrow('Simli LiveKit attachment failed with status 503.');
+  });
+
+  it('retries a throttled attachment using the same Simli session', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce(response({ session_token: 'simli-session-token' }))
+      .mockResolvedValueOnce(response({ message: 'slow down' }, 429))
+      .mockResolvedValueOnce(response({ ok: true })) as unknown as typeof fetch;
+    const wait = vi.fn().mockResolvedValue(undefined);
+
+    await createLiveTutorSimliLiveKitAvatarSession(config, undefined, { fetch: request, wait });
+
+    expect(wait).toHaveBeenCalledWith(1_000);
+    expect((request as unknown as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(3);
   });
 });

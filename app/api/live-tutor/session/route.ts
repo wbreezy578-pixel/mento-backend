@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server';
+import { randomUUID } from 'node:crypto';
 import { LiveKitAPI } from 'livekit-server-sdk';
 import { prisma } from '../../../../lib/prisma';
 // Match your exact original exports from simliService
 import { claimLiveTutorSession, completeSimliSessionLifecycle, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
-import { createLiveTutorSimliLiveKitAvatarSession, getLiveTutorSimliLiveKitConfig, type LiveTutorSimliLiveKitAvatarSession } from '../../../../services/liveTutorSimliLiveKitAvatarSession';
+import { createLiveTutorSimliLiveKitAvatarSession, getLiveTutorSimliLiveKitConfig, SimliLiveKitAttachmentError, type LiveTutorSimliLiveKitAvatarSession } from '../../../../services/liveTutorSimliLiveKitAvatarSession';
 import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE } from '../../../../services/liveTutorVoiceProfiles';
 import { resolveLiveTutorVoiceProfile } from '../../../../services/liveTutorVoiceProfiles';
 import {
@@ -41,6 +42,7 @@ function requireSessionToken(session: { token?: unknown; sessionToken?: unknown 
 
 export async function GET(req: Request) {
   let claimedRequestId: string | undefined;
+  const lifecycleTraceId = randomUUID().replaceAll('-', '');
   let claimedUserId: string | undefined;
   let cleanupStreamId: string | undefined;
   const routePhaseStart = Date.now();
@@ -52,6 +54,7 @@ export async function GET(req: Request) {
       phase: name,
       elapsedMs: now - routePhaseStart,
       category: 'live_tutor_session_phase',
+      lifecycleTraceId,
     });
   };
   try {
@@ -118,17 +121,35 @@ export async function GET(req: Request) {
 
     const staleSessionReconcileStartedAt = Date.now();
     const staleSessionReconcilePromise = reconcileStaleLiveTutorSession(user.id)
-      .then(() => {
+      .then((reconciled) => {
         logger.info('Live Tutor stale session reconciliation completed', {
           durationMs: Date.now() - staleSessionReconcileStartedAt,
           category: 'live_tutor_stale_session_reconcile',
         });
         markPhase('stale_session_reconcile');
+        return reconciled;
       });
 
-    const [providerPreflightResult, staleSessionReconcileResult] = await Promise.allSettled([
+    // This is a read-only entitlement snapshot.  It does not reserve minutes,
+    // create a session, or loosen the durable per-user session claim below, so
+    // it can safely overlap stale-session reconciliation and provider
+    // preflight.  The existing claim remains the authority for one active
+    // session per user.
+    const billingStartedAt = Date.now();
+    const billingDecisionPromise = canUseLiveTutor(user.id, 1)
+      .then((decision) => {
+        logger.info('Live Tutor lightweight allowance preflight completed', {
+          durationMs: Date.now() - billingStartedAt,
+          category: 'live_tutor_lightweight_billing_preflight',
+        });
+        markPhase('lightweight_billing_preflight');
+        return decision;
+      });
+
+    const [providerPreflightResult, staleSessionReconcileResult, billingDecisionResult] = await Promise.allSettled([
       providerPreflightPromise,
       staleSessionReconcilePromise,
+      billingDecisionPromise,
     ]);
     if (providerPreflightResult.status === 'rejected') {
       const error = providerPreflightResult.reason;
@@ -141,6 +162,9 @@ export async function GET(req: Request) {
     }
     if (staleSessionReconcileResult.status === 'rejected') {
       throw staleSessionReconcileResult.reason;
+    }
+    if (billingDecisionResult.status === 'rejected') {
+      throw billingDecisionResult.reason;
     }
 
     const requestId = buildAIRequestId('simli-session');
@@ -164,8 +188,19 @@ export async function GET(req: Request) {
       category: 'live_tutor_session_creating',
     });
 
-    const billingStartedAt = Date.now();
-    const billingDecision: BillingDecision = await canUseLiveTutor(user.id, 1);
+    // A stale session can finalize minutes while the preflight read is in
+    // flight. Re-read only in that recovery case so a user is never admitted
+    // using a balance that the reconciliation just consumed.
+    const billingDecision: BillingDecision = staleSessionReconcileResult.value
+      ? await canUseLiveTutor(user.id, 1)
+      : billingDecisionResult.value;
+    if (staleSessionReconcileResult.value) {
+      logger.info('Live Tutor lightweight allowance revalidated after stale-session recovery', {
+        durationMs: Date.now() - billingStartedAt,
+        category: 'live_tutor_lightweight_billing_revalidation',
+      });
+      markPhase('lightweight_billing_revalidation');
+    }
     logger.info('Live Tutor lightweight allowance check completed', {
       durationMs: Date.now() - billingStartedAt,
       category: 'live_tutor_lightweight_billing_check',
@@ -191,6 +226,9 @@ export async function GET(req: Request) {
       maxSessionSeconds,
       Math.max(0, billingDecision.remainingUsage ?? 0),
     );
+    // The duration is reserved at admission, but it must not begin to elapse
+    // while LiveKit/Simli are still bringing media online.  The worker marks
+    // this session usable only after mobile has proved strict readiness.
     const serverSessionExpiresAt = new Date(Date.now() + Math.max(1, authorizedSeconds) * 1000);
     const liveTutorConversation = continuedConversationId
       ? { id: continuedConversationId }
@@ -217,16 +255,24 @@ export async function GET(req: Request) {
         apiKey: liveKitConfig.liveKitApiKey,
         secret: liveKitConfig.liveKitApiSecret,
       });
+      const agentDispatchStartedAt = Date.now();
       const agentName = resolveLiveTutorAgentNameForUser(user.email);
       const dispatch = await liveKitApi.agentDispatch.createDispatch(
         liveKitSession.roomName,
         agentName,
-        { metadata: JSON.stringify({ requestId, userId: user.id, conversationId: liveTutorConversation.id, mobileParticipantIdentity: liveKitConfig.subscriberIdentity, sessionExpiresAt: serverSessionExpiresAt.toISOString() }) },
+        // Keep the provisional expiry for already-deployed workers during a
+        // rolling upgrade. New workers ignore it and obtain a fresh expiry
+        // only after strict readiness through worker-ready.
+        { metadata: JSON.stringify({ requestId, lifecycleTraceId, userId: user.id, streamId: liveKitSession.streamId, conversationId: liveTutorConversation.id, mobileParticipantIdentity: liveKitConfig.subscriberIdentity, sessionExpiresAt: serverSessionExpiresAt.toISOString() }) },
       );
       logger.info('Live Tutor LiveKit agent dispatched', {
         roomName: liveKitSession.roomName,
         dispatchId: dispatch.id,
         agentName,
+        durationMs: Date.now() - agentDispatchStartedAt,
+        simliTokenCreateMs: liveKitSession.startupTimings.simliSessionCreateMs,
+        simliLiveKitAttachMs: liveKitSession.startupTimings.simliLiveKitAttachMs,
+        tokenPreparationMs: liveKitSession.startupTimings.tokenPreparationMs,
         category: 'live_tutor_livekit_agent_dispatch',
       });
       await prisma.liveTutorSession.updateMany({
@@ -319,6 +365,7 @@ export async function GET(req: Request) {
       avatarVoiceProfile,
       conversationId: liveTutorConversation.id,
       avatarTransport: avatarTransport.transport,
+      lifecycleTraceId,
       ...(liveKitSession ? {
         liveKitUrl,
         roomName: liveKitSession.roomName,
@@ -338,6 +385,7 @@ export async function GET(req: Request) {
     logger.info('Live Tutor route completed', {
       totalElapsedMs: Date.now() - routePhaseStart,
       phaseBreakdown: Object.fromEntries(phaseTimers.entries()),
+      lifecycleTraceId,
       category: 'live_tutor_session_route_complete',
     });
     return NextResponse.json(responsePayload);
@@ -370,7 +418,8 @@ export async function GET(req: Request) {
 
     const message = error instanceof Error ? error.message : 'Internal Server Error';
     const status = (error as { status?: number })?.status ?? 500;
-    const isUnavailable = message && (message.includes('temporarily unavailable') || message.includes('circuit'));
+    const isSimliThrottled = error instanceof SimliLiveKitAttachmentError && error.status === 429;
+    const isUnavailable = isSimliThrottled || Boolean(message && (message.includes('temporarily unavailable') || message.includes('circuit')));
 
     logger.error('Live Tutor session initialization failed', {
       status,
@@ -379,7 +428,9 @@ export async function GET(req: Request) {
       error: message,
     });
 
-    const userMessage = isUnavailable
+    const userMessage = isSimliThrottled
+      ? 'Live Tutor is busy right now. Please wait a moment before trying again.'
+      : isUnavailable
       ? 'Live Tutor is temporarily unavailable. Please try again in a moment.'
       : 'Unable to start Live Tutor. Please check your connection and try again.';
 

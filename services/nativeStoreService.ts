@@ -66,63 +66,21 @@ function readOptionalEnv(name: string): string | undefined {
   }
 }
 
-function adaptWifCredentialsForAzureContainerApps(credentials: Record<string, unknown>): Record<string, unknown> {
-  const identityEndpoint = readOptionalEnv('IDENTITY_ENDPOINT');
-  const identityHeader = readOptionalEnv('IDENTITY_HEADER');
-  if (!identityEndpoint && !identityHeader) return credentials;
-  if (!identityEndpoint || !identityHeader) {
-    throw new Error('Azure Container Apps managed identity is incompletely configured.');
-  }
-
-  const credentialSource = credentials.credential_source;
-  if (!credentialSource || typeof credentialSource !== 'object' || Array.isArray(credentialSource)) {
-    throw new Error('GOOGLE_PLAY_WIF_CONFIG_JSON is missing its credential_source.');
-  }
-  const sourceUrl = (credentialSource as Record<string, unknown>).url;
-  if (typeof sourceUrl !== 'string') {
-    throw new Error('GOOGLE_PLAY_WIF_CONFIG_JSON credential_source URL is invalid.');
-  }
-
-  try {
-    const resource = new URL(sourceUrl).searchParams.get('resource');
-    if (!resource) throw new Error('missing resource');
-    const containerAppsUrl = new URL(identityEndpoint);
-    containerAppsUrl.searchParams.set('resource', resource);
-    containerAppsUrl.searchParams.set('api-version', '2019-08-01');
-    return {
-      ...credentials,
-      credential_source: {
-        ...(credentialSource as Record<string, unknown>),
-        url: containerAppsUrl.toString(),
-        headers: { 'X-IDENTITY-HEADER': identityHeader },
-      },
-    };
-  } catch (error) {
-    throw new Error('Unable to configure Google Play WIF for Azure Container Apps.', { cause: error });
-  }
-}
-
 function parseGooglePlayCredentials(): Record<string, unknown> {
-  const wifConfig = readOptionalEnv('GOOGLE_PLAY_WIF_CONFIG_JSON');
-  const serviceAccount = wifConfig ? undefined : readOptionalEnv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
-  const raw = wifConfig ?? serviceAccount;
-  const variableName = wifConfig ? 'GOOGLE_PLAY_WIF_CONFIG_JSON' : 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON';
+  const raw = readOptionalEnv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
 
   if (!raw) {
-    throw new Error('Google Play authentication is not configured. Set GOOGLE_PLAY_WIF_CONFIG_JSON or GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.');
+    throw new Error('Google Play authentication is not configured. Set GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.');
   }
 
   let value: unknown;
   try {
     value = JSON.parse(raw) as unknown;
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid object');
-    if (wifConfig && (value as Record<string, unknown>).type !== 'external_account') throw new Error('invalid external-account type');
   } catch (error) {
-    throw new Error(`${variableName} is not valid Google Auth configuration JSON.`, { cause: error });
+    throw new Error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is not valid Google Auth configuration JSON.', { cause: error });
   }
-  return wifConfig
-    ? adaptWifCredentialsForAzureContainerApps(value as Record<string, unknown>)
-    : value as Record<string, unknown>;
+  return value as Record<string, unknown>;
 }
 
 function createGooglePlayAuth(): GoogleAuth {
@@ -130,9 +88,8 @@ function createGooglePlayAuth(): GoogleAuth {
 
   // Cloud Run provides short-lived Application Default Credentials for the
   // service identity attached to this revision. Prefer them over the legacy
-  // Azure workload-identity configuration whenever the app is running there.
-  // This keeps Play access keyless and prevents an Azure metadata URL from
-  // breaking purchase verification after a Cloud Run migration.
+  // Cloud Run uses short-lived Application Default Credentials from its
+  // attached service identity, keeping Play verification keyless.
   if (readOptionalEnv('K_SERVICE')) {
     return new GoogleAuth({ scopes });
   }

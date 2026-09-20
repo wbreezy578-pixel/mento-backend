@@ -33,7 +33,7 @@ describe('rate-limit failure safety', () => {
     const envExample = source('.env.example');
 
     expect(envExample).toContain('TRUSTED_PROXY_PROVIDER=cloud-run');
-    expect(envExample).toContain('azure-container-apps, cloud-run, vercel, or none');
+    expect(envExample).toContain('cloud-run, vercel, or none');
     expect(envExample).toContain('Keep this aligned with the current deployment');
   });
 

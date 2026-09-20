@@ -240,9 +240,9 @@ export function loadAndValidateEnvironment(): void {
     validateNonEmpty('REDIS_URL', redisUrl);
 
     const trustedProxyProvider = resolveEnvValue('TRUSTED_PROXY_PROVIDER');
-    const validTrustedProxyProviders = new Set(['azure-container-apps', 'cloud-run', 'vercel', 'none']);
+    const validTrustedProxyProviders = new Set(['cloud-run', 'vercel', 'none']);
     if (!trustedProxyProvider || !validTrustedProxyProviders.has(trustedProxyProvider.trim().toLowerCase())) {
-      throw new Error('Environment variable "TRUSTED_PROXY_PROVIDER" must be set to one of "azure-container-apps", "cloud-run", "vercel", or "none" in production.');
+      throw new Error('Environment variable "TRUSTED_PROXY_PROVIDER" must be set to one of "cloud-run", "vercel", or "none" in production.');
     }
   }
 

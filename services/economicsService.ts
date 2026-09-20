@@ -5,7 +5,7 @@ import { getProductPolicy } from './productPolicy';
 
 export type BillingPlan = 'FREE' | 'PRO';
 export type UsageFeature = 'chat' | 'live_tutor' | 'speech' | 'image' | string;
-export type UsageProvider = 'Gemini' | 'Simli' | 'OpenAI' | 'Azure' | 'ImageGen' | string;
+export type UsageProvider = 'Gemini' | 'Simli' | 'OpenAI' | 'ImageGen' | string;
 
 export interface PlanLimits {
   dailyChatLimit: number;

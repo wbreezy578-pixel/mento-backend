@@ -2,9 +2,9 @@ import { describe, expect, it } from 'vitest';
 import { getRateLimitClientKey, getTrustedClientIp, isHttpsRequestMetadata } from './requestMetadata';
 
 describe('trusted request metadata', () => {
-  it('uses the right-most address supplied by Azure Container Apps', () => {
+  it('uses the right-most address supplied by Cloud Run', () => {
     const headers = new Headers({ 'x-forwarded-for': '203.0.113.5, 198.51.100.20' });
-    expect(getTrustedClientIp(headers, { TRUSTED_PROXY_PROVIDER: 'azure-container-apps' })).toBe('198.51.100.20');
+    expect(getTrustedClientIp(headers, { TRUSTED_PROXY_PROVIDER: 'cloud-run' })).toBe('198.51.100.20');
   });
 
   it('prefers the Vercel-controlled forwarded address', () => {

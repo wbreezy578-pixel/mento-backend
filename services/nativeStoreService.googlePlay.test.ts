@@ -110,22 +110,7 @@ describe('verifyGooglePlayPurchase Google subscriptions', () => {
     setGoogleResponse();
   });
 
-  it('selects WIF configuration when present', async () => {
-    mocks.getRequiredEnv.mockImplementation((name: string) => {
-      if (name === 'GOOGLE_PLAY_WIF_CONFIG_JSON') return '{"type":"external_account","audience":"test"}';
-      if (name === 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON') return '{"type":"service_account"}';
-      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
-    });
-
-    await verifyGooglePlayPurchase(purchase);
-
-    expect(mocks.GoogleAuth).toHaveBeenCalledWith(expect.objectContaining({
-      credentials: { type: 'external_account', audience: 'test' },
-      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
-    }));
-  });
-
-  it('uses the Cloud Run service identity instead of legacy Azure credentials', async () => {
+  it('uses the Cloud Run service identity instead of explicit credentials', async () => {
     mocks.getRequiredEnv.mockImplementation((name: string) => {
       if (name === 'K_SERVICE') return 'mento-backend-migration';
       if (name === 'GOOGLE_PLAY_WIF_CONFIG_JSON') return '{malformed legacy config}';
@@ -137,56 +122,6 @@ describe('verifyGooglePlayPurchase Google subscriptions', () => {
     expect(mocks.GoogleAuth).toHaveBeenCalledWith({
       scopes: ['https://www.googleapis.com/auth/androidpublisher'],
     });
-  });
-
-  it('uses the Container Apps identity endpoint for the Azure WIF subject token', async () => {
-    const wifConfig = {
-      type: 'external_account',
-      audience: 'test',
-      credential_source: {
-        url: 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=api%3A%2F%2Fgoogle-wif-app',
-        headers: { Metadata: 'True' },
-        format: { type: 'json', subject_token_field_name: 'access_token' },
-      },
-    };
-    mocks.getRequiredEnv.mockImplementation((name: string) => {
-      if (name === 'GOOGLE_PLAY_WIF_CONFIG_JSON') return JSON.stringify(wifConfig);
-      if (name === 'IDENTITY_ENDPOINT') return 'http://localhost:42356/msi/token';
-      if (name === 'IDENTITY_HEADER') return 'container-apps-secret-header';
-      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
-    });
-
-    await verifyGooglePlayPurchase(purchase);
-
-    expect(mocks.GoogleAuth).toHaveBeenCalledWith(expect.objectContaining({
-      credentials: expect.objectContaining({
-        type: 'external_account',
-        audience: 'test',
-        credential_source: {
-          url: 'http://localhost:42356/msi/token?resource=api%3A%2F%2Fgoogle-wif-app&api-version=2019-08-01',
-          headers: { 'X-IDENTITY-HEADER': 'container-apps-secret-header' },
-          format: { type: 'json', subject_token_field_name: 'access_token' },
-        },
-      }),
-    }));
-  });
-
-  it('fails closed when Container Apps identity variables are incomplete', async () => {
-    mocks.getRequiredEnv.mockImplementation((name: string) => {
-      if (name === 'GOOGLE_PLAY_WIF_CONFIG_JSON') return JSON.stringify({
-        type: 'external_account',
-        credential_source: {
-          url: 'http://169.254.169.254/metadata/identity/oauth2/token?resource=api%3A%2F%2Fgoogle-wif-app',
-        },
-      });
-      if (name === 'IDENTITY_ENDPOINT') return 'http://localhost:42356/msi/token';
-      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
-    });
-
-    await expect(verifyGooglePlayPurchase(purchase)).rejects.toThrow(
-      'Azure Container Apps managed identity is incompletely configured.',
-    );
-    expect(mocks.GoogleAuth).not.toHaveBeenCalled();
   });
 
   it('falls back to service-account configuration when WIF is absent', async () => {
@@ -203,19 +138,19 @@ describe('verifyGooglePlayPurchase Google subscriptions', () => {
     });
 
     await expect(verifyGooglePlayPurchase(purchase)).rejects.toThrow(
-      'Google Play authentication is not configured. Set GOOGLE_PLAY_WIF_CONFIG_JSON or GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.',
+      'Google Play authentication is not configured. Set GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.',
     );
     expect(mocks.GoogleAuth).not.toHaveBeenCalled();
   });
 
-  it('rejects malformed WIF JSON without contacting Google Auth', async () => {
+  it('rejects malformed service-account JSON without contacting Google Auth', async () => {
     mocks.getRequiredEnv.mockImplementation((name: string) => {
-      if (name === 'GOOGLE_PLAY_WIF_CONFIG_JSON') return '{malformed';
+      if (name === 'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON') return '{malformed';
       throw new Error(`Environment variable "${name}" is required and must not be empty.`);
     });
 
     await expect(verifyGooglePlayPurchase(purchase)).rejects.toThrow(
-      'GOOGLE_PLAY_WIF_CONFIG_JSON is not valid Google Auth configuration JSON.',
+      'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is not valid Google Auth configuration JSON.',
     );
     expect(mocks.GoogleAuth).not.toHaveBeenCalled();
   });

@@ -1,6 +1,6 @@
 # Mento production-readiness checklist
 
-This checklist tracks the release blockers found in the September 2026 backend, mobile, Azure, and Googlebot audit.
+This checklist tracks the release blockers found in the September 2026 backend, mobile, Cloud Run, and Googlebot audit.
 
 ## Phase 0 — Canonical deployment and crawler surface
 
@@ -24,16 +24,16 @@ This checklist tracks the release blockers found in the September 2026 backend, 
 
 - [ ] Commit and push the intended backend and mobile changes without temporary logs or build artifacts.
 - [ ] Deploy the exact backend commit and record its image digest and revision.
-- [ ] Verify Prisma migration status against the Azure database using `DIRECT_URL`.
+- [ ] Verify Prisma migration status against the production database using `DIRECT_URL`.
 - [ ] Smoke-test authentication, normal Gemini chat, image analysis, Live Tutor, and payment callbacks.
 - [ ] Remove or explicitly gate test-only Live Tutor limits and test-user overrides.
 
 ## Phase 3 — Runtime resilience and security
 
 - [ ] Replace or harden in-memory Live Tutor session state for restart and multi-replica recovery.
-- [ ] Move Azure to a deliberate replica/revision strategy with rollback validation.
+- [ ] Validate Cloud Run revision rollback before each production release.
 - [x] Restrict detailed dependency diagnostics to authenticated operators when the metrics token is configured.
-- [x] Limit unauthenticated readiness responses to aggregate status while preserving Azure probe compatibility.
+- [x] Limit unauthenticated readiness responses to aggregate status while preserving runtime probe compatibility.
 - [ ] Add alerts for provider failures, reconnects, audio underruns, stale packets, and failed payments.
 - [ ] Verify backups, restore procedure, secret rotation, and incident rollback.
 

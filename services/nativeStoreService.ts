@@ -125,11 +125,26 @@ function parseGooglePlayCredentials(): Record<string, unknown> {
     : value as Record<string, unknown>;
 }
 
-async function googlePublisherRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  const auth = new GoogleAuth({
+function createGooglePlayAuth(): GoogleAuth {
+  const scopes = ['https://www.googleapis.com/auth/androidpublisher'];
+
+  // Cloud Run provides short-lived Application Default Credentials for the
+  // service identity attached to this revision. Prefer them over the legacy
+  // Azure workload-identity configuration whenever the app is running there.
+  // This keeps Play access keyless and prevents an Azure metadata URL from
+  // breaking purchase verification after a Cloud Run migration.
+  if (readOptionalEnv('K_SERVICE')) {
+    return new GoogleAuth({ scopes });
+  }
+
+  return new GoogleAuth({
     credentials: parseGooglePlayCredentials(),
-    scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    scopes,
   });
+}
+
+async function googlePublisherRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const auth = createGooglePlayAuth();
   const client = await auth.getClient();
   const accessToken = await client.getAccessToken();
   if (!accessToken.token) throw new Error('Unable to authenticate with Google Play Developer API.');

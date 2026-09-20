@@ -125,6 +125,20 @@ describe('verifyGooglePlayPurchase Google subscriptions', () => {
     }));
   });
 
+  it('uses the Cloud Run service identity instead of legacy Azure credentials', async () => {
+    mocks.getRequiredEnv.mockImplementation((name: string) => {
+      if (name === 'K_SERVICE') return 'mento-backend-migration';
+      if (name === 'GOOGLE_PLAY_WIF_CONFIG_JSON') return '{malformed legacy config}';
+      throw new Error(`Environment variable "${name}" is required and must not be empty.`);
+    });
+
+    await verifyGooglePlayPurchase(purchase);
+
+    expect(mocks.GoogleAuth).toHaveBeenCalledWith({
+      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    });
+  });
+
   it('uses the Container Apps identity endpoint for the Azure WIF subject token', async () => {
     const wifConfig = {
       type: 'external_account',

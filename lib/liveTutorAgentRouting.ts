@@ -1,4 +1,6 @@
-const DEFAULT_LIVE_TUTOR_AGENT_NAME = 'mento-live-tutor-staging';
+// Native Live Tutor is a production LiveKit path now.  Keep the worker name
+// server-owned so clients cannot select a different transport or deployment.
+const DEFAULT_LIVE_TUTOR_AGENT_NAME = 'mento-live-tutor-production';
 
 function configuredEmails(): Set<string> {
   return new Set(
@@ -9,21 +11,16 @@ function configuredEmails(): Set<string> {
   );
 }
 
-/**
- * A deliberately narrow, server-owned canary. Clients cannot select an agent;
- * production Cloud routing is enabled only for an explicitly configured user.
- */
 export function resolveLiveTutorAgentNameForUser(email?: string | null): string {
-  const productionAgentName = process.env.LIVE_TUTOR_CLOUD_AGENT_NAME?.trim();
-
-  if (productionAgentName && isLiveTutorCloudCanaryUser(email)) return productionAgentName;
-
-  return DEFAULT_LIVE_TUTOR_AGENT_NAME;
+  // Every normal session uses the stable production worker.  The optional
+  // environment setting is retained for a controlled emergency rollback or
+  // a separately named production deployment, but is never gated by email.
+  return process.env.LIVE_TUTOR_CLOUD_AGENT_NAME?.trim() || DEFAULT_LIVE_TUTOR_AGENT_NAME;
 }
 
 export function isLiveTutorCloudCanaryUser(email?: string | null): boolean {
   const normalizedEmail = email?.trim().toLowerCase();
-  return Boolean(process.env.LIVE_TUTOR_CLOUD_AGENT_NAME?.trim() && normalizedEmail && configuredEmails().has(normalizedEmail));
+  return Boolean(normalizedEmail && configuredEmails().has(normalizedEmail));
 }
 
 export { DEFAULT_LIVE_TUTOR_AGENT_NAME };

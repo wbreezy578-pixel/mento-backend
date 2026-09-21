@@ -56,9 +56,8 @@ const GENUINELY_ACTIVE_STATUS = 'active';
 const RECOVERABLE_STATUSES = ['creating', 'active', 'reconnecting', 'finalizing', 'recovery_required'] as const;
 const TERMINAL_STATUSES = ['completed', 'failed', 'disconnected', 'ended'] as const;
 
-async function closeLiveKitRoomForSession(streamId: string): Promise<void> {
-  const state = await getLiveTutorSessionState(streamId).catch(() => null);
-  const roomName = state?.roomName?.trim();
+export async function closeLiveTutorRoom(roomNameInput: string): Promise<void> {
+  const roomName = roomNameInput.trim();
   const liveKitUrl = process.env.LIVEKIT_URL?.trim();
   const liveKitApiKey = process.env.LIVEKIT_API_KEY?.trim();
   const liveKitApiSecret = process.env.LIVEKIT_API_SECRET?.trim();
@@ -68,18 +67,22 @@ async function closeLiveKitRoomForSession(streamId: string): Promise<void> {
     const host = liveKitUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
     await new RoomServiceClient(host, liveKitApiKey, liveKitApiSecret).deleteRoom(roomName);
     logger.info('[LiveTutorLifecycle] livekit_room_closed', {
-      streamId,
       category: 'live_tutor_livekit_cleanup',
     });
   } catch (error) {
     // Room deletion is best-effort: billing finalization must still complete
     // if the room has already disappeared or LiveKit is temporarily unavailable.
     logger.warn('[LiveTutorLifecycle] livekit_room_close_failed', {
-      streamId,
       category: 'live_tutor_livekit_cleanup',
       error: sanitizeForLogging(error),
     });
   }
+}
+
+async function closeLiveKitRoomForSession(streamId: string): Promise<void> {
+  const state = await getLiveTutorSessionState(streamId).catch(() => null);
+  const roomName = state?.roomName?.trim();
+  if (roomName) await closeLiveTutorRoom(roomName);
 }
 
 export type LiveTutorFinalizationTiming = 'active_end' | 'inactivity_end' | 'transport_recovery_end';

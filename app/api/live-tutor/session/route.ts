@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { LiveKitAPI } from 'livekit-server-sdk';
 import { prisma } from '../../../../lib/prisma';
 // Match your exact original exports from simliService
-import { claimLiveTutorSession, completeSimliSessionLifecycle, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
+import { claimLiveTutorSession, closeLiveTutorRoom, completeSimliSessionLifecycle, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
 import { createLiveTutorSimliLiveKitAvatarSession, getLiveTutorSimliLiveKitConfig, SimliLiveKitAttachmentError, type LiveTutorSimliLiveKitAvatarSession } from '../../../../services/liveTutorSimliLiveKitAvatarSession';
 import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE } from '../../../../services/liveTutorVoiceProfiles';
 import { resolveLiveTutorVoiceProfile } from '../../../../services/liveTutorVoiceProfiles';
@@ -56,6 +56,7 @@ export async function GET(req: Request) {
   let cleanupStreamId: string | undefined;
   let capacityReservationRequestId: string | undefined;
   let capacityReservationStreamId: string | undefined;
+  let liveKitSession: LiveTutorSimliLiveKitAvatarSession | undefined;
   const routePhaseStart = Date.now();
   const phaseTimers = new Map<string, number>();
   const markPhase = (name: string) => {
@@ -266,7 +267,6 @@ export async function GET(req: Request) {
       : await createLiveTutorConversation(user.id);
     const simliCreateStartedAt = Date.now();
     let session: SimliStreamingSession;
-    let liveKitSession: LiveTutorSimliLiveKitAvatarSession | undefined;
     let liveKitUrl: string | undefined;
 
     if (avatarTransport.transport === LIVE_TUTOR_AVATAR_TRANSPORTS.liveKit) {
@@ -449,6 +449,12 @@ export async function GET(req: Request) {
     });
     return NextResponse.json(responsePayload);
   } catch (error: unknown) {
+    // If provider setup succeeded but a later handoff failed, the durable
+    // Redis lease may not exist yet. Close the room directly so the remote
+    // Simli attachment cannot linger and consume the provider slot.
+    if (liveKitSession?.roomName) {
+      await closeLiveTutorRoom(liveKitSession.roomName).catch(() => undefined);
+    }
     const errorRequestId = claimedRequestId;
     if (capacityReservationRequestId) {
       await releaseLiveTutorSessionCapacity(capacityReservationRequestId).catch(() => undefined);

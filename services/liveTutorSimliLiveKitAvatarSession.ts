@@ -33,11 +33,14 @@ type PhaseThreeDependencies = {
 
 export class SimliLiveKitAttachmentError extends Error {
   readonly status: number;
+  /** A short provider reason suitable for application logs; never includes tokens. */
+  readonly providerReason: string | null;
 
-  constructor(status: number) {
-    super(`Simli LiveKit attachment failed with status ${status}.`);
+  constructor(status: number, providerReason: string | null = null) {
+    super(`Simli LiveKit attachment failed with status ${status}${providerReason ? ` (${providerReason})` : ''}.`);
     this.name = 'SimliLiveKitAttachmentError';
     this.status = status;
+    this.providerReason = providerReason;
   }
 }
 
@@ -78,6 +81,24 @@ async function readJson(response: Response, label: string): Promise<Record<strin
   return parsed as Record<string, unknown>;
 }
 
+function safeProviderReason(body: string): string | null {
+  // Providers sometimes echo an invalid credential or a signed URL in an
+  // error body. Only retain a concise, non-secret diagnostic category.
+  let parsed: unknown;
+  try {
+    parsed = body ? JSON.parse(body) : null;
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const candidate = (parsed as Record<string, unknown>).code
+    ?? (parsed as Record<string, unknown>).error_code
+    ?? (parsed as Record<string, unknown>).error;
+  if (typeof candidate !== 'string') return null;
+  const normalized = candidate.trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9_.-]{0,79}$/.test(normalized) ? normalized : null;
+}
+
 function retryDelayMs(response: Response, attempt: number): number {
   const retryAfterSeconds = Number(response.headers.get('retry-after'));
   if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
@@ -90,13 +111,13 @@ async function attachSimliToLiveKit(
   request: typeof fetch,
   wait: (delayMs: number) => Promise<void>,
   url: string,
-  body: Record<string, string>,
+  requestBody: Record<string, string>,
 ): Promise<void> {
   for (let attempt = 1; attempt <= SIMLI_ATTACHMENT_MAX_ATTEMPTS; attempt += 1) {
     const response = await request(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(requestBody),
     });
     if (response.ok) {
       await readJson(response, 'Simli LiveKit attachment');
@@ -112,14 +133,18 @@ async function attachSimliToLiveKit(
       continue;
     }
 
-    await response.text();
-    throw new SimliLiveKitAttachmentError(response.status);
+    const errorBody = await response.text();
+    throw new SimliLiveKitAttachmentError(response.status, safeProviderReason(errorBody));
   }
 }
 
 export function getLiveTutorSimliLiveKitConfig(options: Pick<LiveTutorSimliLiveKitConfig, 'roomName' | 'agentIdentity' | 'subscriberIdentity'>): LiveTutorSimliLiveKitConfig {
+  const liveKitUrl = present(process.env.LIVEKIT_URL, 'LIVEKIT_URL');
+  if (!/^wss:\/\/[^/\s]+(?:\/[^\s]*)?$/i.test(liveKitUrl)) {
+    throw new Error('LIVEKIT_URL must be a public wss:// URL for the Simli LiveKit integration.');
+  }
   return {
-    liveKitUrl: present(process.env.LIVEKIT_URL, 'LIVEKIT_URL'),
+    liveKitUrl,
     liveKitApiKey: present(process.env.LIVEKIT_API_KEY, 'LIVEKIT_API_KEY'),
     liveKitApiSecret: present(process.env.LIVEKIT_API_SECRET, 'LIVEKIT_API_SECRET'),
     simliApiKey: present(process.env.SIMLI_API_KEY, 'SIMLI_API_KEY'),

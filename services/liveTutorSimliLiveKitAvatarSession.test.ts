@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createLiveTutorSimliLiveKitAvatarSession } from './liveTutorSimliLiveKitAvatarSession';
+import { createLiveTutorSimliLiveKitAvatarSession, getLiveTutorSimliLiveKitConfig } from './liveTutorSimliLiveKitAvatarSession';
 
 function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -67,6 +67,24 @@ describe('Live Tutor Simli LiveKit avatar session', () => {
     await expect(createLiveTutorSimliLiveKitAvatarSession(config, undefined, {
       fetch: request,
     })).rejects.toThrow('Simli LiveKit attachment failed with status 503.');
+  });
+
+  it('keeps a safe provider error code but never logs a free-form provider message', async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce(response({ session_token: 'simli-session-token' }))
+      .mockResolvedValueOnce(response({ code: 'INVALID_LIVEKIT_URL', message: 'token=do-not-log' }, 400)) as unknown as typeof fetch;
+
+    await expect(createLiveTutorSimliLiveKitAvatarSession(config, undefined, {
+      fetch: request,
+    })).rejects.toMatchObject({ status: 400, providerReason: 'invalid_livekit_url' });
+  });
+
+  it('requires a public secure LiveKit URL in runtime configuration', () => {
+    const previous = process.env.LIVEKIT_URL;
+    process.env.LIVEKIT_URL = 'http://127.0.0.1:7880';
+    expect(() => getLiveTutorSimliLiveKitConfig({ roomName: 'room', agentIdentity: 'agent', subscriberIdentity: 'subscriber' }))
+      .toThrow('LIVEKIT_URL must be a public wss:// URL');
+    process.env.LIVEKIT_URL = previous;
   });
 
   it('retries a throttled attachment using the same Simli session', async () => {

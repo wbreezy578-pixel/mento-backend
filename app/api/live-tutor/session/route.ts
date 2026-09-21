@@ -432,6 +432,11 @@ export async function GET(req: Request) {
       category: isUnavailable ? 'provider_unavailable' : 'session_error',
       message: isUnavailable ? 'Simli unavailable' : 'Session error',
       error: message,
+      ...(error instanceof SimliLiveKitAttachmentError ? {
+        provider: 'simli_livekit',
+        providerStatus: error.status,
+        providerReason: error.providerReason,
+      } : {}),
     });
 
     const userMessage = isSimliThrottled

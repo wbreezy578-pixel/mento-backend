@@ -79,6 +79,49 @@ describe('Live Tutor Redis leases', () => {
     );
   });
 
+  it('uses the safe one-session capacity default and accepts an explicit provider upgrade', async () => {
+    const { getLiveTutorCapacityConfig } = await import('./realtimeRedis');
+
+    expect(getLiveTutorCapacityConfig()).toEqual({
+      maxConcurrentSessions: 1,
+      maxConcurrentAvatarStarts: 1,
+    });
+
+    vi.stubEnv('LIVE_TUTOR_MAX_CONCURRENT_SESSIONS', '50');
+    vi.stubEnv('LIVE_TUTOR_MAX_CONCURRENT_AVATAR_STARTS', '5');
+    expect(getLiveTutorCapacityConfig()).toEqual({
+      maxConcurrentSessions: 50,
+      maxConcurrentAvatarStarts: 5,
+    });
+  });
+
+  it('reserves session capacity in a shared Redis key before a provider call', async () => {
+    evalCommand.mockResolvedValue(1);
+    const { reserveLiveTutorSessionCapacity, transferLiveTutorSessionCapacity } = await import('./realtimeRedis');
+
+    await expect(reserveLiveTutorSessionCapacity('request-123')).resolves.toBe(true);
+    expect(evalCommand).toHaveBeenLastCalledWith(
+      expect.any(String),
+      1,
+      'live-tutor:capacity:{global}:sessions',
+      expect.any(String),
+      expect.any(String),
+      '50',
+      'pending:request-123',
+    );
+
+    await expect(transferLiveTutorSessionCapacity('request-123', 'stream-123')).resolves.toBe(true);
+    expect(evalCommand).toHaveBeenLastCalledWith(
+      expect.any(String),
+      1,
+      'live-tutor:capacity:{global}:sessions',
+      expect.any(String),
+      expect.any(String),
+      'pending:request-123',
+      'stream:stream-123',
+    );
+  });
+
   it('keeps the HTTP server available when production realtime Redis is unavailable', async () => {
     vi.stubEnv('NODE_ENV', 'production');
     ping.mockRejectedValue(new Error('Redis unavailable'));

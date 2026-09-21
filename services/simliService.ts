@@ -9,7 +9,12 @@ import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE, type LiveTutorVoiceProfile } from './
 import '../lib/metrics';
 import { clampLiveTutorExpiry, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from '../lib/liveTutorLimits';
 import { resolveLiveTutorFinalizationUsage } from './liveTutorSessionBilling';
-import { acquireLiveTutorSessionLease, releaseLiveTutorSessionLease } from '../lib/realtimeRedis';
+import {
+  acquireLiveTutorSessionLease,
+  refreshLiveTutorSessionCapacity,
+  releaseActiveLiveTutorSessionCapacity,
+  releaseLiveTutorSessionLease,
+} from '../lib/realtimeRedis';
 import { recordLiveTutorMinutesDeducted } from '../lib/metrics';
 
 export interface SimliStreamingSession {
@@ -571,6 +576,14 @@ export async function markSessionActivity(streamId: string, userId: string, repo
       error: sanitizeForLogging(error),
     });
   });
+  await refreshLiveTutorSessionCapacity(streamId).catch((error) => {
+    logger.warn('[LiveTutorLifecycle] shared session capacity refresh failed', {
+      streamId,
+      userId,
+      category: 'live_tutor_realtime_redis',
+      error: sanitizeForLogging(error),
+    });
+  });
   if (!session) return true;
 
   const nextSession: SessionRecord = {
@@ -798,6 +811,14 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
   await closeRealtimeSession(streamId);
   await releaseLiveTutorSessionLease(streamId).catch((error) => {
     logger.warn('[LiveTutorLifecycle] shared session lease release failed', {
+      streamId,
+      userId: durable.userId,
+      category: 'live_tutor_realtime_redis',
+      error: sanitizeForLogging(error),
+    });
+  });
+  await releaseActiveLiveTutorSessionCapacity(streamId).catch((error) => {
+    logger.warn('[LiveTutorLifecycle] shared session capacity release failed', {
       streamId,
       userId: durable.userId,
       category: 'live_tutor_realtime_redis',

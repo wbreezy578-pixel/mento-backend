@@ -1,9 +1,17 @@
 import { getRedisUrl } from './env';
+import { LIVE_TUTOR_MAX_SESSION_SECONDS } from './liveTutorLimits';
 import logger from './logger';
 import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REALTIME_LEASE_TTL_SECONDS = 30;
 const LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS = 120;
+// These are deliberately conservative defaults for Simli's current Free plan.
+// Raising them is a backend configuration change made only after the matching
+// Simli plan is active; mobile clients never control provider capacity.
+const DEFAULT_MAX_CONCURRENT_LIVE_TUTOR_SESSIONS = 1;
+const DEFAULT_MAX_CONCURRENT_AVATAR_STARTS = 1;
+const LIVE_TUTOR_CAPACITY_SESSION_TTL_SECONDS = LIVE_TUTOR_MAX_SESSION_SECONDS + LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS;
+const LIVE_TUTOR_AVATAR_START_TTL_SECONDS = 180;
 const REDIS_STARTUP_ATTEMPTS = 4;
 const REDIS_STARTUP_RETRY_DELAYS_MS = [750, 1_500, 3_000];
 const isBuild = process.env.MENTO_BUILD === '1';
@@ -36,6 +44,123 @@ function liveTutorSessionLeaseKey(streamId: string): string {
 
 function liveTutorSessionStateKey(streamId: string): string {
   return `live-tutor:{${streamId}}:session`;
+}
+
+function liveTutorCapacityKey(kind: 'sessions' | 'avatar-starts'): string {
+  // The shared hash tag keeps the key cluster-safe while allowing every Cloud
+  // Run replica to enforce one global Simli admission limit.
+  return `live-tutor:capacity:{global}:${kind}`;
+}
+
+function configuredPositiveInteger(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function getLiveTutorCapacityConfig(): {
+  maxConcurrentSessions: number;
+  maxConcurrentAvatarStarts: number;
+} {
+  return {
+    maxConcurrentSessions: configuredPositiveInteger(
+      'LIVE_TUTOR_MAX_CONCURRENT_SESSIONS',
+      DEFAULT_MAX_CONCURRENT_LIVE_TUTOR_SESSIONS,
+    ),
+    maxConcurrentAvatarStarts: configuredPositiveInteger(
+      'LIVE_TUTOR_MAX_CONCURRENT_AVATAR_STARTS',
+      DEFAULT_MAX_CONCURRENT_AVATAR_STARTS,
+    ),
+  };
+}
+
+async function reserveLiveTutorCapacitySlot(
+  kind: 'sessions' | 'avatar-starts',
+  member: string,
+  maximum: number,
+  ttlSeconds: number,
+): Promise<boolean> {
+  const client = assertRedisAvailable();
+  if (!client) return true;
+  const now = Date.now();
+  const reserved = await client.eval(
+    "local now = tonumber(ARGV[1]); local expiresAt = tonumber(ARGV[2]); local maximum = tonumber(ARGV[3]); local member = ARGV[4]; redis.call('zremrangebyscore', KEYS[1], '-inf', now); if redis.call('zscore', KEYS[1], member) then redis.call('zadd', KEYS[1], expiresAt, member); return 1 end; if redis.call('zcard', KEYS[1]) >= maximum then return 0 end; redis.call('zadd', KEYS[1], expiresAt, member); return 1",
+    1,
+    liveTutorCapacityKey(kind),
+    String(now),
+    String(now + ttlSeconds * 1000),
+    String(maximum),
+    member,
+  );
+  return Number(reserved) === 1;
+}
+
+async function releaseLiveTutorCapacitySlot(kind: 'sessions' | 'avatar-starts', member: string): Promise<void> {
+  const client = assertRedisAvailable();
+  if (!client) return;
+  await client.eval("return redis.call('zrem', KEYS[1], ARGV[1])", 1, liveTutorCapacityKey(kind), member);
+}
+
+export async function reserveLiveTutorSessionCapacity(requestId: string): Promise<boolean> {
+  const { maxConcurrentSessions } = getLiveTutorCapacityConfig();
+  return reserveLiveTutorCapacitySlot(
+    'sessions',
+    `pending:${requestId}`,
+    maxConcurrentSessions,
+    LIVE_TUTOR_CAPACITY_SESSION_TTL_SECONDS,
+  );
+}
+
+export async function transferLiveTutorSessionCapacity(requestId: string, streamId: string): Promise<boolean> {
+  const client = assertRedisAvailable();
+  if (!client) return true;
+  const now = Date.now();
+  const transferred = await client.eval(
+    "local now = tonumber(ARGV[1]); local expiresAt = tonumber(ARGV[2]); local pending = ARGV[3]; local active = ARGV[4]; redis.call('zremrangebyscore', KEYS[1], '-inf', now); if not redis.call('zscore', KEYS[1], pending) then return 0 end; redis.call('zrem', KEYS[1], pending); redis.call('zadd', KEYS[1], expiresAt, active); return 1",
+    1,
+    liveTutorCapacityKey('sessions'),
+    String(now),
+    String(now + LIVE_TUTOR_CAPACITY_SESSION_TTL_SECONDS * 1000),
+    `pending:${requestId}`,
+    `stream:${streamId}`,
+  );
+  return Number(transferred) === 1;
+}
+
+export async function refreshLiveTutorSessionCapacity(streamId: string): Promise<boolean> {
+  const client = assertRedisAvailable();
+  if (!client) return true;
+  const now = Date.now();
+  const refreshed = await client.eval(
+    "local now = tonumber(ARGV[1]); local expiresAt = tonumber(ARGV[2]); redis.call('zremrangebyscore', KEYS[1], '-inf', now); if not redis.call('zscore', KEYS[1], ARGV[3]) then return 0 end; redis.call('zadd', KEYS[1], expiresAt, ARGV[3]); return 1",
+    1,
+    liveTutorCapacityKey('sessions'),
+    String(now),
+    String(now + LIVE_TUTOR_CAPACITY_SESSION_TTL_SECONDS * 1000),
+    `stream:${streamId}`,
+  );
+  return Number(refreshed) === 1;
+}
+
+export async function releaseLiveTutorSessionCapacity(requestId: string): Promise<void> {
+  await releaseLiveTutorCapacitySlot('sessions', `pending:${requestId}`);
+}
+
+export async function releaseActiveLiveTutorSessionCapacity(streamId: string): Promise<void> {
+  await releaseLiveTutorCapacitySlot('sessions', `stream:${streamId}`);
+}
+
+export async function reserveLiveTutorAvatarStartCapacity(requestId: string): Promise<boolean> {
+  const { maxConcurrentAvatarStarts } = getLiveTutorCapacityConfig();
+  return reserveLiveTutorCapacitySlot(
+    'avatar-starts',
+    `request:${requestId}`,
+    maxConcurrentAvatarStarts,
+    LIVE_TUTOR_AVATAR_START_TTL_SECONDS,
+  );
+}
+
+export async function releaseLiveTutorAvatarStartCapacity(requestId: string): Promise<void> {
+  await releaseLiveTutorCapacitySlot('avatar-starts', `request:${requestId}`);
 }
 
 export function getLiveTutorSessionLeaseOwner(streamId: string): string {

@@ -23,7 +23,15 @@ import { validateLiveTutorVoiceProviderHandshake } from '../../../../services/li
 import { getProductPolicy } from '../../../../services/productPolicy';
 import { canUseLiveTutor } from '../../../../services/liveTutorBillingService';
 import { resolveLiveTutorAgentNameForUser } from '../../../../lib/liveTutorAgentRouting';
-import { acquireLiveTutorSessionLease } from '../../../../lib/realtimeRedis';
+import {
+  acquireLiveTutorSessionLease,
+  releaseActiveLiveTutorSessionCapacity,
+  releaseLiveTutorAvatarStartCapacity,
+  releaseLiveTutorSessionCapacity,
+  reserveLiveTutorAvatarStartCapacity,
+  reserveLiveTutorSessionCapacity,
+  transferLiveTutorSessionCapacity,
+} from '../../../../lib/realtimeRedis';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -46,6 +54,8 @@ export async function GET(req: Request) {
   const lifecycleTraceId = randomUUID().replaceAll('-', '');
   let claimedUserId: string | undefined;
   let cleanupStreamId: string | undefined;
+  let capacityReservationRequestId: string | undefined;
+  let capacityReservationStreamId: string | undefined;
   const routePhaseStart = Date.now();
   const phaseTimers = new Map<string, number>();
   const markPhase = (name: string) => {
@@ -220,6 +230,29 @@ export async function GET(req: Request) {
       });
     }
 
+    // Simli's plan is a global provider limit, not a per-phone limit. Reserve
+    // a slot in Redis before an avatar is created so Cloud Run replicas cannot
+    // race each other into provider throttling. This happens before minutes
+    // are reserved, so a busy service never charges a user for a failed start.
+    const capacityReserved = await reserveLiveTutorSessionCapacity(requestId);
+    if (!capacityReserved) {
+      await releaseLiveTutorSessionClaim(user.id, requestId);
+      claimedRequestId = undefined;
+      cleanupStreamId = undefined;
+      logger.info('Live Tutor global session capacity reached', {
+        category: 'live_tutor_capacity_full',
+      });
+      return NextResponse.json(
+        {
+          error: 'All Live Tutor sessions are in use right now. Please try again shortly.',
+          code: 'live_tutor_capacity_full',
+          retryable: true,
+        },
+        { status: 503, headers: { 'Retry-After': '30' } },
+      );
+    }
+    capacityReservationRequestId = requestId;
+
     const authorizedSeconds = Math.min(
       maxSessionSeconds,
       Math.max(0, billingDecision.remainingUsage ?? 0),
@@ -243,10 +276,40 @@ export async function GET(req: Request) {
         subscriberIdentity: `mento-live-tutor-subscriber-${user.id}`,
       });
       liveKitUrl = liveKitConfig.liveKitUrl;
-      liveKitSession = await createLiveTutorSimliLiveKitAvatarSession({
-        ...liveKitConfig,
-        maxSessionLength: authorizedSeconds,
+      const avatarStartReserved = await reserveLiveTutorAvatarStartCapacity(requestId);
+      if (!avatarStartReserved) {
+        const error = new Error('Live Tutor avatar startup capacity is currently full.') as Error & { status?: number };
+        error.status = 503;
+        throw error;
+      }
+      try {
+        liveKitSession = await createLiveTutorSimliLiveKitAvatarSession({
+          ...liveKitConfig,
+          maxSessionLength: authorizedSeconds,
+        });
+      } finally {
+        await releaseLiveTutorAvatarStartCapacity(requestId).catch(() => undefined);
+      }
+
+      // Make the durable session visible before transferring its global slot.
+      // If the following steps fail, lifecycle finalization releases the slot.
+      cleanupStreamId = liveKitSession.streamId;
+      await prisma.liveTutorSession.updateMany({
+        where: { userId: user.id, streamId: `pending-${requestId}` },
+        data: {
+          streamId: liveKitSession.streamId,
+          status: 'active',
+          expiresAt: serverSessionExpiresAt,
+          secondsReserved: authorizedSeconds,
+          lastActivityAt: new Date(),
+        },
       });
+      const capacityTransferred = await transferLiveTutorSessionCapacity(requestId, liveKitSession.streamId);
+      if (!capacityTransferred) {
+        throw new Error('Live Tutor capacity reservation expired before session startup completed.');
+      }
+      capacityReservationRequestId = undefined;
+      capacityReservationStreamId = liveKitSession.streamId;
 
       const liveKitApi = new LiveKitAPI({
         host: liveKitConfig.liveKitUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:'),
@@ -272,16 +335,6 @@ export async function GET(req: Request) {
         simliLiveKitAttachMs: liveKitSession.startupTimings.simliLiveKitAttachMs,
         tokenPreparationMs: liveKitSession.startupTimings.tokenPreparationMs,
         category: 'live_tutor_livekit_agent_dispatch',
-      });
-      await prisma.liveTutorSession.updateMany({
-        where: { userId: user.id, streamId: `pending-${requestId}` },
-        data: {
-          streamId: liveKitSession.streamId,
-          status: 'active',
-          expiresAt: serverSessionExpiresAt,
-          secondsReserved: authorizedSeconds,
-          lastActivityAt: new Date(),
-        },
       });
       const leaseAcquired = await acquireLiveTutorSessionLease(liveKitSession.streamId, {
         userId: user.id,
@@ -397,6 +450,12 @@ export async function GET(req: Request) {
     return NextResponse.json(responsePayload);
   } catch (error: unknown) {
     const errorRequestId = claimedRequestId;
+    if (capacityReservationRequestId) {
+      await releaseLiveTutorSessionCapacity(capacityReservationRequestId).catch(() => undefined);
+    }
+    if (capacityReservationStreamId) {
+      await releaseActiveLiveTutorSessionCapacity(capacityReservationStreamId).catch(() => undefined);
+    }
     if (claimedUserId && cleanupStreamId) {
       await completeSimliSessionLifecycle(cleanupStreamId, {
         status: 'failed',
@@ -424,13 +483,14 @@ export async function GET(req: Request) {
 
     const message = error instanceof Error ? error.message : 'Internal Server Error';
     const status = (error as { status?: number })?.status ?? 500;
+    const isCapacityFull = status === 503 && message.includes('capacity');
     const isSimliThrottled = error instanceof SimliLiveKitAttachmentError && error.status === 429;
-    const isUnavailable = isSimliThrottled || Boolean(message && (message.includes('temporarily unavailable') || message.includes('circuit')));
+    const isUnavailable = isCapacityFull || isSimliThrottled || Boolean(message && (message.includes('temporarily unavailable') || message.includes('circuit')));
 
     logger.error('Live Tutor session initialization failed', {
       status,
-      category: isUnavailable ? 'provider_unavailable' : 'session_error',
-      message: isUnavailable ? 'Simli unavailable' : 'Session error',
+      category: isCapacityFull ? 'live_tutor_capacity_full' : isUnavailable ? 'provider_unavailable' : 'session_error',
+      message: isCapacityFull ? 'Live Tutor capacity full' : isUnavailable ? 'Simli unavailable' : 'Session error',
       error: message,
       ...(error instanceof SimliLiveKitAttachmentError ? {
         provider: 'simli_livekit',
@@ -439,7 +499,7 @@ export async function GET(req: Request) {
       } : {}),
     });
 
-    const userMessage = isSimliThrottled
+    const userMessage = isCapacityFull || isSimliThrottled
       ? 'Live Tutor is busy right now. Please wait a moment before trying again.'
       : isUnavailable
       ? 'Live Tutor is temporarily unavailable. Please try again in a moment.'

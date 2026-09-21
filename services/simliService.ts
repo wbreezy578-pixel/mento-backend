@@ -9,6 +9,8 @@ import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE, type LiveTutorVoiceProfile } from './
 import '../lib/metrics';
 import { clampLiveTutorExpiry, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_SESSION_SECONDS } from '../lib/liveTutorLimits';
 import { resolveLiveTutorFinalizationUsage } from './liveTutorSessionBilling';
+import { acquireLiveTutorSessionLease, releaseLiveTutorSessionLease } from '../lib/realtimeRedis';
+import { recordLiveTutorMinutesDeducted } from '../lib/metrics';
 
 export interface SimliStreamingSession {
   token: string;
@@ -39,7 +41,6 @@ const simliProviderOptions = getProviderRetryOptions('simli');
 
 const activeSessions = new Map<string, SessionRecord>();
 const terminalFinalizations = new Map<string, Promise<void>>();
-const LIVE_TUTOR_PROCESS_ID = `live-tutor-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 const INACTIVITY_TIMEOUT_MS = LIVE_TUTOR_INACTIVITY_TIMEOUT_MS;
 const MAX_SESSION_SECONDS = LIVE_TUTOR_MAX_SESSION_SECONDS;
@@ -261,7 +262,6 @@ export async function claimLiveTutorSession(userId: string, requestId: string, a
         expiresAt: new Date(now.getTime() + MAX_SESSION_SECONDS * 1000),
         secondsConsumed: 0,
         billingFinalized: false,
-        ownerProcessId: LIVE_TUTOR_PROCESS_ID,
         finalizationStartedAt: null,
         terminalStatus: null,
         terminalReason: null,
@@ -276,7 +276,6 @@ export async function claimLiveTutorSession(userId: string, requestId: string, a
         createdAt: now,
         lastActivityAt: now,
         expiresAt: new Date(now.getTime() + MAX_SESSION_SECONDS * 1000),
-        ownerProcessId: LIVE_TUTOR_PROCESS_ID,
       },
     });
 
@@ -427,7 +426,7 @@ export async function createSimliStreamingAvatarSession(options: {
     });
     await prisma.liveTutorSession.update({
       where: { userId: options.userId },
-      data: { streamId: sessionInfo.streamId, avatarVoiceProfile: options.avatarVoiceProfile ?? DEFAULT_LIVE_TUTOR_VOICE_PROFILE, status: 'active', ownerProcessId: LIVE_TUTOR_PROCESS_ID, finalizationStartedAt: null, lastActivityAt: new Date(now), expiresAt: new Date(sessionInfo.expiresAt), secondsReserved: options.secondsReserved },
+      data: { streamId: sessionInfo.streamId, avatarVoiceProfile: options.avatarVoiceProfile ?? DEFAULT_LIVE_TUTOR_VOICE_PROFILE, status: 'active', finalizationStartedAt: null, lastActivityAt: new Date(now), expiresAt: new Date(sessionInfo.expiresAt), secondsReserved: options.secondsReserved },
     });
     logStatusTransition({ streamId: sessionInfo.streamId, userId: options.userId ?? 'unknown', previousStatus: 'creating', resultingStatus: 'active', reason: 'simli_session_created' });
     simliBreaker.recordSuccess();
@@ -557,6 +556,20 @@ export async function markSessionActivity(streamId: string, userId: string, repo
   await prisma.liveTutorSession.updateMany({
     where: { streamId, userId, status: 'active', billingFinalized: false },
     data: { lastActivityAt: now, secondsConsumed },
+  });
+  // LiveKit media runs outside this Node process. Renew its shared lease from
+  // whichever Cloud Run replica receives the authenticated heartbeat.
+  await acquireLiveTutorSessionLease(streamId, {
+    userId,
+    status: 'active',
+    secondsConsumed: String(secondsConsumed),
+  }).catch((error) => {
+    logger.warn('[LiveTutorLifecycle] shared session lease refresh failed', {
+      streamId,
+      userId,
+      category: 'live_tutor_realtime_redis',
+      error: sanitizeForLogging(error),
+    });
   });
   if (!session) return true;
 
@@ -750,6 +763,8 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
           pending: true,
           secondsUsed: finalizationUsage.chargedSeconds,
         });
+        // Count only minutes that were committed by the durable billing layer.
+        recordLiveTutorMinutesDeducted(finalizationUsage.chargedSeconds, options.status);
       }
 
       const updatedSession = getSession(streamId);
@@ -781,6 +796,14 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
   }
 
   await closeRealtimeSession(streamId);
+  await releaseLiveTutorSessionLease(streamId).catch((error) => {
+    logger.warn('[LiveTutorLifecycle] shared session lease release failed', {
+      streamId,
+      userId: durable.userId,
+      category: 'live_tutor_realtime_redis',
+      error: sanitizeForLogging(error),
+    });
+  });
   logger.info('Simli realtime session closed', {
     provider: 'simli',
     streamId,
@@ -816,8 +839,6 @@ export async function recoverDurableLiveTutorSessions(reason = 'Server startup r
         {
           status: { in: ['creating', 'active', 'reconnecting'] },
           OR: [
-            { ownerProcessId: null },
-            { ownerProcessId: { not: LIVE_TUTOR_PROCESS_ID } },
             { lastActivityAt: { lt: staleFinalizationBefore } },
             { expiresAt: { lte: now } },
           ],

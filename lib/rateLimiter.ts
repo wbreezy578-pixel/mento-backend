@@ -4,6 +4,7 @@ import logger from './logger';
 import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REDIS_URL = getRedisUrl();
+const isBuild = process.env.MENTO_BUILD === '1';
 // Redis is the preferred cross-instance limiter. It is opt-in as a strict
 // dependency so a short Redis outage cannot turn into a full application
 // outage. When strict mode is off, the bounded per-instance limiter below
@@ -39,7 +40,7 @@ function distributedLimiterUnavailable(type: 'cooldown' | 'sliding' | 'daily') {
   rateLimitHits.inc({ type: outageType });
 }
 
-if (REDIS_URL) {
+if (REDIS_URL && !isBuild) {
   try {
     redis = createRedisClient(REDIS_URL);
     // Define a Lua-backed atomic sliding window command for accuracy under concurrency

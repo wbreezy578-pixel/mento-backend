@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "tsx server.ts --dev",
-    "build": "prisma generate && next build",
+    "build": "node scripts/buildWithBuildEnv.mjs",
     "postinstall": "prisma generate",
     "migrate:deploy": "prisma migrate deploy",
     "start": "tsx server.ts",
@@ -12,8 +12,8 @@
     "typecheck": "tsc --noEmit --incremental false",
     "test": "vitest run && node --import tsx --test app/lib/auth.test.ts app/lib/accountDeletion.test.ts",
     "test-account:grant-live-tutor": "tsx scripts/grantLiveTutorTestAccess.ts",
-    "validate:livekit-poc": "tsx scripts/validateLiveTutorLiveKitPublisher.ts",
-    "validate:livekit-simli-poc": "tsx scripts/validateLiveTutorSimliLiveKitAvatar.ts"
+    "validate:livekit": "tsx scripts/validateLiveTutorLiveKitPublisher.ts",
+    "validate:livekit-simli": "tsx scripts/validateLiveTutorSimliLiveKitAvatar.ts"
   },
   "dependencies": {
     "@apple/app-store-server-library": "^3.1.0",

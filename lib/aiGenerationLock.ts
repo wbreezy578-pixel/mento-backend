@@ -6,12 +6,13 @@ const GENERATION_LOCK_TTL_MS = Math.max(30_000, Number.parseInt(process.env.AI_G
 const GENERATION_LOCK_RENEW_MS = Math.max(5_000, Math.min(Math.floor(GENERATION_LOCK_TTL_MS / 3), Number.parseInt(process.env.AI_GENERATION_LOCK_RENEW_MS ?? '30000', 10)));
 const GENERATION_LOCK_RENEW_TIMEOUT_MS = Math.max(1_000, Number.parseInt(process.env.AI_GENERATION_LOCK_RENEW_TIMEOUT_MS ?? '5000', 10));
 const GENERATION_OPERATION_DEADLINE_MS = Math.max(GENERATION_LOCK_TTL_MS, Number.parseInt(process.env.AI_GENERATION_OPERATION_DEADLINE_MS ?? '240000', 10));
-const requireRedis = process.env.REQUIRE_RATE_LIMIT_REDIS === 'true' || process.env.NODE_ENV === 'production';
+const isBuild = process.env.MENTO_BUILD === '1';
+const requireRedis = !isBuild && (process.env.REQUIRE_RATE_LIMIT_REDIS === 'true' || process.env.NODE_ENV === 'production');
 const redisUrl = getRedisUrl();
 let redis: MentoRedisClient | null = null;
 const localLocks = new Map<string, { ownerId: string; expiresAt: number }>();
 
-if (redisUrl) {
+if (redisUrl && !isBuild) {
   redis = createRedisClient(redisUrl);
   redis.on('error', (error) => logger.warn('AI generation lock Redis error', {
     message: error.message,

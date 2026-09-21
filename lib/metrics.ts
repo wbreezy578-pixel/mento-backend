@@ -20,6 +20,9 @@ type MetricsState = {
   monitoringLatency: client.Histogram<'metric' | 'provider' | 'route' | 'operation' | 'feature'>;
   monitoringFailures: client.Counter<'metric' | 'provider' | 'route' | 'operation' | 'feature' | 'status' | 'source' | 'reason'>;
   liveTutorVoiceLatency: client.Histogram<'stage'>;
+  liveTutorSessionEvents: client.Counter<'event' | 'transport'>;
+  liveTutorAvatarAvOffset: client.Histogram<'transport'>;
+  liveTutorMinutesDeducted: client.Counter<'status'>;
 };
 
 declare global {
@@ -147,6 +150,28 @@ function initializeMetrics(): MetricsState {
     registers: [register],
   }));
 
+  const liveTutorSessionEvents = createMetric(register, 'live_tutor_session_events_total', () => new client.Counter({
+    name: 'live_tutor_session_events_total',
+    help: 'Live Tutor session lifecycle events by transport',
+    labelNames: ['event', 'transport'] as const,
+    registers: [register],
+  }));
+
+  const liveTutorAvatarAvOffset = createMetric(register, 'live_tutor_avatar_av_offset_ms', () => new client.Histogram({
+    name: 'live_tutor_avatar_av_offset_ms',
+    help: 'Absolute audio/video playout offset reported by a Live Tutor client',
+    labelNames: ['transport'] as const,
+    buckets: [25, 50, 75, 100, 150, 250, 500, 1000, 2500],
+    registers: [register],
+  }));
+
+  const liveTutorMinutesDeducted = createMetric(register, 'live_tutor_minutes_deducted_total', () => new client.Counter({
+    name: 'live_tutor_minutes_deducted_total',
+    help: 'Live Tutor minutes deducted after durable billing finalization',
+    labelNames: ['status'] as const,
+    registers: [register],
+  }));
+
   const state: MetricsState = {
     register,
     rateLimitHits,
@@ -162,6 +187,9 @@ function initializeMetrics(): MetricsState {
     monitoringLatency,
     monitoringFailures,
     liveTutorVoiceLatency,
+    liveTutorSessionEvents,
+    liveTutorAvatarAvOffset,
+    liveTutorMinutesDeducted,
   };
 
   (globalThis as typeof globalThis & { __mentoPromClientMetrics__?: MetricsState })[GLOBAL_METRIC_STATE] = state;
@@ -209,10 +237,27 @@ export const providerSuccesses = metrics.providerSuccesses;
 export const monitoringLatency = metrics.monitoringLatency;
 export const monitoringFailures = metrics.monitoringFailures;
 export const liveTutorVoiceLatency = metrics.liveTutorVoiceLatency;
+export const liveTutorSessionEvents = metrics.liveTutorSessionEvents;
+export const liveTutorAvatarAvOffset = metrics.liveTutorAvatarAvOffset;
+export const liveTutorMinutesDeducted = metrics.liveTutorMinutesDeducted;
 
 export function observeLiveTutorVoiceLatency(stage: string, durationMs: number): void {
   if (!Number.isFinite(durationMs) || durationMs < 0) return;
   metrics.liveTutorVoiceLatency.labels(stage).observe(durationMs);
+}
+
+export function recordLiveTutorSessionEvent(event: 'connection_success' | 'first_avatar_audio' | 'reconnect' | 'connection_failed', transport = 'livekit'): void {
+  metrics.liveTutorSessionEvents.labels(event, transport).inc();
+}
+
+export function observeLiveTutorAvatarAvOffset(offsetMs: number, transport = 'livekit'): void {
+  if (!Number.isFinite(offsetMs)) return;
+  metrics.liveTutorAvatarAvOffset.labels(transport).observe(Math.abs(offsetMs));
+}
+
+export function recordLiveTutorMinutesDeducted(seconds: number, status: string): void {
+  if (!Number.isFinite(seconds) || seconds <= 0) return;
+  metrics.liveTutorMinutesDeducted.labels(status).inc(seconds / 60);
 }
 
 export function observeRequestLatency(route: string, durationMs: number) {

@@ -22,7 +22,8 @@ import { LIVE_TUTOR_AVATAR_TRANSPORTS, resolveLiveTutorAvatarTransport } from '.
 import { validateLiveTutorVoiceProviderHandshake } from '../../../../services/liveTutorVoiceProvider';
 import { getProductPolicy } from '../../../../services/productPolicy';
 import { canUseLiveTutor } from '../../../../services/liveTutorBillingService';
-import { isLiveTutorCloudCanaryUser, resolveLiveTutorAgentNameForUser } from '../../../../lib/liveTutorAgentRouting';
+import { resolveLiveTutorAgentNameForUser } from '../../../../lib/liveTutorAgentRouting';
+import { acquireLiveTutorSessionLease } from '../../../../lib/realtimeRedis';
 
 function requireSessionToken(session: { token?: unknown; sessionToken?: unknown }): string {
   const token = typeof session.token === 'string' && session.token.trim()
@@ -63,14 +64,11 @@ export async function GET(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
     const requestUrl = new URL(req.url);
-    const avatarTransport = resolveLiveTutorAvatarTransport(
-      requestUrl.searchParams.get('avatarTransport'),
-      process.env.LIVE_TUTOR_LIVEKIT_POC_ENABLED === 'true' || isLiveTutorCloudCanaryUser(user.email),
-    );
+    const avatarTransport = resolveLiveTutorAvatarTransport(requestUrl.searchParams.get('avatarTransport'));
     if (!avatarTransport.ok) {
       return NextResponse.json(
-        { error: avatarTransport.reason === 'invalid_transport' ? 'Invalid Live Tutor avatar transport.' : 'Live Tutor experiment unavailable.' },
-        { status: avatarTransport.reason === 'invalid_transport' ? 400 : 404 },
+        { error: 'Invalid Live Tutor avatar transport.' },
+        { status: 400 },
       );
     }
     const requestedVoiceProfile = requestUrl.searchParams.get('avatarVoiceProfile');
@@ -103,7 +101,7 @@ export async function GET(req: Request) {
     markPhase('request_received');
 
     const providerPreflightStartedAt = Date.now();
-    const providerPreflightPromise = avatarTransport.transport === LIVE_TUTOR_AVATAR_TRANSPORTS.liveKitPoc
+    const providerPreflightPromise = avatarTransport.transport === LIVE_TUTOR_AVATAR_TRANSPORTS.liveKit
       ? Promise.resolve().then(() => {
         logger.info('Live Tutor provider preflight skipped for LiveKit worker path', {
           category: 'live_tutor_voice_provider_preflight',
@@ -238,7 +236,7 @@ export async function GET(req: Request) {
     let liveKitSession: LiveTutorSimliLiveKitAvatarSession | undefined;
     let liveKitUrl: string | undefined;
 
-    if (avatarTransport.transport === LIVE_TUTOR_AVATAR_TRANSPORTS.liveKitPoc) {
+    if (avatarTransport.transport === LIVE_TUTOR_AVATAR_TRANSPORTS.liveKit) {
       const liveKitConfig = getLiveTutorSimliLiveKitConfig({
         roomName: `mento-live-tutor-${requestId}`,
         agentIdentity: `mento-live-tutor-agent-${user.id}`,
@@ -283,9 +281,17 @@ export async function GET(req: Request) {
           expiresAt: serverSessionExpiresAt,
           secondsReserved: authorizedSeconds,
           lastActivityAt: new Date(),
-          ownerProcessId: `live-tutor-${process.pid}`,
         },
       });
+      const leaseAcquired = await acquireLiveTutorSessionLease(liveKitSession.streamId, {
+        userId: user.id,
+        streamId: liveKitSession.streamId,
+        roomName: liveKitSession.roomName,
+        status: 'active',
+      });
+      if (!leaseAcquired) {
+        throw new Error('A Live Tutor session coordinator is already active for this session.');
+      }
       await attachLiveTutorConversation(liveKitSession.streamId, user.id, liveTutorConversation.id);
       session = {
         token: liveKitSession.token,

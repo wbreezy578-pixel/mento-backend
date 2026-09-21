@@ -63,6 +63,22 @@ describe('Live Tutor Redis leases', () => {
     );
   });
 
+  it('keeps a LiveKit session lease in one Redis Cluster hash slot', async () => {
+    evalCommand.mockResolvedValue(1);
+    const { acquireLiveTutorSessionLease, releaseLiveTutorSessionLease } = await import('./realtimeRedis');
+
+    await acquireLiveTutorSessionLease('livekit-stream-123', { userId: 'user-1', status: 'active' });
+    await releaseLiveTutorSessionLease('livekit-stream-123');
+
+    expect(evalCommand).toHaveBeenLastCalledWith(
+      expect.any(String),
+      2,
+      'live-tutor:{livekit-stream-123}:owner',
+      'live-tutor:{livekit-stream-123}:session',
+      'livekit:livekit-stream-123',
+    );
+  });
+
   it('keeps the HTTP server available when production realtime Redis is unavailable', async () => {
     vi.stubEnv('NODE_ENV', 'production');
     ping.mockRejectedValue(new Error('Redis unavailable'));

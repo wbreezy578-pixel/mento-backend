@@ -3,14 +3,16 @@ import logger from './logger';
 import { createRedisClient, type MentoRedisClient } from './redisClient';
 
 const REALTIME_LEASE_TTL_SECONDS = 30;
+const LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS = 120;
 const REDIS_STARTUP_ATTEMPTS = 4;
 const REDIS_STARTUP_RETRY_DELAYS_MS = [750, 1_500, 3_000];
+const isBuild = process.env.MENTO_BUILD === '1';
 const redisUrl = getRedisUrl();
 const requireRedis = process.env.REQUIRE_REALTIME_REDIS === 'true';
 
 let redis: MentoRedisClient | null = null;
 
-if (redisUrl) {
+if (redisUrl && !isBuild) {
   redis = createRedisClient(redisUrl);
   redis.on('error', (error) => {
     logger.warn('[RealtimeRedis] Redis connection error', {
@@ -26,6 +28,18 @@ function leaseKey(streamId: string): string {
 
 function sessionKey(streamId: string): string {
   return `voice:{${streamId}}:session`;
+}
+
+function liveTutorSessionLeaseKey(streamId: string): string {
+  return `live-tutor:{${streamId}}:owner`;
+}
+
+function liveTutorSessionStateKey(streamId: string): string {
+  return `live-tutor:{${streamId}}:session`;
+}
+
+export function getLiveTutorSessionLeaseOwner(streamId: string): string {
+  return `livekit:${streamId}`;
 }
 
 function assertRedisAvailable(): MentoRedisClient | null {
@@ -151,6 +165,72 @@ export async function assertRealtimeRedisReadyForProduction(): Promise<void> {
     category: 'realtime_redis_startup_degraded',
     required: status.required,
   });
+}
+
+/**
+ * Coordinates an active LiveKit room across Cloud Run replicas. The owner is a
+ * logical LiveKit session id, rather than a process id, so any replica may
+ * safely renew its liveness record while LiveKit owns the media session.
+ */
+export async function acquireLiveTutorSessionLease(
+  streamId: string,
+  fields: Record<string, string>,
+): Promise<boolean> {
+  const client = assertRedisAvailable();
+  if (!client) return true;
+  const ownerId = getLiveTutorSessionLeaseOwner(streamId);
+  const acquired = await client.eval(
+    "local current = redis.call('get', KEYS[1]); if not current then redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2]); return 1 elseif current == ARGV[1] then redis.call('expire', KEYS[1], ARGV[2]); return 1 else return 0 end",
+    1,
+    liveTutorSessionLeaseKey(streamId),
+    ownerId,
+    String(LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS),
+  );
+  if (Number(acquired) !== 1) return false;
+  try {
+    await client.hset(liveTutorSessionStateKey(streamId), {
+      ...fields,
+      ownerId,
+      lastHeartbeatAt: new Date().toISOString(),
+    });
+    await client.expire(liveTutorSessionStateKey(streamId), LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS);
+  } catch (error) {
+    await releaseLiveTutorSessionLease(streamId).catch(() => undefined);
+    throw error;
+  }
+  return true;
+}
+
+export async function refreshLiveTutorSessionLease(
+  streamId: string,
+  fields: Record<string, string> = {},
+): Promise<boolean> {
+  const client = assertRedisAvailable();
+  if (!client) return true;
+  const ownerId = getLiveTutorSessionLeaseOwner(streamId);
+  const refreshed = await client.eval(
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('expire', KEYS[1], ARGV[2]) else return 0 end",
+    1,
+    liveTutorSessionLeaseKey(streamId),
+    ownerId,
+    String(LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS),
+  );
+  if (Number(refreshed) !== 1) return false;
+  if (Object.keys(fields).length > 0) await client.hset(liveTutorSessionStateKey(streamId), fields);
+  await client.expire(liveTutorSessionStateKey(streamId), LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS);
+  return true;
+}
+
+export async function releaseLiveTutorSessionLease(streamId: string): Promise<void> {
+  const client = assertRedisAvailable();
+  if (!client) return;
+  await client.eval(
+    "if redis.call('get', KEYS[1]) == ARGV[1] then redis.call('del', KEYS[1]); redis.call('del', KEYS[2]); return 1 else return 0 end",
+    2,
+    liveTutorSessionLeaseKey(streamId),
+    liveTutorSessionStateKey(streamId),
+    getLiveTutorSessionLeaseOwner(streamId),
+  );
 }
 
 export async function checkRealtimeRedisHealth(): Promise<'ok' | 'not_configured' | 'fail'> {

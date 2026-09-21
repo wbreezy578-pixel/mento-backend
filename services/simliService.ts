@@ -1,4 +1,5 @@
 import logger from '../lib/logger';
+import { RoomServiceClient } from 'livekit-server-sdk';
 import { liveTutorProviderHttpStatus } from './liveTutorProviderError';
 import { getCircuitBreaker, retryWithBackoff, getClientErrorMessage, getProviderRetryOptions, sanitizeForLogging } from '../lib/resilience';
 import { getSimliApiKey, getSimliAvatarId, getSimliVoiceId, getSimliApiBaseUrl } from '../lib/env';
@@ -11,6 +12,7 @@ import { clampLiveTutorExpiry, LIVE_TUTOR_INACTIVITY_TIMEOUT_MS, LIVE_TUTOR_MAX_
 import { resolveLiveTutorFinalizationUsage } from './liveTutorSessionBilling';
 import {
   acquireLiveTutorSessionLease,
+  getLiveTutorSessionState,
   refreshLiveTutorSessionCapacity,
   releaseActiveLiveTutorSessionCapacity,
   releaseLiveTutorSessionLease,
@@ -53,6 +55,32 @@ const MIN_HEARTBEAT_INTERVAL_MS = 5 * 1000;
 const GENUINELY_ACTIVE_STATUS = 'active';
 const RECOVERABLE_STATUSES = ['creating', 'active', 'reconnecting', 'finalizing', 'recovery_required'] as const;
 const TERMINAL_STATUSES = ['completed', 'failed', 'disconnected', 'ended'] as const;
+
+async function closeLiveKitRoomForSession(streamId: string): Promise<void> {
+  const state = await getLiveTutorSessionState(streamId).catch(() => null);
+  const roomName = state?.roomName?.trim();
+  const liveKitUrl = process.env.LIVEKIT_URL?.trim();
+  const liveKitApiKey = process.env.LIVEKIT_API_KEY?.trim();
+  const liveKitApiSecret = process.env.LIVEKIT_API_SECRET?.trim();
+  if (!roomName || !liveKitUrl || !liveKitApiKey || !liveKitApiSecret) return;
+
+  try {
+    const host = liveKitUrl.replace(/^wss:/, 'https:').replace(/^ws:/, 'http:');
+    await new RoomServiceClient(host, liveKitApiKey, liveKitApiSecret).deleteRoom(roomName);
+    logger.info('[LiveTutorLifecycle] livekit_room_closed', {
+      streamId,
+      category: 'live_tutor_livekit_cleanup',
+    });
+  } catch (error) {
+    // Room deletion is best-effort: billing finalization must still complete
+    // if the room has already disappeared or LiveKit is temporarily unavailable.
+    logger.warn('[LiveTutorLifecycle] livekit_room_close_failed', {
+      streamId,
+      category: 'live_tutor_livekit_cleanup',
+      error: sanitizeForLogging(error),
+    });
+  }
+}
 
 export type LiveTutorFinalizationTiming = 'active_end' | 'inactivity_end' | 'transport_recovery_end';
 
@@ -671,9 +699,11 @@ async function completeSimliSessionLifecycleInternal(streamId: string, options: 
   if (!durable || (userId && durable.userId !== userId)) throw buildSimliError('Live Tutor session not found.', 404);
   if (durable.billingFinalized) {
     logger.info('[LiveTutorLifecycle] terminal_finalize_duplicate', { streamId, sessionId: durable.id, userId: durable.userId, reason: options.reason ?? 'already_finalized', previousStatus: durable.status, resultingStatus: durable.status, category: 'live_tutor_lifecycle' });
+    await closeLiveKitRoomForSession(streamId);
     await closeRealtimeSession(streamId);
     return;
   }
+  await closeLiveKitRoomForSession(streamId);
   if (!session) logger.warn('Live Tutor session is not in this process; finalizing from durable ledger', { streamId, userId: durable.userId, category: 'live_tutor_durable_reconciliation' });
 
   const staleFinalizationBefore = new Date(Date.now() - INACTIVITY_TIMEOUT_MS);

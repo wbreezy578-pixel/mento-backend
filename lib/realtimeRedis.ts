@@ -346,6 +346,20 @@ export async function refreshLiveTutorSessionLease(
   return true;
 }
 
+/**
+ * Read the shared Live Tutor session metadata needed for cross-instance
+ * cleanup.  Billing remains durable in PostgreSQL; this is only the short-
+ * lived LiveKit coordination record.
+ */
+export async function getLiveTutorSessionState(
+  streamId: string,
+): Promise<Record<string, string> | null> {
+  const client = assertRedisAvailable();
+  if (!client) return null;
+  const state = await client.hgetall(liveTutorSessionStateKey(streamId));
+  return Object.keys(state).length > 0 ? state : null;
+}
+
 export async function releaseLiveTutorSessionLease(streamId: string): Promise<void> {
   const client = assertRedisAvailable();
   if (!client) return;

@@ -105,6 +105,29 @@ function required(name: string): string {
   return value;
 }
 
+function callbackBackendHostname(): string {
+  try {
+    return new URL(required('MENTO_LIVE_TUTOR_BACKEND_URL')).hostname;
+  } catch {
+    return 'invalid-or-missing-hostname';
+  }
+}
+
+function safeCallbackFailure(error: unknown): { errorType: string; networkCode?: string } {
+  const knownTypes = new Set(['TimeoutError', 'AbortError', 'TypeError', 'Error']);
+  const knownCodes = new Set([
+    'ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT',
+    'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+  ]);
+  const type = error instanceof Error && knownTypes.has(error.name) ? error.name : 'UnknownError';
+  const cause = error instanceof Error ? error.cause : undefined;
+  const code = cause && typeof cause === 'object' && 'code' in cause ? cause.code : undefined;
+  return {
+    errorType: type,
+    ...(typeof code === 'string' && knownCodes.has(code) ? { networkCode: code } : {}),
+  };
+}
+
 async function readJson(response: Response, label: string): Promise<Record<string, unknown>> {
   const body = await response.text();
   let parsed: unknown;
@@ -351,7 +374,7 @@ export default defineAgent({
     const markSessionUsable = async () => {
       if (sessionUsable) return;
       const callbackStartedAtMs = Date.now();
-      console.log('[MentoLiveTutorStaging] usable_session_callback_started', JSON.stringify({ streamId }));
+      console.log('[MentoLiveTutorStaging] usable_session_callback_started', JSON.stringify({ streamId, backendHostname: callbackBackendHostname() }));
       const backendUrl = required('MENTO_LIVE_TUTOR_BACKEND_URL').replace(/\/$/, '');
       const callbackSecret = required('MENTO_LIVE_TUTOR_WORKER_CALLBACK_SECRET');
       const response = await fetch(`${backendUrl}/api/live-tutor/worker-ready`, {
@@ -416,7 +439,11 @@ export default defineAgent({
         console.log('[MentoLiveTutorStaging] client_ready_received', JSON.stringify({ streamId }));
         void markSessionUsable().catch((error) => {
           usableCallbackFailures += 1;
-          console.error('[MentoLiveTutorStaging] usable_session_callback_failed', JSON.stringify({ message: error instanceof Error ? error.message : String(error) }));
+          console.error('[MentoLiveTutorStaging] usable_session_callback_failed', JSON.stringify({
+            streamId,
+            backendHostname: callbackBackendHostname(),
+            ...safeCallbackFailure(error),
+          }));
           if (usableCallbackFailures >= 3) ctx.shutdown('live_tutor_usable_session_callback_failed');
         }).finally(() => {
           usableCallbackPending = false;

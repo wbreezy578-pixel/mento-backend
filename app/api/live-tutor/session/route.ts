@@ -491,15 +491,21 @@ export async function GET(req: Request) {
 
     const message = error instanceof Error ? error.message : 'Internal Server Error';
     const status = (error as { status?: number })?.status ?? 500;
+    const providerReason = (error as { providerReason?: unknown })?.providerReason;
+    const safeProviderReason = typeof providerReason === 'string' && /^[a-z0-9][a-z0-9_.-]{0,79}$/.test(providerReason)
+      ? providerReason
+      : undefined;
     const isCapacityFull = status === 503 && message.includes('capacity');
     const isSimliThrottled = error instanceof SimliLiveKitAttachmentError && error.status === 429;
-    const isUnavailable = isCapacityFull || isSimliThrottled || Boolean(message && (message.includes('temporarily unavailable') || message.includes('circuit')));
+    const isStartupTimeout = status === 504 || Boolean(safeProviderReason?.endsWith('_timeout')) || /timed out|timeout|network error/i.test(message);
+    const isUnavailable = isCapacityFull || isSimliThrottled || isStartupTimeout || Boolean(message && (message.includes('temporarily unavailable') || message.includes('circuit')));
 
     logger.error('Live Tutor session initialization failed', {
       status,
-      category: isCapacityFull ? 'live_tutor_capacity_full' : isUnavailable ? 'provider_unavailable' : 'session_error',
-      message: isCapacityFull ? 'Live Tutor capacity full' : isUnavailable ? 'Simli unavailable' : 'Session error',
+      category: isCapacityFull ? 'live_tutor_capacity_full' : isStartupTimeout ? 'provider_timeout' : isUnavailable ? 'provider_unavailable' : 'session_error',
+      message: isCapacityFull ? 'Live Tutor capacity full' : isStartupTimeout ? 'Simli startup timeout' : isUnavailable ? 'Simli unavailable' : 'Session error',
       error: message,
+      ...(safeProviderReason ? { providerReason: safeProviderReason } : {}),
       ...(error instanceof SimliLiveKitAttachmentError ? {
         provider: 'simli_livekit',
         providerStatus: error.status,
@@ -513,7 +519,7 @@ export async function GET(req: Request) {
       ? 'Live Tutor is temporarily unavailable. Please try again in a moment.'
       : 'Unable to start Live Tutor. Please check your connection and try again.';
 
-    return NextResponse.json({ error: userMessage, requestId: errorRequestId }, { status });
+    return NextResponse.json({ error: userMessage, requestId: errorRequestId }, { status: status === 504 ? 503 : status });
   }
 }
 

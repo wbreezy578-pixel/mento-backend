@@ -21,11 +21,15 @@ export function createRedisClient(url: string): MentoRedisClient {
   return new Cluster(
     [{ host: parsed.hostname, port: Number(parsed.port || (tls ? 6380 : 6379)) }],
     {
+      clusterRetryStrategy: (attempt) => Math.min(attempt * 250, 2_000),
+      enableOfflineQueue: false,
       redisOptions: {
         username: parsed.username ? decodeURIComponent(parsed.username) : undefined,
         password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
         tls,
         maxRetriesPerRequest: 2,
+        connectTimeout: 8_000,
+        commandTimeout: 8_000,
       },
     },
   );

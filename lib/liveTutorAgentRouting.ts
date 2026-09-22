@@ -1,6 +1,9 @@
-// Native Live Tutor is a production LiveKit path now.  Keep the worker name
-// server-owned so clients cannot select a different transport or deployment.
-const DEFAULT_LIVE_TUTOR_AGENT_NAME = 'mento-live-tutor-production';
+// Keep this aligned with the currently deployed LiveKit worker.  The worker
+// is still registered under this name even though the native LiveKit path is
+// now the production user path.  Renaming it requires a coordinated worker
+// and backend rollout; otherwise dispatch succeeds but no worker claims the
+// room and the mobile client eventually times out.
+const DEFAULT_LIVE_TUTOR_AGENT_NAME = 'mento-live-tutor-staging';
 
 function configuredEmails(): Set<string> {
   return new Set(

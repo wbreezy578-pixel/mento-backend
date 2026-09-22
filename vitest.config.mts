@@ -23,6 +23,7 @@ export default defineConfig({
       "lib/requestMetadata.test.ts",
       "lib/internalJobAuth.test.ts",
       "lib/realtimeRedis.test.ts",
+      "lib/liveTutorAgentRouting.test.ts",
       "lib/aiBillingSecurity.test.ts",
       "lib/aiSecurityDecision.test.ts",
       "lib/aiGenerationLock.test.ts",

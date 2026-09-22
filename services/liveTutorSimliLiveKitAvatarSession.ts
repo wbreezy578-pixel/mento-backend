@@ -4,6 +4,7 @@ const PUBLISH_ON_BEHALF_ATTRIBUTE = 'lk.publish_on_behalf';
 const DEFAULT_SIMLI_API_URL = 'https://api.simli.ai';
 const DEFAULT_AVATAR_IDENTITY = 'simli-avatar-agent';
 const DEFAULT_JOIN_TIMEOUT_MS = 20_000;
+const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const LIVEKIT_TOKEN_GRACE_SECONDS = 60;
 const SIMLI_ATTACHMENT_MAX_ATTEMPTS = 3;
 const SIMLI_ATTACHMENT_RETRY_BASE_MS = 1_000;
@@ -24,6 +25,7 @@ export type LiveTutorSimliLiveKitConfig = {
   maxSessionLength?: number;
   maxIdleTime?: number;
   joinTimeoutMs?: number;
+  startupTimeoutMs?: number;
 };
 
 type PhaseThreeDependencies = {
@@ -76,7 +78,12 @@ async function readJson(response: Response, label: string): Promise<Record<strin
   } catch {
     throw new Error(`${label} returned invalid JSON.`);
   }
-  if (!response.ok) throw new Error(`${label} failed with status ${response.status}.`);
+  if (!response.ok) {
+    const failure = new Error(`${label} failed with status ${response.status}.`) as Error & { status?: number; providerReason?: string | null };
+    failure.status = response.status;
+    failure.providerReason = safeProviderReason(body);
+    throw failure;
+  }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error(`${label} returned an invalid response.`);
   return parsed as Record<string, unknown>;
 }
@@ -112,13 +119,21 @@ async function attachSimliToLiveKit(
   wait: (delayMs: number) => Promise<void>,
   url: string,
   requestBody: Record<string, string>,
+  timeoutMs: number,
 ): Promise<void> {
   for (let attempt = 1; attempt <= SIMLI_ATTACHMENT_MAX_ATTEMPTS; attempt += 1) {
-    const response = await request(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody),
-    });
+    let response: Response;
+    try {
+      response = await request(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (error) {
+      const isTimeout = error instanceof DOMException && error.name === 'TimeoutError';
+      throw new SimliLiveKitAttachmentError(504, isTimeout ? 'attachment_timeout' : 'attachment_network_error');
+    }
     if (response.ok) {
       await readJson(response, 'Simli LiveKit attachment');
       return;
@@ -165,6 +180,7 @@ export async function createLiveTutorSimliLiveKitAvatarSession(
   const avatarName = config.avatarName?.trim() || avatarIdentity;
   const apiUrl = (config.simliApiUrl || DEFAULT_SIMLI_API_URL).replace(/\/$/, '');
   const maxSessionLength = Math.max(1, Math.floor(config.maxSessionLength ?? 600));
+  const startupTimeoutMs = Math.max(1_000, Math.floor(config.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS));
   const liveKitTokenTtlMinutes = Math.ceil((maxSessionLength + LIVEKIT_TOKEN_GRACE_SECONDS) / 60);
 
   const tokenPreparationStartedAt = Date.now();
@@ -188,17 +204,27 @@ export async function createLiveTutorSimliLiveKitAvatarSession(
   ]);
 
   const simliSessionCreateStartedAt = Date.now();
-  const composeResponse = await request(`${apiUrl}/compose/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-simli-api-key': config.simliApiKey },
-    body: JSON.stringify({
-      faceId: config.faceId,
-      ...(config.emotionId ? { emotionId: config.emotionId } : {}),
-      handleSilence: true,
-      maxSessionLength,
-      maxIdleTime: config.maxIdleTime ?? 180,
-    }),
-  });
+  let composeResponse: Response;
+  try {
+    composeResponse = await request(`${apiUrl}/compose/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-simli-api-key': config.simliApiKey },
+      body: JSON.stringify({
+        faceId: config.faceId,
+        ...(config.emotionId ? { emotionId: config.emotionId } : {}),
+        handleSilence: true,
+        maxSessionLength,
+        maxIdleTime: config.maxIdleTime ?? 180,
+      }),
+      signal: AbortSignal.timeout(startupTimeoutMs),
+    });
+  } catch (error) {
+    const isTimeout = error instanceof DOMException && error.name === 'TimeoutError';
+    const failure = new Error(isTimeout ? 'Simli session creation timed out.' : 'Simli session creation failed.') as Error & { status?: number; providerReason?: string };
+    failure.status = 504;
+    failure.providerReason = isTimeout ? 'compose_timeout' : 'compose_network_error';
+    throw failure;
+  }
   const compose = await readJson(composeResponse, 'Simli session creation');
   const simliSessionCreateMs = Date.now() - simliSessionCreateStartedAt;
   const sessionToken = typeof compose.session_token === 'string' ? compose.session_token : null;
@@ -214,7 +240,7 @@ export async function createLiveTutorSimliLiveKitAvatarSession(
     session_token: sessionToken,
     livekit_token: avatarToken,
     livekit_url: config.liveKitUrl,
-  });
+  }, startupTimeoutMs);
   const simliLiveKitAttachMs = Date.now() - simliLiveKitAttachStartedAt;
 
   return {

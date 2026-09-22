@@ -24,6 +24,7 @@ type MetricsState = {
   liveTutorAvatarAvOffset: client.Histogram<'transport'>;
   liveTutorMinutesDeducted: client.Counter<'status'>;
   chatTimeToFirstToken: client.Histogram<'answer_mode'>;
+  chatFirstTokenMissing: client.Counter<'answer_mode'>;
   chatGenerationTotal: client.Histogram<'outcome'>;
   chatHistoryLoad: client.Histogram<'conversation_size'>;
   chatGeminiResponse: client.Histogram<'model'>;
@@ -185,6 +186,13 @@ function initializeMetrics(): MetricsState {
     registers: [register],
   }));
 
+  const chatFirstTokenMissing = createMetric(register, 'chat_first_token_missing_total', () => new client.Counter({
+    name: 'chat_first_token_missing_total',
+    help: 'Successful or failed chat generations that produced no streamed first token',
+    labelNames: ['answer_mode'] as const,
+    registers: [register],
+  }));
+
   const chatGenerationTotal = createMetric(register, 'chat_generation_total_ms', () => new client.Histogram({
     name: 'chat_generation_total_ms',
     help: 'End-to-end chat request duration through completion or failure',
@@ -235,6 +243,7 @@ function initializeMetrics(): MetricsState {
     liveTutorAvatarAvOffset,
     liveTutorMinutesDeducted,
     chatTimeToFirstToken,
+    chatFirstTokenMissing,
     chatGenerationTotal,
     chatHistoryLoad,
     chatGeminiResponse,
@@ -290,6 +299,7 @@ export const liveTutorSessionEvents = metrics.liveTutorSessionEvents;
 export const liveTutorAvatarAvOffset = metrics.liveTutorAvatarAvOffset;
 export const liveTutorMinutesDeducted = metrics.liveTutorMinutesDeducted;
 export const chatTimeToFirstToken = metrics.chatTimeToFirstToken;
+export const chatFirstTokenMissing = metrics.chatFirstTokenMissing;
 export const chatGenerationTotal = metrics.chatGenerationTotal;
 export const chatHistoryLoad = metrics.chatHistoryLoad;
 export const chatGeminiResponse = metrics.chatGeminiResponse;
@@ -297,6 +307,10 @@ export const chatFallbacks = metrics.chatFallbacks;
 
 export function observeChatTimeToFirstToken(durationMs: number, answerMode: 'short' | 'detailed' = 'detailed'): void {
   if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatTimeToFirstToken.labels(answerMode).observe(durationMs);
+}
+
+export function recordChatFirstTokenMissing(answerMode: 'short' | 'detailed' = 'detailed'): void {
+  metrics.chatFirstTokenMissing.labels(answerMode).inc();
 }
 
 export function observeChatGenerationTotal(durationMs: number, outcome: 'success' | 'failed' | 'cancelled'): void {

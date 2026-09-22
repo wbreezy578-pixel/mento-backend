@@ -28,11 +28,12 @@ import { createHash } from 'node:crypto';
 import { acquireAIGenerationLock, releaseAIGenerationLock, startAIGenerationLockHeartbeat } from '../../../../lib/aiGenerationLock';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../lib/userSettings';
 import { ChatOperationConflictError, claimInitialChatOperation, completeInitialChatOperation, failInitialChatOperation } from '../../../../services/chatOperationService';
-import { observeChatGenerationTotal, observeChatHistoryLoad, observeChatTimeToFirstToken } from '../../../../lib/metrics';
+import { observeChatGenerationTotal, observeChatHistoryLoad, observeChatTimeToFirstToken, recordChatFirstTokenMissing } from '../../../../lib/metrics';
 
 const CORS_METHODS = 'POST, OPTIONS';
 const MAX_IMAGE_BASE64_CHARS = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
 const MAX_CHAT_JSON_BYTES = MAX_IMAGE_BASE64_CHARS + 128 * 1024;
+const SLOW_FIRST_TOKEN_WARN_MS = 5_000;
 
 export async function OPTIONS(req: Request) {
   return new NextResponse(null, {
@@ -200,10 +201,11 @@ export async function POST(req: Request) {
     }
 
     let historyForAI: GeminiMessage[];
+    let historyDurationMs = 0;
     try {
       const historyStartedAt = Date.now();
       historyForAI = await getConversationHistoryForAI(conversationId);
-      const historyDurationMs = Date.now() - historyStartedAt;
+      historyDurationMs = Date.now() - historyStartedAt;
       observeMonitoringLatency('database', historyDurationMs, { route: 'chat-stream', operation: 'history' });
       observeChatHistoryLoad(historyDurationMs, historyForAI.length > 30 ? 'long' : 'fresh');
       observeMonitoringLatency('api', Date.now() - requestStartedAt, { route: 'chat-stream', operation: 'history-ready' });
@@ -346,11 +348,20 @@ export async function POST(req: Request) {
                     status: 'success',
                   });
                   observeChatTimeToFirstToken(firstTokenAt - requestStartedAt, answerMode);
-                  logger.info('Chat stream first Gemini token', {
+                  const endToEndElapsedMs = firstTokenAt - requestStartedAt;
+                  const geminiElapsedMs = firstTokenAt - geminiStartedAt;
+                  // Production suppresses routine info logs. Keep this event at
+                  // warn level so Cloud Logging can measure every user-visible
+                  // first token, while the category identifies slow requests.
+                  logger.warn('Chat stream first Gemini token', {
                     requestId,
                     conversationId,
-                    endToEndElapsedMs: firstTokenAt - requestStartedAt,
-                    geminiElapsedMs: firstTokenAt - geminiStartedAt,
+                    category: endToEndElapsedMs >= SLOW_FIRST_TOKEN_WARN_MS ? 'chat_first_token_slow' : 'chat_first_token',
+                    answerMode,
+                    historyDurationMs,
+                    historyMessageCount: historyForAI.length,
+                    endToEndElapsedMs,
+                    geminiElapsedMs,
                   });
                 }
                 assistantText += token;
@@ -364,6 +375,17 @@ export async function POST(req: Request) {
 
               if (generationLease.signal.aborted) {
                 throw generationLease.signal.reason;
+              }
+              if (!firstTokenObserved) {
+                recordChatFirstTokenMissing(answerMode);
+                logger.warn('Chat stream completed without a first Gemini token', {
+                  requestId,
+                  conversationId,
+                  category: 'chat_first_token_missing',
+                  answerMode,
+                  generationOutcome: generation.outcome,
+                  endToEndElapsedMs: Date.now() - requestStartedAt,
+                });
               }
               if (generation.outcome === 'cancelled' || req.signal.aborted || isStreamClosed()) {
                 throw new AIGenerationCancelledError();

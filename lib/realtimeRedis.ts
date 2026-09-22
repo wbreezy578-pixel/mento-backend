@@ -26,6 +26,13 @@ if (redisUrl && !isBuild) {
     logger.warn('[RealtimeRedis] Redis connection error', {
       message: error.message,
       category: 'live_tutor_realtime_redis',
+      clientStatus: typeof (redis as { status?: unknown })?.status === 'string'
+        ? (redis as { status: string }).status
+        : undefined,
+      scheme: (() => {
+        try { return new URL(redisUrl).protocol.replace(':', ''); } catch { return 'invalid'; }
+      })(),
+      clusterMode: process.env.REDIS_CLUSTER_MODE === 'true',
     });
   });
 }
@@ -55,6 +62,28 @@ function liveTutorCapacityKey(kind: 'sessions' | 'avatar-starts'): string {
 function configuredPositiveInteger(name: string, fallback: number): number {
   const parsed = Number(process.env[name]);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function redisConnectionDiagnostics(): Record<string, unknown> {
+  if (!redisUrl) return { configured: false };
+  try {
+    const parsed = new URL(redisUrl);
+    return {
+      configured: true,
+      scheme: parsed.protocol.replace(':', ''),
+      host: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'rediss:' ? '6380' : '6379'),
+      clusterMode: process.env.REDIS_CLUSTER_MODE === 'true',
+      requireRedis,
+    };
+  } catch {
+    return {
+      configured: true,
+      invalidUrl: true,
+      clusterMode: process.env.REDIS_CLUSTER_MODE === 'true',
+      requireRedis,
+    };
+  }
 }
 
 export function getLiveTutorCapacityConfig(): {
@@ -263,6 +292,7 @@ export async function assertRealtimeRedisReadyForProduction(): Promise<void> {
     logger.error('[RealtimeRedis] Redis is not configured; Live Tutor voice will be unavailable until it is restored', {
       category: 'realtime_redis_startup_degraded',
       required: status.required,
+      ...redisConnectionDiagnostics(),
     });
     return;
   }
@@ -281,6 +311,7 @@ export async function assertRealtimeRedisReadyForProduction(): Promise<void> {
         maxAttempts: REDIS_STARTUP_ATTEMPTS,
         delayMs,
         category: 'realtime_redis_startup_retry',
+        ...redisConnectionDiagnostics(),
       });
       await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     }
@@ -289,6 +320,7 @@ export async function assertRealtimeRedisReadyForProduction(): Promise<void> {
   logger.error('[RealtimeRedis] Redis is unavailable after startup retries; starting the HTTP API in degraded mode', {
     category: 'realtime_redis_startup_degraded',
     required: status.required,
+    ...redisConnectionDiagnostics(),
   });
 }
 
@@ -384,13 +416,27 @@ export async function checkRealtimeRedisHealth(): Promise<'ok' | 'not_configured
       return 'not_configured';
     }
 
-    const pong = await client.ping();
+    // Do not let an offline cluster command sit in ioredis' startup queue.
+    // Cloud Run can call readiness immediately after the container starts,
+    // before the TLS/cluster connection reaches `ready`.  The client-level
+    // command timeout bounds this as well, while this guard keeps the health
+    // probe deterministic for every supported Redis client.
+    const pong = await Promise.race([
+      client.ping(),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('Redis health ping timed out.')), 8_500);
+      }),
+    ]);
     if (pong !== 'PONG') {
       logger.warn('[RealtimeRedis] Redis health check failed', {
         configured: true,
         pong,
+        clientStatus: typeof (client as { status?: unknown }).status === 'string'
+          ? (client as { status: string }).status
+          : undefined,
         required: requireRedis || process.env.NODE_ENV === 'production',
         category: 'realtime_redis_health',
+        ...redisConnectionDiagnostics(),
       });
       return 'fail';
     }
@@ -399,8 +445,13 @@ export async function checkRealtimeRedisHealth(): Promise<'ok' | 'not_configured
   } catch (error) {
     logger.warn('[RealtimeRedis] Redis health check failed', {
       errorName: error instanceof Error ? error.name : 'unknown',
+      errorMessage: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160),
+      clientStatus: redis && typeof (redis as { status?: unknown }).status === 'string'
+        ? (redis as { status: string }).status
+        : undefined,
       required: requireRedis || process.env.NODE_ENV === 'production',
       category: 'realtime_redis_health',
+      ...redisConnectionDiagnostics(),
     });
     return 'fail';
   }

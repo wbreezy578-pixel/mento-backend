@@ -23,4 +23,9 @@ describe('Live Tutor Cloud agent routing', () => {
     expect(isLiveTutorCloudCanaryUser('canary@example.com')).toBe(true);
     expect(isLiveTutorCloudCanaryUser('other@example.com')).toBe(false);
   });
+
+  it('matches the currently deployed worker when no override is configured', () => {
+    delete process.env.LIVE_TUTOR_CLOUD_AGENT_NAME;
+    expect(resolveLiveTutorAgentNameForUser('user@example.com')).toBe('mento-live-tutor-staging');
+  });
 });

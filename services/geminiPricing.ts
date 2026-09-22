@@ -42,10 +42,10 @@ export const GEMINI_PRICING_VERSION = '2026-08-31';
 export type NormalChatGeminiModel = keyof typeof NORMAL_CHAT_GEMINI_MODELS;
 
 export const NORMAL_CHAT_COST_AWARE_FALLBACKS: readonly NormalChatGeminiModel[] = [
-  // Keep the fallback in the same currently-deployed Gemini family. The
-  // previous 2.5 fallback is not available to this API project (404), which
-  // turned a temporary primary-model overload into a guaranteed chat failure.
+  // Keep fallback models in the currently-deployed Gemini family. The
+  // previous 2.5 fallback is not available to this API project (404).
   'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
 ];
 
 export function isSupportedNormalChatModel(model: string): model is NormalChatGeminiModel {

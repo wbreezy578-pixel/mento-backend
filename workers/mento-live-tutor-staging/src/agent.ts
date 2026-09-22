@@ -10,8 +10,12 @@ const AVATAR_IDENTITY = process.env.SIMLI_AVATAR_IDENTITY?.trim() || 'simli-avat
 const AVATAR_JOIN_TIMEOUT_MS = 20_000;
 const MOBILE_PARTICIPANT_IDENTITY_PREFIX = 'mento-live-tutor-subscriber-';
 const AGENT_NAME = process.env.MENTO_LIVE_TUTOR_AGENT_NAME?.trim() || 'mento-live-tutor-staging';
-const SERVER_VAD_SILENCE_DURATION_MS = 500;
-const INTERRUPTION_MIN_DURATION_MS = 750;
+// Mobile speakers and network jitter can briefly leak avatar audio back into
+// the microphone. A short VAD window treated that echo as a new user turn and
+// repeatedly cleared Simli playback. Keep responses responsive, but require a
+// stable pause/speech interval before changing turns.
+const SERVER_VAD_SILENCE_DURATION_MS = 850;
+const INTERRUPTION_MIN_DURATION_MS = 1100;
 const LIFECYCLE_TOPIC = 'mento.live_tutor.lifecycle.v1';
 const CLIENT_READY_TOPIC = 'mento.live_tutor.client_ready.v1';
 type LifecycleEvent = 'agent_joined' | 'agent_ready' | 'session_usable' | 'user_speech_started' | 'provider_speech_ended' | 'response_requested' | 'agent_thinking' | 'first_audio_emitted' | 'simli_first_audio_frame' | 'response_completed' | 'interruption_started' | 'audio_stop_confirmed' | 'interrupted' | 'listening_resumed';
@@ -540,15 +544,17 @@ export default defineAgent({
               simliOutputStopConfirmed = true;
               confirmInterruptionStopped();
             }).catch((error) => {
-              // Do not lie to the client that avatar output stopped when Simli
-              // failed to acknowledge the clear-buffer RPC.
               console.warn('[MentoLiveTutorStaging] simli_playback_clear_failed', JSON.stringify({
                 message: error instanceof Error ? error.message : String(error),
+                fallback: 'local_flush_and_continue',
               }));
-              // Continuing would risk old assistant audio talking over the
-              // learner. End this bounded-failure session instead of claiming
-              // that playout was interrupted.
-              ctx.shutdown('simli_playback_clear_failed');
+              // The RPC is a best-effort remote drain. Do not terminate a paid
+              // session because one interruption acknowledgement timed out:
+              // flushing the local stream lets the next response continue and
+              // avoids leaving the learner in a silent room.
+              avatarOutput?.flush();
+              simliOutputStopConfirmed = true;
+              confirmInterruptionStopped();
             });
           }
         }

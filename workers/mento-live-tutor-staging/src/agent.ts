@@ -340,6 +340,9 @@ export default defineAgent({
       ctx.shutdown('live_tutor_session_expired');
     };
     let sessionUsable = false;
+    let sessionUsableExpiresAt: Date | null = null;
+    let usableCallbackPending = false;
+    let usableCallbackFailures = 0;
     const startAuthoritativeExpiry = (expiresAt: Date) => {
       if (expiryTimer) clearTimeout(expiryTimer);
       const remainingMs = expiresAt.getTime() - Date.now();
@@ -368,6 +371,7 @@ export default defineAgent({
         throw new Error('Live Tutor usable-session callback returned an invalid expiry.');
       }
       sessionUsable = true;
+      sessionUsableExpiresAt = expiresAt;
       startAuthoritativeExpiry(expiresAt);
       publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'session_usable', workerStartedAtMs, undefined, { expiresAt: expiresAt.toISOString() });
       publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'listening_resumed', workerStartedAtMs, activeTurn);
@@ -397,14 +401,25 @@ export default defineAgent({
       }
     });
     ctx.room.on(RoomEvent.DataReceived, (payload, participant, _kind, topic) => {
-      if (topic !== CLIENT_READY_TOPIC || participant?.identity !== expectedMobileParticipantIdentity || sessionUsable) return;
+      if (topic !== CLIENT_READY_TOPIC || participant?.identity !== expectedMobileParticipantIdentity) return;
       try {
         const message = JSON.parse(new TextDecoder().decode(payload)) as { type?: unknown };
         if (message.type !== 'mento.live_tutor.client_ready') return;
+        if (sessionUsable && sessionUsableExpiresAt) {
+          // Re-acknowledge a duplicate readiness message if the first reliable
+          // lifecycle packet was missed by the reconnecting mobile client.
+          publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'session_usable', workerStartedAtMs, undefined, { expiresAt: sessionUsableExpiresAt.toISOString() });
+          return;
+        }
+        if (usableCallbackPending) return;
+        usableCallbackPending = true;
         console.log('[MentoLiveTutorStaging] client_ready_received', JSON.stringify({ streamId }));
         void markSessionUsable().catch((error) => {
+          usableCallbackFailures += 1;
           console.error('[MentoLiveTutorStaging] usable_session_callback_failed', JSON.stringify({ message: error instanceof Error ? error.message : String(error) }));
-          ctx.shutdown('live_tutor_usable_session_callback_failed');
+          if (usableCallbackFailures >= 3) ctx.shutdown('live_tutor_usable_session_callback_failed');
+        }).finally(() => {
+          usableCallbackPending = false;
         });
       } catch { /* malformed mobile data must not affect session state */ }
     });

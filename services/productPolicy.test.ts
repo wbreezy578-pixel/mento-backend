@@ -125,6 +125,8 @@ describe('canonical product policy', () => {
     expect(classifyLiveTutorFinalizationTiming('unauthorized')).toBe('transport_recovery_end');
     expect(classifyLiveTutorFinalizationTiming('Heartbeat expired; stale session recovery')).toBe('inactivity_end');
     expect(classifyLiveTutorFinalizationTiming('User ended session')).toBe('active_end');
+    expect(classifyLiveTutorFinalizationTiming('Mento could not confirm your session. Your Live Tutor minutes were not used.')).toBe('active_end');
+    expect(classifyLiveTutorFinalizationTiming('worker_confirmation_timeout')).toBe('active_end');
     expect(() => classifyLiveTutorFinalizationTiming('unrecognized terminal reason')).toThrow(/Unknown Live Tutor finalization reason/);
   });
 });

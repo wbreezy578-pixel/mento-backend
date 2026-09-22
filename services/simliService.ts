@@ -111,6 +111,8 @@ export function classifyLiveTutorFinalizationTiming(reason: string | undefined):
     || normalized === 'session time elapsed'
     || normalized === 'session_expired'
     || normalized === 'server shutdown'
+    || normalized === 'worker_confirmation_timeout'
+    || normalized === 'mento could not confirm your session. your live tutor minutes were not used.'
     || normalized.startsWith('live tutor connection timed out after ')
   ) return 'active_end';
   throw new Error(`Unknown Live Tutor finalization reason: ${reason}`);

@@ -190,7 +190,9 @@ function retainActiveInputPcm(session: GeminiLiveSession, pcm: Uint8Array, mimeT
   session.activeInputMimeType = mimeType;
 }
 
-// In-memory session store (TODO: Move to Redis for production)
+// Legacy Gemini Live session store. Native production Live Tutor uses the
+// LiveKit/OpenAI path; this store is retained only for development rollback
+// tests and must never become a production session coordinator.
 const activeGeminiLiveSessions = new Map<string, GeminiLiveSession>();
 
 function buildSessionId(): string {
@@ -297,6 +299,9 @@ export async function createGeminiLiveSession(options: {
   onResponseCompleted?: (turnNumber: number, generationId: number) => void | Promise<void>;
   onTranscript?: (transcript: { speaker: 'user' | 'assistant'; text: string; isFinal: boolean; turnNumber: number; generationId: number }) => void;
 } = {}): Promise<GeminiLiveSession> {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('Legacy Gemini Live sessions are disabled in production. Use native LiveKit Live Tutor.');
+  }
   const sessionId = buildSessionId();
   const now = Date.now();
 

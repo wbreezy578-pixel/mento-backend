@@ -6,7 +6,10 @@ const AI_HISTORY_MESSAGE_LIMIT = 40;
 export const CONVERSATION_SUMMARY_MAX_CHARS = 6_000;
 const SUMMARY_MESSAGE_MAX_CHARS = 240;
 const MAX_SUMMARY_UPDATE_RETRIES = 5;
-const MAX_UNSUMMARIZED_CONTEXT_MESSAGES = 80;
+// The model receives a compact recent window; older turns are represented by
+// the durable summary. Fetching more than this only adds database and JSON
+// overhead before the token-budget trimmer discards it.
+const MAX_UNSUMMARIZED_CONTEXT_MESSAGES = 40;
 export const RECENT_MESSAGE_WINDOW = AI_HISTORY_MESSAGE_LIMIT;
 const activeSummaryRefreshes = new Map<string, Promise<void>>();
 

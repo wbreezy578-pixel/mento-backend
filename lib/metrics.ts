@@ -23,6 +23,11 @@ type MetricsState = {
   liveTutorSessionEvents: client.Counter<'event' | 'transport'>;
   liveTutorAvatarAvOffset: client.Histogram<'transport'>;
   liveTutorMinutesDeducted: client.Counter<'status'>;
+  chatTimeToFirstToken: client.Histogram<'answer_mode'>;
+  chatGenerationTotal: client.Histogram<'outcome'>;
+  chatHistoryLoad: client.Histogram<'conversation_size'>;
+  chatGeminiResponse: client.Histogram<'model'>;
+  chatFallbacks: client.Counter<'reason'>;
 };
 
 declare global {
@@ -172,6 +177,45 @@ function initializeMetrics(): MetricsState {
     registers: [register],
   }));
 
+  const chatTimeToFirstToken = createMetric(register, 'chat_time_to_first_token_ms', () => new client.Histogram({
+    name: 'chat_time_to_first_token_ms',
+    help: 'End-to-end chat request time until the first streamed token is delivered',
+    labelNames: ['answer_mode'] as const,
+    buckets: [50, 100, 250, 500, 1000, 2500, 5000, 10000, 20000, 40000, 60000],
+    registers: [register],
+  }));
+
+  const chatGenerationTotal = createMetric(register, 'chat_generation_total_ms', () => new client.Histogram({
+    name: 'chat_generation_total_ms',
+    help: 'End-to-end chat request duration through completion or failure',
+    labelNames: ['outcome'] as const,
+    buckets: [100, 500, 1000, 2500, 5000, 10000, 20000, 40000, 60000, 120000],
+    registers: [register],
+  }));
+
+  const chatHistoryLoad = createMetric(register, 'chat_history_load_ms', () => new client.Histogram({
+    name: 'chat_history_load_ms',
+    help: 'Database time spent loading the context for a chat request',
+    labelNames: ['conversation_size'] as const,
+    buckets: [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+    registers: [register],
+  }));
+
+  const chatGeminiResponse = createMetric(register, 'chat_gemini_response_ms', () => new client.Histogram({
+    name: 'chat_gemini_response_ms',
+    help: 'Gemini provider time for a streamed chat response',
+    labelNames: ['model'] as const,
+    buckets: [50, 100, 250, 500, 1000, 2500, 5000, 10000, 20000, 40000, 60000],
+    registers: [register],
+  }));
+
+  const chatFallbacks = createMetric(register, 'chat_fallbacks_total', () => new client.Counter({
+    name: 'chat_fallbacks_total',
+    help: 'Chat provider fallback and retry outcomes',
+    labelNames: ['reason'] as const,
+    registers: [register],
+  }));
+
   const state: MetricsState = {
     register,
     rateLimitHits,
@@ -190,6 +234,11 @@ function initializeMetrics(): MetricsState {
     liveTutorSessionEvents,
     liveTutorAvatarAvOffset,
     liveTutorMinutesDeducted,
+    chatTimeToFirstToken,
+    chatGenerationTotal,
+    chatHistoryLoad,
+    chatGeminiResponse,
+    chatFallbacks,
   };
 
   (globalThis as typeof globalThis & { __mentoPromClientMetrics__?: MetricsState })[GLOBAL_METRIC_STATE] = state;
@@ -240,6 +289,31 @@ export const liveTutorVoiceLatency = metrics.liveTutorVoiceLatency;
 export const liveTutorSessionEvents = metrics.liveTutorSessionEvents;
 export const liveTutorAvatarAvOffset = metrics.liveTutorAvatarAvOffset;
 export const liveTutorMinutesDeducted = metrics.liveTutorMinutesDeducted;
+export const chatTimeToFirstToken = metrics.chatTimeToFirstToken;
+export const chatGenerationTotal = metrics.chatGenerationTotal;
+export const chatHistoryLoad = metrics.chatHistoryLoad;
+export const chatGeminiResponse = metrics.chatGeminiResponse;
+export const chatFallbacks = metrics.chatFallbacks;
+
+export function observeChatTimeToFirstToken(durationMs: number, answerMode: 'short' | 'detailed' = 'detailed'): void {
+  if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatTimeToFirstToken.labels(answerMode).observe(durationMs);
+}
+
+export function observeChatGenerationTotal(durationMs: number, outcome: 'success' | 'failed' | 'cancelled'): void {
+  if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatGenerationTotal.labels(outcome).observe(durationMs);
+}
+
+export function observeChatHistoryLoad(durationMs: number, conversationSize: 'fresh' | 'long' = 'fresh'): void {
+  if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatHistoryLoad.labels(conversationSize).observe(durationMs);
+}
+
+export function observeChatGeminiResponse(durationMs: number, model: string): void {
+  if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatGeminiResponse.labels(model || 'unknown').observe(durationMs);
+}
+
+export function recordChatFallback(reason: string): void {
+  metrics.chatFallbacks.labels(reason || 'unknown').inc();
+}
 
 export function observeLiveTutorVoiceLatency(stage: string, durationMs: number): void {
   if (!Number.isFinite(durationMs) || durationMs < 0) return;

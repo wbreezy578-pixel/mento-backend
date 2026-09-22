@@ -9,7 +9,7 @@ import { streamTextInChunks } from '../app/lib/aiStreaming';
 import logger from '../lib/logger';
 import { getCircuitBreaker, getClientErrorMessage, getProviderRetryOptions, sanitizeForLogging } from '../lib/resilience';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
-import '../lib/metrics';
+import { observeChatGeminiResponse, recordChatFallback } from '../lib/metrics';
 import { getGeminiApiKey, loadAndValidateEnvironment } from '../lib/env';
 import { isSupportedNormalChatModel, NORMAL_CHAT_COST_AWARE_FALLBACKS, NORMAL_CHAT_GEMINI_MODELS, type NormalChatGeminiModel } from './geminiPricing';
 import { trimContextByTokenBudget, checkContextFitsBudget, UNTRUSTED_SUMMARY_ACKNOWLEDGEMENT, type ContextBudgetTrimResult } from './contextBudgetManager';
@@ -935,7 +935,9 @@ export async function askGeminiStream(
         geminiBreaker.recordSuccess();
         const usage = normalizeGeminiUsage(model, usageMetadata);
         onUsage?.(usage);
-        observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: requestKind });
+        const providerDurationMs = Date.now() - requestStartedAt;
+        observeMonitoringLatency('gemini', providerDurationMs, { provider: 'gemini', operation: requestKind });
+        if (requestKind === 'chat') observeChatGeminiResponse(providerDurationMs, model);
         logger.info('Gemini stream completed', {
           provider: 'gemini',
           kind: requestKind,
@@ -974,6 +976,7 @@ export async function askGeminiStream(
           break;
         }
         fallbackReason = classification.category;
+        if (requestKind === 'chat') recordChatFallback(classification.category);
       }
     }
   } finally {

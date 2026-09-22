@@ -28,6 +28,7 @@ import { createHash } from 'node:crypto';
 import { acquireAIGenerationLock, releaseAIGenerationLock, startAIGenerationLockHeartbeat } from '../../../../lib/aiGenerationLock';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../lib/userSettings';
 import { ChatOperationConflictError, claimInitialChatOperation, completeInitialChatOperation, failInitialChatOperation } from '../../../../services/chatOperationService';
+import { observeChatGenerationTotal, observeChatHistoryLoad, observeChatTimeToFirstToken } from '../../../../lib/metrics';
 
 const CORS_METHODS = 'POST, OPTIONS';
 const MAX_IMAGE_BASE64_CHARS = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
@@ -202,7 +203,9 @@ export async function POST(req: Request) {
     try {
       const historyStartedAt = Date.now();
       historyForAI = await getConversationHistoryForAI(conversationId);
-      observeMonitoringLatency('database', Date.now() - historyStartedAt, { route: 'chat-stream', operation: 'history' });
+      const historyDurationMs = Date.now() - historyStartedAt;
+      observeMonitoringLatency('database', historyDurationMs, { route: 'chat-stream', operation: 'history' });
+      observeChatHistoryLoad(historyDurationMs, historyForAI.length > 30 ? 'long' : 'fresh');
       observeMonitoringLatency('api', Date.now() - requestStartedAt, { route: 'chat-stream', operation: 'history-ready' });
       logger.info('Chat stream history ready', {
         conversationId,
@@ -342,6 +345,7 @@ export async function POST(req: Request) {
                     operation: 'first-token',
                     status: 'success',
                   });
+                  observeChatTimeToFirstToken(firstTokenAt - requestStartedAt, answerMode);
                   logger.info('Chat stream first Gemini token', {
                     requestId,
                     conversationId,
@@ -392,10 +396,13 @@ export async function POST(req: Request) {
               errorName: summaryError instanceof Error ? summaryError.name : 'UnknownError',
             });
           });
-          observeMonitoringLatency('api', Date.now() - requestStartedAt, { route: 'chat-stream', operation: 'total' });
+          const totalGenerationMs = Date.now() - requestStartedAt;
+          observeMonitoringLatency('api', totalGenerationMs, { route: 'chat-stream', operation: 'total' });
+          observeChatGenerationTotal(totalGenerationMs, 'success');
           close();
         } catch (err: unknown) {
           if (err instanceof AIGenerationCancelledError) {
+            observeChatGenerationTotal(Date.now() - requestStartedAt, 'cancelled');
             if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'generation_cancelled' }).catch(() => undefined);
             if (assistantMessageId) {
               await prisma.conversationMessage.deleteMany({
@@ -430,6 +437,7 @@ export async function POST(req: Request) {
             upgradeAvailable: gatewayBody?.upgradeAvailable === true,
             resetTime: typeof gatewayBody?.resetTime === 'string' ? gatewayBody.resetTime : null,
           };
+          observeChatGenerationTotal(Date.now() - requestStartedAt, 'failed');
           logger.error('Chat stream error', { error: { message: appError.message, status: appError.status } });
           if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'generation_failed' }).catch(() => undefined);
           if (assistantMessageId) {

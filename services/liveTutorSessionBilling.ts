@@ -9,6 +9,13 @@ export interface LiveTutorFinalizationUsageInput {
   status: LiveTutorTerminalStatus;
 }
 
+/** A terminal session is billable only after the wallet transaction commits. */
+export function assertLiveTutorDebitCommitted(decision: { allowed: boolean; reason?: string }): void {
+  if (!decision.allowed) {
+    throw new Error(`Live Tutor wallet debit was not committed: ${decision.reason ?? 'unknown reason'}`);
+  }
+}
+
 /**
  * Separates elapsed/observed time from debit-authoritative time. A failed
  * session is rolled back by policy, so it must never be reported or persisted

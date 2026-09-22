@@ -71,7 +71,7 @@ const FREE_TIER_BUDGET: ContextBudget = {
   conversationSummaryMaxTokens: 1_500,
   recentTurnsMaxTokens: 4_000,
   latestInputMaxTokens: 3_000,
-  outputTokenReserve: 1_024, // CHAT_MAX_OUTPUT_TOKENS
+  outputTokenReserve: 512, // CHAT_MAX_OUTPUT_TOKENS
   maxTokensPerTurn: 5_000,
   maxRecentTurns: 5,
 };
@@ -82,7 +82,7 @@ const PRO_TIER_BUDGET: ContextBudget = {
   conversationSummaryMaxTokens: 3_000,
   recentTurnsMaxTokens: 16_000,
   latestInputMaxTokens: 8_000,
-  outputTokenReserve: 1_024, // CHAT_MAX_OUTPUT_TOKENS
+  outputTokenReserve: 512, // CHAT_MAX_OUTPUT_TOKENS
   maxTokensPerTurn: 10_000,
   maxRecentTurns: 15,
 };

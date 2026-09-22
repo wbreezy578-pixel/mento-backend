@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { resolveLiveTutorFinalizationUsage } from './liveTutorSessionBilling';
+import { assertLiveTutorDebitCommitted, resolveLiveTutorFinalizationUsage } from './liveTutorSessionBilling';
 
 describe('Live Tutor terminal billing usage', () => {
+  it('does not treat a denied wallet debit as a finalized session', () => {
+    expect(() => assertLiveTutorDebitCommitted({ allowed: false, reason: 'Wallet unavailable' })).toThrow('wallet debit was not committed');
+    expect(() => assertLiveTutorDebitCommitted({ allowed: true })).not.toThrow();
+  });
   it('records a failed startup as zero charged seconds even if its observed duration reached the reservation cap', () => {
     expect(resolveLiveTutorFinalizationUsage({
       secondsReserved: 1_800,

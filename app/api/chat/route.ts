@@ -69,7 +69,7 @@ export async function POST(req: Request) {
     const message = typeof body?.message === 'string' ? body.message.trim() : '';
     const image = body?.image;
     requestId = requireClientAIRequestId(req, body?.requestId);
-    const answerMode = body?.answerMode === 'short' ? 'short' : 'detailed';
+    const answerMode = body?.answerMode === 'detailed' ? 'detailed' : 'short';
 
     if (!message && !image) {
       return buildErrorResponse('Invalid input: message or image is required', 400, 'validation_error', req.headers.get('origin'), requestId);

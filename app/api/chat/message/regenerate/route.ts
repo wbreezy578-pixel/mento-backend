@@ -44,7 +44,7 @@ export async function POST(req: Request) {
     }
 
     const messageId = typeof body?.messageId === 'string' ? body.messageId.trim() : '';
-    const answerMode = body?.answerMode === 'short' ? 'short' : 'detailed';
+    const answerMode = body?.answerMode === 'detailed' ? 'detailed' : 'short';
     const requestId = requireClientAIRequestId(req, body?.requestId);
     if (!messageId) {
       return NextResponse.json({ error: 'Invalid input: messageId is required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });

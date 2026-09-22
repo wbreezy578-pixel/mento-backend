@@ -1354,7 +1354,16 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
     select: { id: true },
   });
   if (!existingBeforeFinalize) {
-    return reserveUsage({ ...validatedInput, success: true });
+    // Native Live Tutor creates its durable session before media is usable and
+    // intentionally does not debit at admission. Its terminal finalizer is
+    // therefore allowed to arrive without a pending UsageLog row. In that
+    // case this must be a completed reservation, otherwise `pending: true`
+    // creates an unfinished ledger entry and leaves the wallet unchanged.
+    return reserveUsage({
+      ...validatedInput,
+      ...(validatedInput.feature === 'live_tutor' ? { pending: false } : {}),
+      success: true,
+    });
   }
 
   try {

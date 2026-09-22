@@ -254,10 +254,12 @@ export async function GET(req: Request) {
     }
     capacityReservationRequestId = requestId;
 
-    const authorizedSeconds = Math.min(
-      maxSessionSeconds,
-      Math.max(0, billingDecision.remainingUsage ?? 0),
-    );
+    // The lightweight preflight asks for one second only as an authorization
+    // probe, so its remainingUsage is balance minus one. Restore that probe
+    // second when setting the actual session reservation; otherwise every
+    // session silently loses one second before it can be used.
+    const availableSecondsAfterPreflight = Math.max(0, (billingDecision.remainingUsage ?? 0) + 1);
+    const authorizedSeconds = Math.min(maxSessionSeconds, availableSecondsAfterPreflight);
     // The duration is reserved at admission, but it must not begin to elapse
     // while LiveKit/Simli are still bringing media online.  The worker marks
     // this session usable only after mobile has proved strict readiness.

@@ -114,6 +114,35 @@ async function main() {
     assert.ok((usableBilling?.secondsConsumed ?? 0) >= 9 && (usableBilling?.secondsConsumed ?? 0) < 20, 'billing must start at usableAt, not createdAt');
     await prisma.liveTutorSession.delete({ where: { streamId: usableStream } });
 
+    const deniedStream = `${streamId}-plan-expired-before-finalization`;
+    const deniedRequest = `${requestId}-plan-expired-before-finalization`;
+    const walletBeforeDeniedFinalize = await prisma.liveTutorWallet.findUniqueOrThrow({ where: { userId: entitlementUser.id } });
+    await prisma.liveTutorSession.create({ data: {
+      userId: entitlementUser.id,
+      streamId: deniedStream,
+      billingRequestId: deniedRequest,
+      status: 'active',
+      createdAt: new Date(Date.now() - 5_000),
+      usableAt: new Date(Date.now() - 4_000),
+      lastActivityAt: new Date(Date.now() - 1_000),
+      expiresAt: new Date(Date.now() + 60_000),
+      secondsReserved: 60,
+    } });
+    await prisma.userWallet.update({ where: { userId: entitlementUser.id }, data: { subscriptionStatus: 'expired', subscriptionExpiresAt: new Date(Date.now() - 1_000) } });
+    await completeSimliSessionLifecycle(deniedStream, { status: 'completed', timing: 'active_end', reason: 'plan expired during session' }, entitlementUser.id);
+    const deniedFinalization = await prisma.liveTutorSession.findUniqueOrThrow({ where: { streamId: deniedStream } });
+    const deniedUsage = await prisma.usageLog.findUniqueOrThrow({ where: { provider_requestId: { provider: 'Simli', requestId: deniedRequest } } });
+    const walletAfterDeniedFinalize = await prisma.liveTutorWallet.findUniqueOrThrow({ where: { userId: entitlementUser.id } });
+    assert.equal(deniedFinalization.status, 'ended', 'billing denial must not strand the session');
+    assert.equal(deniedFinalization.secondsConsumed, 0, 'billing denial must not report uncharged minutes');
+    assert.equal(deniedFinalization.billingFinalized, true, 'uncharged session must be terminal');
+    assert.equal(deniedUsage.success, false, 'denied usage must never be recorded as completed');
+    assert.equal(await prisma.liveTutorMinuteLedger.count({ where: { idempotencyKey: `usage:Simli:${deniedUsage.id}` } }), 0, 'denied usage must not create a debit');
+    assert.equal(walletAfterDeniedFinalize.includedSeconds, walletBeforeDeniedFinalize.includedSeconds, 'denied usage must not change included balance');
+    assert.equal(walletAfterDeniedFinalize.topUpSeconds, walletBeforeDeniedFinalize.topUpSeconds, 'denied usage must not change top-up balance');
+    await prisma.liveTutorSession.delete({ where: { streamId: deniedStream } });
+    await prisma.userWallet.update({ where: { userId: entitlementUser.id }, data: { subscriptionStatus: 'active', subscriptionExpiresAt } });
+
     const recoveryStream = `${streamId}-fresh-recovery`;
     const recoveryRequest = `${requestId}-fresh-recovery`;
     const recoveryCreatedAt = new Date();
@@ -174,6 +203,10 @@ async function main() {
     assert.equal(await prisma.liveTutorSession.findUnique({ where: { userId: user.id } }).then((session) => session?.status), 'ended', 'normal terminal finalization must release the active claim');
     assert.equal(await prisma.liveTutorSession.findUnique({ where: { userId: user.id } }).then((session) => session?.secondsConsumed), 60, 'usage must not exceed the 60-second reservation');
     assert.equal(await claimLiveTutorSession(user.id, `${requestId}-after-end`), true, 'user must start a second session after normal end');
+    const freshClaim = await prisma.liveTutorSession.findUniqueOrThrow({ where: { userId: user.id } });
+    assert.equal(freshClaim.usableAt, null, 'a new session must not inherit the previous tutor-ready timestamp');
+    assert.equal(freshClaim.secondsConsumed, 0, 'a new session must not inherit charged seconds');
+    assert.equal(freshClaim.secondsReserved, 0, 'a pending claim must not inherit the previous duration');
     await prisma.liveTutorSession.delete({ where: { userId: user.id } });
 
     const expiredStream = `${streamId}-expired`;

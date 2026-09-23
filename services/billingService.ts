@@ -21,6 +21,7 @@ import {
   isNormalChatGeminiBudgetSubject,
 } from './geminiDailyBudget';
 import { createKeyedTransactionQueue } from './billingTransactionQueue';
+import { resolveUsageLogSuccess } from './billingLedgerStatus';
 
 // LiveTutorWallet.minutesBalance is stored in minutes; live_tutor amounts are always passed in seconds.
 const SECONDS_PER_MINUTE = 60;
@@ -735,12 +736,10 @@ async function createUsageLedgerEntry(
   metadata?: Record<string, unknown>,
 ): Promise<{ id: string; success: boolean | null; providerCostUSD: number; userChargeUSD: number; profitUSD: number }> {
   const provider = input.provider ?? getDefaultProvider(input.feature);
-  const successValue = input.pending
-    ? null
-    : typeof input.success === 'boolean'
-      ? input.success
-      : allowed;
-  const secondsUsed = typeof input.secondsUsed === 'number' ? input.secondsUsed : (input.feature === 'live_tutor' ? (input.amount ?? 1) : 0);
+  const successValue = resolveUsageLogSuccess(allowed, input.pending === true, input.success);
+  const secondsUsed = input.feature === 'live_tutor' && !allowed
+    ? 0
+    : typeof input.secondsUsed === 'number' ? input.secondsUsed : (input.feature === 'live_tutor' ? (input.amount ?? 1) : 0);
 
   try {
     const record = await tx.usageLog.create({

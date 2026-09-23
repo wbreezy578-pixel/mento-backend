@@ -55,6 +55,7 @@ export default defineConfig({
       "services/chatService.test.ts",
       "services/chatOperationService.test.ts",
       "services/billingReservation.test.ts",
+      "services/billingLedgerStatus.test.ts",
       "services/productPolicy.test.ts",
       "services/entitlementFoundation.test.ts",
       "services/economicsService.test.ts",

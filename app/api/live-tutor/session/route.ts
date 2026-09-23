@@ -310,7 +310,9 @@ export async function GET(req: Request) {
           streamId: liveKitSession.streamId,
           status: 'active',
           expiresAt: serverSessionExpiresAt,
+          usableAt: null,
           secondsReserved: authorizedSeconds,
+          secondsConsumed: 0,
           lastActivityAt: new Date(),
         },
       });

@@ -192,35 +192,6 @@ async function attachSimliAvatar(room: Room, onFirstAudioFrame?: () => void): Pr
   });
 }
 
-class Pcm16Resampler {
-  private samples: number[] = [];
-  private position = 0;
-
-  transform(frame: AudioFrame): AudioFrame | null {
-    if (frame.channels !== 1) throw new Error('Live Tutor staging agent expects mono audio.');
-    if (frame.sampleRate === SAMPLE_RATE) return frame;
-    if (frame.sampleRate !== 24_000) throw new Error(`Unexpected OpenAI audio rate: ${frame.sampleRate}.`);
-
-    for (const sample of frame.data) this.samples.push(sample);
-    const output: number[] = [];
-    const step = frame.sampleRate / SAMPLE_RATE;
-    while (this.position + 1 < this.samples.length) {
-      const lower = Math.floor(this.position);
-      const fraction = this.position - lower;
-      const a = this.samples[lower]!;
-      const b = this.samples[lower + 1]!;
-      output.push(Math.round(a + (b - a) * fraction));
-      this.position += step;
-    }
-    const consumed = Math.floor(this.position);
-    this.samples = this.samples.slice(consumed);
-    this.position -= consumed;
-    if (output.length === 0) return null;
-    const data = Int16Array.from(output);
-    return new AudioFrame(data, SAMPLE_RATE, 1, data.length);
-  }
-}
-
 class TimestampedDataStreamAudioOutput extends DataStreamAudioOutput {
   private firstFrameLogged = false;
   private readonly onFirstAudioFrame?: () => void;
@@ -267,16 +238,13 @@ class TimestampedDataStreamAudioOutput extends DataStreamAudioOutput {
 }
 
 class MentoStagingTutor extends Agent {
-  private readonly resampler = new Pcm16Resampler();
   private readonly onFirstAudioEmitted?: () => void;
   private readonly getPlaybackEpoch?: () => number;
-  private readonly directAudio: boolean;
 
   constructor(
     historicalContext?: string | null,
     onFirstAudioEmitted?: () => void,
     getPlaybackEpoch?: () => number,
-    directAudio = false,
   ) {
     super({
       instructions: [
@@ -291,7 +259,6 @@ class MentoStagingTutor extends Agent {
     });
     this.onFirstAudioEmitted = onFirstAudioEmitted;
     this.getPlaybackEpoch = getPlaybackEpoch;
-    this.directAudio = directAudio;
   }
 
   override async realtimeAudioOutputNode(
@@ -300,8 +267,6 @@ class MentoStagingTutor extends Agent {
   ): Promise<WebReadableStream<AudioFrame> | null> {
     const source = await Agent.default.realtimeAudioOutputNode(this, audio, modelSettings);
     if (!source) return null;
-    const resampler = this.resampler;
-    const directAudio = this.directAudio;
     const onFirstAudioEmitted = this.onFirstAudioEmitted;
     // A Realtime response can have frames already in flight when server VAD
     // detects a new learner utterance.  Bind this stream to the output epoch
@@ -315,15 +280,13 @@ class MentoStagingTutor extends Agent {
         try {
           for await (const frame of source) {
             if (getPlaybackEpoch && playbackEpoch !== getPlaybackEpoch()) continue;
-            const converted = directAudio ? frame : resampler.transform(frame);
-            if (converted) {
-              if (!firstFrameLogged) {
-                firstFrameLogged = true;
-                console.log('[MentoLiveTutorStaging] openai_first_audio_frame', JSON.stringify({ timestampMs: Date.now() }));
-                onFirstAudioEmitted?.();
-              }
-              controller.enqueue(converted);
+            if (!firstFrameLogged) {
+              firstFrameLogged = true;
+              console.log('[MentoLiveTutorStaging] openai_first_audio_frame', JSON.stringify({ timestampMs: Date.now() }));
+              onFirstAudioEmitted?.();
             }
+            // LiveKit resamples to the Simli output's requested 16 kHz rate.
+            controller.enqueue(frame);
           }
           controller.close();
         } catch (error) {
@@ -607,7 +570,6 @@ export default defineAgent({
         undefined,
         () => publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'first_audio_emitted', workerStartedAtMs, responseTurn),
         () => playbackEpoch,
-        directAudio,
       ),
       room: ctx.room,
       inputOptions: { participantIdentity: expectedMobileParticipantIdentity },

@@ -1,4 +1,4 @@
-import { Agent, AgentSession, AgentSessionEventTypes, DataStreamAudioOutput, ServerOptions, cli, defineAgent, type JobContext, type ModelSettings } from '@livekit/agents';
+import { Agent, AgentSession, AgentSessionEventTypes, DataStreamAudioOutput, ServerOptions, cli, defineAgent, inference, type JobContext, type ModelSettings } from '@livekit/agents';
 import * as openai from '@livekit/agents-plugin-openai';
 import { AudioFrame, RoomEvent, type Room } from '@livekit/rtc-node';
 import { ReadableStream as WebReadableStream } from 'stream/web';
@@ -10,11 +10,9 @@ const AVATAR_IDENTITY = process.env.SIMLI_AVATAR_IDENTITY?.trim() || 'simli-avat
 const AVATAR_JOIN_TIMEOUT_MS = 20_000;
 const MOBILE_PARTICIPANT_IDENTITY_PREFIX = 'mento-live-tutor-subscriber-';
 const AGENT_NAME = process.env.MENTO_LIVE_TUTOR_AGENT_NAME?.trim() || 'mento-live-tutor-staging';
-// Mobile speakers and network jitter can briefly leak avatar audio back into
-// the microphone. A short VAD window treated that echo as a new user turn and
-// repeatedly cleared Simli playback. Keep responses responsive, but require a
-// stable pause/speech interval before changing turns.
-const SERVER_VAD_SILENCE_DURATION_MS = 850;
+// One worker-side VAD decides when speech is sustained enough to interrupt.
+// The Realtime API must not independently cancel responses on short noises.
+const USER_TURN_SILENCE_DURATION_MS = 850;
 const INTERRUPTION_MIN_DURATION_MS = 1100;
 const LIFECYCLE_TOPIC = 'mento.live_tutor.lifecycle.v1';
 const CLIENT_READY_TOPIC = 'mento.live_tutor.client_ready.v1';
@@ -299,8 +297,8 @@ class MentoStagingTutor extends Agent {
     if (!source) return null;
     const resampler = this.resampler;
     const onFirstAudioEmitted = this.onFirstAudioEmitted;
-    // A Realtime response can have frames already in flight when server VAD
-    // detects a new learner utterance.  Bind this stream to the output epoch
+    // A Realtime response can have frames already in flight after the worker
+    // confirms an interruption. Bind this stream to the output epoch
     // it started in so frames from a cancelled response cannot enter Simli's
     // next playback segment.
     const playbackEpoch = this.getPlaybackEpoch?.();
@@ -354,6 +352,8 @@ export default defineAgent({
     let activeTurn: TurnTrace | undefined;
     let responseTurn: TurnTrace | undefined;
     let interruptedResponseTurn: TurnTrace | undefined;
+    let activeSpeechHandle: { readonly interrupted: boolean } | null = null;
+    let speakingSpeechHandle: { readonly interrupted: boolean } | null = null;
     let playbackEpoch = 0;
     const confirmInterruptionStopped = () => {
       if (!interruptionPending || !agentOutputStopConfirmed || !simliOutputStopConfirmed) return;
@@ -510,16 +510,16 @@ export default defineAgent({
         model: process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime',
         voice: process.env.OPENAI_REALTIME_VOICE || 'marin',
         speed: Number(process.env.OPENAI_REALTIME_SPEED || '0.95'),
-        turnDetection: {
-          type: 'server_vad',
-          silence_duration_ms: SERVER_VAD_SILENCE_DURATION_MS,
-          create_response: true,
-          interrupt_response: true,
-        },
+        turnDetection: null,
       }),
+      vad: new inference.VAD({ model: 'silero' }),
       turnHandling: {
+        turnDetection: 'vad',
+        endpointing: { minDelay: USER_TURN_SILENCE_DURATION_MS },
         interruption: {
+          mode: 'vad',
           minDuration: INTERRUPTION_MIN_DURATION_MS,
+          resumeFalseInterruption: false,
         },
       },
     });
@@ -527,46 +527,16 @@ export default defineAgent({
     session.on(AgentSessionEventTypes.UserStateChanged, (event) => {
       userState = event.newState;
       if (event.newState === 'speaking') {
-        const isInterruptingActiveResponse = agentState === 'speaking';
-        interruptionPending = isInterruptingActiveResponse;
         activeTurn = { id: `turn-${++nextTurnNumber}`, startedAtMs: Date.now() };
-        if (isInterruptingActiveResponse) {
-          // DataStreamAudioOutput.clearBuffer issues LiveKit's authenticated
-          // lk.clear_buffer RPC to Simli.  This is a real remote playout stop,
-          // not a mobile-only state update.  The epoch gate below discards any
-          // OpenAI frames that were already in flight for the interrupted turn.
-          interruptedResponseTurn = responseTurn;
-          playbackEpoch += 1;
-          agentOutputStopConfirmed = false;
-          simliOutputStopConfirmed = false;
-          publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'interruption_started', workerStartedAtMs, interruptedResponseTurn);
-          if (!avatarOutput) {
-            console.warn('[MentoLiveTutorStaging] simli_playback_clear_unavailable');
-          } else {
-            void avatarOutput.clearRemotePlayback().then(() => {
-              simliOutputStopConfirmed = true;
-              confirmInterruptionStopped();
-            }).catch((error) => {
-              console.warn('[MentoLiveTutorStaging] simli_playback_clear_failed', JSON.stringify({
-                message: error instanceof Error ? error.message : String(error),
-                fallback: 'local_flush_and_continue',
-              }));
-              // The RPC is a best-effort remote drain. Do not terminate a paid
-              // session because one interruption acknowledgement timed out:
-              // flushing the local stream lets the next response continue and
-              // avoids leaving the learner in a silent room.
-              avatarOutput?.flush();
-              simliOutputStopConfirmed = true;
-              confirmInterruptionStopped();
-            });
-          }
-        }
+        // VAD speech-start is only a candidate. The SDK applies minDuration
+        // before cancelling the response; never clear Simli here.
         publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'user_speech_started', workerStartedAtMs, activeTurn);
       } else if (event.oldState === 'speaking') {
         publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'provider_speech_ended', workerStartedAtMs, activeTurn);
       }
     });
     session.on(AgentSessionEventTypes.SpeechCreated, (event) => {
+      activeSpeechHandle = event.speechHandle;
       if (event.source === 'generate_reply') {
         responseTurn = activeTurn;
         publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'response_requested', workerStartedAtMs, responseTurn);
@@ -575,14 +545,37 @@ export default defineAgent({
     session.on(AgentSessionEventTypes.AgentStateChanged, (event) => {
       const wasSpeaking = agentState === 'speaking';
       agentState = event.newState;
+      if (!wasSpeaking && event.newState === 'speaking') speakingSpeechHandle = activeSpeechHandle;
       if (event.newState === 'thinking') publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'agent_thinking', workerStartedAtMs, activeTurn);
-      if (wasSpeaking && event.newState !== 'speaking' && interruptionPending) {
-        // AgentState leaving speaking is the provider/agent acknowledgement
-        // that its response pipeline was cancelled.  The lifecycle event is
-        // held until Simli also acknowledges its remote buffer clear.
+      if (wasSpeaking && event.newState !== 'speaking' && speakingSpeechHandle?.interrupted) {
+        // The speech handle, not microphone activity or a normal response end,
+        // is the authority for clearing the remote avatar queue.
+        interruptionPending = true;
+        interruptedResponseTurn = responseTurn;
+        playbackEpoch += 1;
         agentOutputStopConfirmed = true;
-        confirmInterruptionStopped();
+        simliOutputStopConfirmed = false;
+        publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'interruption_started', workerStartedAtMs, interruptedResponseTurn);
+        if (!avatarOutput) {
+          console.warn('[MentoLiveTutorStaging] simli_playback_clear_unavailable');
+          simliOutputStopConfirmed = true;
+          confirmInterruptionStopped();
+        } else {
+          void avatarOutput.clearRemotePlayback().then(() => {
+            simliOutputStopConfirmed = true;
+            confirmInterruptionStopped();
+          }).catch((error) => {
+            console.warn('[MentoLiveTutorStaging] simli_playback_clear_failed', JSON.stringify({
+              message: error instanceof Error ? error.message : String(error),
+              fallback: 'local_flush_and_continue',
+            }));
+            avatarOutput?.flush();
+            simliOutputStopConfirmed = true;
+            confirmInterruptionStopped();
+          });
+        }
       }
+      if (wasSpeaking && event.newState !== 'speaking') speakingSpeechHandle = null;
       if (wasSpeaking && event.newState === 'listening' && !interruptionPending && userState !== 'speaking') publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'response_completed', workerStartedAtMs, responseTurn);
       if (event.newState === 'listening' && agentReady && sessionUsable && userState !== 'speaking') publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'listening_resumed', workerStartedAtMs, activeTurn);
     });

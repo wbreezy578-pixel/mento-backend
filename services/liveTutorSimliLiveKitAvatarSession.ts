@@ -64,6 +64,32 @@ export type LiveTutorSimliLiveKitAvatarSession = {
   close(): Promise<void>;
 };
 
+/** QA-only room with no Simli session, attachment, or avatar participant. */
+export async function createLiveTutorDirectVoiceSession(
+  config: Pick<LiveTutorSimliLiveKitConfig, 'liveKitUrl' | 'liveKitApiKey' | 'liveKitApiSecret' | 'roomName' | 'subscriberIdentity'>,
+  maxSessionLength: number,
+  streamId: string,
+): Promise<LiveTutorSimliLiveKitAvatarSession> {
+  const startedAt = Date.now();
+  const subscriberAccess = new AccessToken(config.liveKitApiKey, config.liveKitApiSecret, {
+    identity: config.subscriberIdentity,
+    ttl: `${Math.ceil((maxSessionLength + LIVEKIT_TOKEN_GRACE_SECONDS) / 60)}m`,
+  });
+  subscriberAccess.addGrant({ room: config.roomName, roomJoin: true, canPublish: true, canSubscribe: true });
+  const subscriberToken = await subscriberAccess.toJwt();
+  return {
+    token: subscriberToken,
+    sessionToken: subscriberToken,
+    subscriberToken,
+    streamId,
+    sessionId: streamId,
+    roomName: config.roomName,
+    avatarIdentity: DEFAULT_AVATAR_IDENTITY,
+    startupTimings: { tokenPreparationMs: Date.now() - startedAt, simliSessionCreateMs: 0, simliLiveKitAttachMs: 0 },
+    close: async () => undefined,
+  };
+}
+
 function present(value: string | undefined, name: string): string {
   const result = value?.trim();
   if (!result) throw new Error(`${name} is required for the LiveKit Simli proof of concept.`);

@@ -4,7 +4,7 @@ import { LiveKitAPI } from 'livekit-server-sdk';
 import { prisma } from '../../../../lib/prisma';
 // Match your exact original exports from simliService
 import { claimLiveTutorSession, closeLiveTutorRoom, completeSimliSessionLifecycle, createSimliStreamingAvatarSession, reconcileStaleLiveTutorSession, releaseLiveTutorSessionClaim, type SimliStreamingSession } from '../../../../services/simliService';
-import { createLiveTutorSimliLiveKitAvatarSession, getLiveTutorSimliLiveKitConfig, SimliLiveKitAttachmentError, type LiveTutorSimliLiveKitAvatarSession } from '../../../../services/liveTutorSimliLiveKitAvatarSession';
+import { createLiveTutorDirectVoiceSession, createLiveTutorSimliLiveKitAvatarSession, getLiveTutorSimliLiveKitConfig, SimliLiveKitAttachmentError, type LiveTutorSimliLiveKitAvatarSession } from '../../../../services/liveTutorSimliLiveKitAvatarSession';
 import { DEFAULT_LIVE_TUTOR_VOICE_PROFILE } from '../../../../services/liveTutorVoiceProfiles';
 import { resolveLiveTutorVoiceProfile } from '../../../../services/liveTutorVoiceProfiles';
 import {
@@ -22,7 +22,7 @@ import { LIVE_TUTOR_AVATAR_TRANSPORTS, resolveLiveTutorAvatarTransport } from '.
 import { validateLiveTutorVoiceProviderHandshake } from '../../../../services/liveTutorVoiceProvider';
 import { getProductPolicy } from '../../../../services/productPolicy';
 import { canUseLiveTutor } from '../../../../services/liveTutorBillingService';
-import { resolveLiveTutorAgentNameForUser } from '../../../../lib/liveTutorAgentRouting';
+import { isLiveTutorCloudCanaryUser, resolveLiveTutorAgentNameForUser } from '../../../../lib/liveTutorAgentRouting';
 import {
   acquireLiveTutorSessionLease,
   releaseActiveLiveTutorSessionCapacity,
@@ -75,6 +75,10 @@ export async function GET(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(user.id, clientIp);
     const requestUrl = new URL(req.url);
+    const directVoiceRequested = requestUrl.searchParams.get('diagnosticAudioMode') === 'direct';
+    if (directVoiceRequested && (process.env.LIVE_TUTOR_DIRECT_VOICE_TEST_ENABLED !== 'true' || !isLiveTutorCloudCanaryUser(user.email))) {
+      return NextResponse.json({ error: 'Live Tutor diagnostic mode is unavailable.' }, { status: 403 });
+    }
     const avatarTransport = resolveLiveTutorAvatarTransport(requestUrl.searchParams.get('avatarTransport'));
     if (!avatarTransport.ok) {
       return NextResponse.json(
@@ -278,19 +282,23 @@ export async function GET(req: Request) {
         subscriberIdentity: `mento-live-tutor-subscriber-${user.id}`,
       });
       liveKitUrl = liveKitConfig.liveKitUrl;
-      const avatarStartReserved = await reserveLiveTutorAvatarStartCapacity(requestId);
-      if (!avatarStartReserved) {
-        const error = new Error('Live Tutor avatar startup capacity is currently full.') as Error & { status?: number };
-        error.status = 503;
-        throw error;
-      }
-      try {
-        liveKitSession = await createLiveTutorSimliLiveKitAvatarSession({
-          ...liveKitConfig,
-          maxSessionLength: authorizedSeconds,
-        });
-      } finally {
-        await releaseLiveTutorAvatarStartCapacity(requestId).catch(() => undefined);
+      if (directVoiceRequested) {
+        liveKitSession = await createLiveTutorDirectVoiceSession(liveKitConfig, authorizedSeconds, `voice-test-${requestId}`);
+      } else {
+        const avatarStartReserved = await reserveLiveTutorAvatarStartCapacity(requestId);
+        if (!avatarStartReserved) {
+          const error = new Error('Live Tutor avatar startup capacity is currently full.') as Error & { status?: number };
+          error.status = 503;
+          throw error;
+        }
+        try {
+          liveKitSession = await createLiveTutorSimliLiveKitAvatarSession({
+            ...liveKitConfig,
+            maxSessionLength: authorizedSeconds,
+          });
+        } finally {
+          await releaseLiveTutorAvatarStartCapacity(requestId).catch(() => undefined);
+        }
       }
 
       // Make the durable session visible before transferring its global slot.
@@ -326,12 +334,13 @@ export async function GET(req: Request) {
         // Keep the provisional expiry for already-deployed workers during a
         // rolling upgrade. New workers ignore it and obtain a fresh expiry
         // only after strict readiness through worker-ready.
-        { metadata: JSON.stringify({ requestId, lifecycleTraceId, userId: user.id, streamId: liveKitSession.streamId, conversationId: liveTutorConversation.id, mobileParticipantIdentity: liveKitConfig.subscriberIdentity, sessionExpiresAt: serverSessionExpiresAt.toISOString() }) },
+        { metadata: JSON.stringify({ requestId, lifecycleTraceId, userId: user.id, streamId: liveKitSession.streamId, conversationId: liveTutorConversation.id, mobileParticipantIdentity: liveKitConfig.subscriberIdentity, sessionExpiresAt: serverSessionExpiresAt.toISOString(), ...(directVoiceRequested ? { diagnosticAudioMode: 'direct' } : {}) }) },
       );
       logger.info('Live Tutor LiveKit agent dispatched', {
         roomName: liveKitSession.roomName,
         dispatchId: dispatch.id,
         agentName,
+        diagnosticAudioMode: directVoiceRequested ? 'direct' : 'avatar',
         durationMs: Date.now() - agentDispatchStartedAt,
         simliTokenCreateMs: liveKitSession.startupTimings.simliSessionCreateMs,
         simliLiveKitAttachMs: liveKitSession.startupTimings.simliLiveKitAttachMs,
@@ -359,10 +368,11 @@ export async function GET(req: Request) {
         status: 'active',
         avatarVoiceProfile,
       };
-      logger.info('Live Tutor Simli LiveKit session creation completed', {
+      logger.info('Live Tutor LiveKit session creation completed', {
         durationMs: Date.now() - simliCreateStartedAt,
         streamId: session.streamId,
         roomName: liveKitSession.roomName,
+        diagnosticAudioMode: directVoiceRequested ? 'direct' : 'avatar',
         category: 'live_tutor_livekit_session_create',
       });
     } else {
@@ -426,6 +436,7 @@ export async function GET(req: Request) {
       avatarVoiceProfile,
       conversationId: liveTutorConversation.id,
       avatarTransport: avatarTransport.transport,
+      diagnosticAudioMode: directVoiceRequested ? 'direct' : 'avatar',
       lifecycleTraceId,
       ...(liveKitSession ? {
         liveKitUrl,

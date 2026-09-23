@@ -270,11 +270,13 @@ class MentoStagingTutor extends Agent {
   private readonly resampler = new Pcm16Resampler();
   private readonly onFirstAudioEmitted?: () => void;
   private readonly getPlaybackEpoch?: () => number;
+  private readonly directAudio: boolean;
 
   constructor(
     historicalContext?: string | null,
     onFirstAudioEmitted?: () => void,
     getPlaybackEpoch?: () => number,
+    directAudio = false,
   ) {
     super({
       instructions: [
@@ -289,6 +291,7 @@ class MentoStagingTutor extends Agent {
     });
     this.onFirstAudioEmitted = onFirstAudioEmitted;
     this.getPlaybackEpoch = getPlaybackEpoch;
+    this.directAudio = directAudio;
   }
 
   override async realtimeAudioOutputNode(
@@ -298,6 +301,7 @@ class MentoStagingTutor extends Agent {
     const source = await Agent.default.realtimeAudioOutputNode(this, audio, modelSettings);
     if (!source) return null;
     const resampler = this.resampler;
+    const directAudio = this.directAudio;
     const onFirstAudioEmitted = this.onFirstAudioEmitted;
     // A Realtime response can have frames already in flight when server VAD
     // detects a new learner utterance.  Bind this stream to the output epoch
@@ -311,7 +315,7 @@ class MentoStagingTutor extends Agent {
         try {
           for await (const frame of source) {
             if (getPlaybackEpoch && playbackEpoch !== getPlaybackEpoch()) continue;
-            const converted = resampler.transform(frame);
+            const converted = directAudio ? frame : resampler.transform(frame);
             if (converted) {
               if (!firstFrameLogged) {
                 firstFrameLogged = true;
@@ -342,6 +346,8 @@ export default defineAgent({
     logStartupTiming(lifecycleTraceId, workerStartupStartedAtMs, 'room_connected');
     const expectedMobileParticipantIdentity = getExpectedMobileParticipantIdentity(ctx);
     const streamId = getStreamId(ctx);
+    const directAudio = getDispatchMetadata(ctx).diagnosticAudioMode === 'direct';
+    console.log('[MentoLiveTutorStaging] diagnostic_audio_mode', JSON.stringify({ mode: directAudio ? 'direct' : 'avatar', streamId }));
     let avatarOutput: TimestampedDataStreamAudioOutput | null = null;
     let session: AgentSession | null = null;
     let agentReady = false;
@@ -494,16 +500,18 @@ export default defineAgent({
       logRoomTracks(ctx.room, 'track_unsubscribed');
     });
     logRoomTracks(ctx.room, 'after_connect');
-    try {
-      avatarOutput = await attachSimliAvatar(ctx.room, () => publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'simli_first_audio_frame', workerStartedAtMs, responseTurn));
-      logStartupTiming(lifecycleTraceId, workerStartupStartedAtMs, 'avatar_attached');
-    } catch (error) {
-      console.error('[MentoLiveTutorStaging] avatar_attachment_failed', JSON.stringify({
-        avatarIdentity: AVATAR_IDENTITY,
-        message: error instanceof Error ? error.message : String(error),
-      }));
-      ctx.shutdown('simli_avatar_attachment_failed');
-      return;
+    if (!directAudio) {
+      try {
+        avatarOutput = await attachSimliAvatar(ctx.room, () => publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'simli_first_audio_frame', workerStartedAtMs, responseTurn));
+        logStartupTiming(lifecycleTraceId, workerStartupStartedAtMs, 'avatar_attached');
+      } catch (error) {
+        console.error('[MentoLiveTutorStaging] avatar_attachment_failed', JSON.stringify({
+          avatarIdentity: AVATAR_IDENTITY,
+          message: error instanceof Error ? error.message : String(error),
+        }));
+        ctx.shutdown('simli_avatar_attachment_failed');
+        return;
+      }
     }
     session = new AgentSession({
       llm: new openai.realtime.RealtimeModel({
@@ -523,7 +531,7 @@ export default defineAgent({
         },
       },
     });
-    session.output.audio = avatarOutput;
+    if (avatarOutput) session.output.audio = avatarOutput;
     session.on(AgentSessionEventTypes.UserStateChanged, (event) => {
       userState = event.newState;
       if (event.newState === 'speaking') {
@@ -540,7 +548,12 @@ export default defineAgent({
           agentOutputStopConfirmed = false;
           simliOutputStopConfirmed = false;
           publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'interruption_started', workerStartedAtMs, interruptedResponseTurn);
-          if (!avatarOutput) {
+          if (directAudio) {
+            // LiveKit's RoomIO owns direct playback and the agent SDK stops
+            // its own audio when the Realtime response is interrupted.
+            simliOutputStopConfirmed = true;
+            confirmInterruptionStopped();
+          } else if (!avatarOutput) {
             console.warn('[MentoLiveTutorStaging] simli_playback_clear_unavailable');
           } else {
             void avatarOutput.clearRemotePlayback().then(() => {
@@ -594,6 +607,7 @@ export default defineAgent({
         undefined,
         () => publishLifecycle(ctx.room, expectedMobileParticipantIdentity, 'first_audio_emitted', workerStartedAtMs, responseTurn),
         () => playbackEpoch,
+        directAudio,
       ),
       room: ctx.room,
       inputOptions: { participantIdentity: expectedMobileParticipantIdentity },

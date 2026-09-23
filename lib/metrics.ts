@@ -19,6 +19,16 @@ type MetricsState = {
   providerSuccesses: client.Counter<'provider'>;
   monitoringLatency: client.Histogram<'metric' | 'provider' | 'route' | 'operation' | 'feature'>;
   monitoringFailures: client.Counter<'metric' | 'provider' | 'route' | 'operation' | 'feature' | 'status' | 'source' | 'reason'>;
+  liveTutorVoiceLatency: client.Histogram<'stage'>;
+  liveTutorSessionEvents: client.Counter<'event' | 'transport'>;
+  liveTutorAvatarAvOffset: client.Histogram<'transport'>;
+  liveTutorMinutesDeducted: client.Counter<'status'>;
+  chatTimeToFirstToken: client.Histogram<'answer_mode'>;
+  chatFirstTokenMissing: client.Counter<'answer_mode'>;
+  chatGenerationTotal: client.Histogram<'outcome'>;
+  chatHistoryLoad: client.Histogram<'conversation_size'>;
+  chatGeminiResponse: client.Histogram<'model'>;
+  chatFallbacks: client.Counter<'reason'>;
 };
 
 declare global {
@@ -138,6 +148,82 @@ function initializeMetrics(): MetricsState {
     registers: [register],
   }));
 
+  const liveTutorVoiceLatency = createMetric(register, 'live_tutor_voice_latency_ms', () => new client.Histogram({
+    name: 'live_tutor_voice_latency_ms',
+    help: 'Live Tutor latency by privacy-safe voice pipeline stage in milliseconds',
+    labelNames: ['stage'] as const,
+    buckets: [25, 50, 100, 200, 350, 500, 750, 1000, 1500, 2500, 4000, 7000, 10000],
+    registers: [register],
+  }));
+
+  const liveTutorSessionEvents = createMetric(register, 'live_tutor_session_events_total', () => new client.Counter({
+    name: 'live_tutor_session_events_total',
+    help: 'Live Tutor session lifecycle events by transport',
+    labelNames: ['event', 'transport'] as const,
+    registers: [register],
+  }));
+
+  const liveTutorAvatarAvOffset = createMetric(register, 'live_tutor_avatar_av_offset_ms', () => new client.Histogram({
+    name: 'live_tutor_avatar_av_offset_ms',
+    help: 'Absolute audio/video playout offset reported by a Live Tutor client',
+    labelNames: ['transport'] as const,
+    buckets: [25, 50, 75, 100, 150, 250, 500, 1000, 2500],
+    registers: [register],
+  }));
+
+  const liveTutorMinutesDeducted = createMetric(register, 'live_tutor_minutes_deducted_total', () => new client.Counter({
+    name: 'live_tutor_minutes_deducted_total',
+    help: 'Live Tutor minutes deducted after durable billing finalization',
+    labelNames: ['status'] as const,
+    registers: [register],
+  }));
+
+  const chatTimeToFirstToken = createMetric(register, 'chat_time_to_first_token_ms', () => new client.Histogram({
+    name: 'chat_time_to_first_token_ms',
+    help: 'End-to-end chat request time until the first streamed token is delivered',
+    labelNames: ['answer_mode'] as const,
+    buckets: [50, 100, 250, 500, 1000, 2500, 5000, 10000, 20000, 40000, 60000],
+    registers: [register],
+  }));
+
+  const chatFirstTokenMissing = createMetric(register, 'chat_first_token_missing_total', () => new client.Counter({
+    name: 'chat_first_token_missing_total',
+    help: 'Successful or failed chat generations that produced no streamed first token',
+    labelNames: ['answer_mode'] as const,
+    registers: [register],
+  }));
+
+  const chatGenerationTotal = createMetric(register, 'chat_generation_total_ms', () => new client.Histogram({
+    name: 'chat_generation_total_ms',
+    help: 'End-to-end chat request duration through completion or failure',
+    labelNames: ['outcome'] as const,
+    buckets: [100, 500, 1000, 2500, 5000, 10000, 20000, 40000, 60000, 120000],
+    registers: [register],
+  }));
+
+  const chatHistoryLoad = createMetric(register, 'chat_history_load_ms', () => new client.Histogram({
+    name: 'chat_history_load_ms',
+    help: 'Database time spent loading the context for a chat request',
+    labelNames: ['conversation_size'] as const,
+    buckets: [10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000],
+    registers: [register],
+  }));
+
+  const chatGeminiResponse = createMetric(register, 'chat_gemini_response_ms', () => new client.Histogram({
+    name: 'chat_gemini_response_ms',
+    help: 'Gemini provider time for a streamed chat response',
+    labelNames: ['model'] as const,
+    buckets: [50, 100, 250, 500, 1000, 2500, 5000, 10000, 20000, 40000, 60000],
+    registers: [register],
+  }));
+
+  const chatFallbacks = createMetric(register, 'chat_fallbacks_total', () => new client.Counter({
+    name: 'chat_fallbacks_total',
+    help: 'Chat provider fallback and retry outcomes',
+    labelNames: ['reason'] as const,
+    registers: [register],
+  }));
+
   const state: MetricsState = {
     register,
     rateLimitHits,
@@ -152,6 +238,16 @@ function initializeMetrics(): MetricsState {
     providerSuccesses,
     monitoringLatency,
     monitoringFailures,
+    liveTutorVoiceLatency,
+    liveTutorSessionEvents,
+    liveTutorAvatarAvOffset,
+    liveTutorMinutesDeducted,
+    chatTimeToFirstToken,
+    chatFirstTokenMissing,
+    chatGenerationTotal,
+    chatHistoryLoad,
+    chatGeminiResponse,
+    chatFallbacks,
   };
 
   (globalThis as typeof globalThis & { __mentoPromClientMetrics__?: MetricsState })[GLOBAL_METRIC_STATE] = state;
@@ -198,6 +294,59 @@ export const providerFailures = metrics.providerFailures;
 export const providerSuccesses = metrics.providerSuccesses;
 export const monitoringLatency = metrics.monitoringLatency;
 export const monitoringFailures = metrics.monitoringFailures;
+export const liveTutorVoiceLatency = metrics.liveTutorVoiceLatency;
+export const liveTutorSessionEvents = metrics.liveTutorSessionEvents;
+export const liveTutorAvatarAvOffset = metrics.liveTutorAvatarAvOffset;
+export const liveTutorMinutesDeducted = metrics.liveTutorMinutesDeducted;
+export const chatTimeToFirstToken = metrics.chatTimeToFirstToken;
+export const chatFirstTokenMissing = metrics.chatFirstTokenMissing;
+export const chatGenerationTotal = metrics.chatGenerationTotal;
+export const chatHistoryLoad = metrics.chatHistoryLoad;
+export const chatGeminiResponse = metrics.chatGeminiResponse;
+export const chatFallbacks = metrics.chatFallbacks;
+
+export function observeChatTimeToFirstToken(durationMs: number, answerMode: 'short' | 'detailed' = 'detailed'): void {
+  if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatTimeToFirstToken.labels(answerMode).observe(durationMs);
+}
+
+export function recordChatFirstTokenMissing(answerMode: 'short' | 'detailed' = 'detailed'): void {
+  metrics.chatFirstTokenMissing.labels(answerMode).inc();
+}
+
+export function observeChatGenerationTotal(durationMs: number, outcome: 'success' | 'failed' | 'cancelled'): void {
+  if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatGenerationTotal.labels(outcome).observe(durationMs);
+}
+
+export function observeChatHistoryLoad(durationMs: number, conversationSize: 'fresh' | 'long' = 'fresh'): void {
+  if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatHistoryLoad.labels(conversationSize).observe(durationMs);
+}
+
+export function observeChatGeminiResponse(durationMs: number, model: string): void {
+  if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatGeminiResponse.labels(model || 'unknown').observe(durationMs);
+}
+
+export function recordChatFallback(reason: string): void {
+  metrics.chatFallbacks.labels(reason || 'unknown').inc();
+}
+
+export function observeLiveTutorVoiceLatency(stage: string, durationMs: number): void {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  metrics.liveTutorVoiceLatency.labels(stage).observe(durationMs);
+}
+
+export function recordLiveTutorSessionEvent(event: 'connection_success' | 'first_avatar_audio' | 'reconnect' | 'connection_failed', transport = 'livekit'): void {
+  metrics.liveTutorSessionEvents.labels(event, transport).inc();
+}
+
+export function observeLiveTutorAvatarAvOffset(offsetMs: number, transport = 'livekit'): void {
+  if (!Number.isFinite(offsetMs)) return;
+  metrics.liveTutorAvatarAvOffset.labels(transport).observe(Math.abs(offsetMs));
+}
+
+export function recordLiveTutorMinutesDeducted(seconds: number, status: string): void {
+  if (!Number.isFinite(seconds) || seconds <= 0) return;
+  metrics.liveTutorMinutesDeducted.labels(status).inc(seconds / 60);
+}
 
 export function observeRequestLatency(route: string, durationMs: number) {
   metrics.requestLatency.labels(route).observe(durationMs);

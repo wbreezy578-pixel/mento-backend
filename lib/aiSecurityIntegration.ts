@@ -22,7 +22,7 @@
 
 import { getAISecurityLayer, AIRequestSecurityContext, SecurityLayerConfig, SecurityAssessmentResult } from './aiSecurityLayer';
 import { getRequestAuditor, SECURITY_EVENTS } from './requestAuditor';
-import { createSecureError, getHttpStatus, formatSecureErrorResponse } from './secureErrorHandler';
+import { createSecureError, formatSecureErrorResponse } from './secureErrorHandler';
 import logger from './logger';
 
 export interface ChatSecurityCheckResult {
@@ -84,7 +84,7 @@ export async function assessAndSecureChatRequest(
       securityContext,
       {
         riskLevel: assessment.riskLevel,
-        injectionScore: assessment.assessment.injectionDetection.score,
+        injectionScore: assessment.assessment.injectionDetection.riskScore,
         abuseScore: assessment.assessment.abuseScore.score,
         warnings: assessment.warnings,
         inputLength: userInput.length,
@@ -162,7 +162,7 @@ export async function assessAndSecureChatRequest(
       riskLevel: 'critical',
       assessment: {
         validation: { valid: false, error: 'Assessment error' },
-        injectionDetection: { hasInjection: false, score: 0, patterns: [] },
+        injectionDetection: { hasInjection: false, riskScore: 0, obfuscationRisk: 0, patterns: [], blockingRecommended: false, detectionDetails: { normalized: false, scriptTypes: [], detectedLanguage: 'unknown', characterAnomalies: [] } },
         abuseScore: {
           score: 0,
           reasons: [],
@@ -200,71 +200,11 @@ export function getSecurityMetrics(result: ChatSecurityCheckResult): Record<stri
     allowed: result.allowed,
     riskLevel: result.riskLevel,
     injectionDetected: result.assessment.injectionDetection.hasInjection,
-    injectionScore: result.assessment.injectionDetection.score,
+    injectionScore: result.assessment.injectionDetection.riskScore,
     abuseScore: result.assessment.abuseScore.score,
     warningCount: result.warnings.length,
     processingTimeMs: result.processingTimeMs,
   };
-}
-
-/**
- * Middleware wrapper for Express/Next.js
- *
- * Usage in route handler:
- * ```typescript
- * export async function POST(req: NextRequest) {
- *   const securityCheck = await createSecurityCheckMiddleware(req);
- *   if (!securityCheck.passed) {
- *     return NextResponse.json(securityCheck.error, { status: securityCheck.statusCode });
- *   }
- *
- *   // Use securityCheck.sanitizedInput
- * }
- * ```
- */
-export async function createSecurityCheckMiddleware(
-  request: Request & { json: () => Promise<Record<string, unknown>> }
-): Promise<{
-  passed: boolean;
-  sanitizedInput?: string;
-  error?: Record<string, unknown>;
-  statusCode?: number;
-  requestId?: string;
-}> {
-  try {
-    const body = await request.json();
-    const userInput = typeof body?.message === 'string' ? body.message : '';
-
-    if (!userInput) {
-      return {
-        passed: false,
-        error: { error: 'Message is required' },
-        statusCode: 400,
-      };
-    }
-
-    // Extract context from request
-    const userId = body?.userId || request.headers.get('x-user-id') || 'anonymous';
-    const requestId = body?.requestId || `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const ip = request.headers.get('x-forwarded-for')?.split(',')[0] || request.headers.get('x-real-ip') || 'unknown';
-
-    const result = await assessAndSecureChatRequest(userInput, { userId, requestId, ip });
-
-    return {
-      passed: result.allowed,
-      sanitizedInput: result.sanitizedInput,
-      error: result.errorResponse,
-      statusCode: result.statusCode,
-      requestId: result.requestId,
-    };
-  } catch (error) {
-    logger.error('Security middleware error', { error });
-    return {
-      passed: false,
-      error: { error: 'Request could not be processed' },
-      statusCode: 400,
-    };
-  }
 }
 
 /**

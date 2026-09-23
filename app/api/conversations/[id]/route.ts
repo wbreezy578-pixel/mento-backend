@@ -2,8 +2,11 @@ import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../../lib/auth';
 import { deleteConversation, validateConversationOwnership } from '../../../../lib/conversationDb';
 import { info, warn } from '../../../../lib/logger';
+import { buildRateLimitHeaders, enforceChatEndpointRateLimit } from '../../../../lib/chatRateLimits';
 
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
+import { acquireAIGenerationLock, releaseAIGenerationLock } from '../../../../lib/aiGenerationLock';
+import { randomUUID } from 'node:crypto';
 
 const CORS_METHODS = 'DELETE, OPTIONS';
 
@@ -32,11 +35,30 @@ export async function DELETE(req: Request, context: { params: Promise<{ id: stri
       return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
     }
 
-    await deleteConversation(conversationId);
+    const rateLimit = await enforceChatEndpointRateLimit(user.id, 'delete-conversation');
+    if (!rateLimit.ok) {
+      return NextResponse.json(
+        { error: 'Too many conversation deletions. Please try again later.', code: 'rate_limit_exceeded', retryAfterSec: rateLimit.retryAfterSec },
+        { status: 429, headers: { ...buildCorsHeaders(req.headers.get('origin')), ...buildRateLimitHeaders(rateLimit.retryAfterSec), 'Access-Control-Allow-Methods': CORS_METHODS } },
+      );
+    }
+
+    const lockOwner = `${user.id}:conversation-delete:${randomUUID()}`;
+    if (!await acquireAIGenerationLock(conversationId, lockOwner)) {
+      return NextResponse.json(
+        { error: 'This conversation is busy. Wait for the current response to finish.', code: 'generation_in_progress' },
+        { status: 409, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } },
+      );
+    }
+    try {
+      await deleteConversation(conversationId);
+    } finally {
+      await releaseAIGenerationLock(conversationId, lockOwner).catch(() => undefined);
+    }
     return NextResponse.json({ success: true }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Internal Server Error';
     warn('Error deleting conversation', { error: message });
-    return NextResponse.json({ error: message }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    return NextResponse.json({ error: 'Unable to delete the conversation.', code: 'conversation_delete_failed' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

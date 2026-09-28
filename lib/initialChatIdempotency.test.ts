@@ -36,7 +36,7 @@ describe('initial Normal Chat identity integration', () => {
     for (const route of ['app/api/chat/route.ts', 'app/api/chat/stream/route.ts']) {
       const code = source(route);
       expect(code).toContain('await generationLease.assertOwned();');
-      expect(code).toContain('return reportProviderAttempt(model);');
+      expect(code).toContain('reportProviderAttempt(model)');
       expect(code).toContain('completeInitialChatOperation({');
       expect(code).toContain('failInitialChatOperation({');
     }

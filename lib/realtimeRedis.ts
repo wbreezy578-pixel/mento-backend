@@ -8,8 +8,8 @@ const LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS = 120;
 // These are deliberately conservative defaults for Simli's current Free plan.
 // Raising them is a backend configuration change made only after the matching
 // Simli plan is active; mobile clients never control provider capacity.
-const DEFAULT_MAX_CONCURRENT_LIVE_TUTOR_SESSIONS = 1;
-const DEFAULT_MAX_CONCURRENT_AVATAR_STARTS = 1;
+const DEFAULT_MAX_CONCURRENT_LIVE_TUTOR_SESSIONS = 10;
+const DEFAULT_MAX_CONCURRENT_AVATAR_STARTS = 10;
 const LIVE_TUTOR_CAPACITY_SESSION_TTL_SECONDS = LIVE_TUTOR_MAX_SESSION_SECONDS + LIVE_TUTOR_SESSION_LEASE_TTL_SECONDS;
 const LIVE_TUTOR_AVATAR_START_TTL_SECONDS = 180;
 const REDIS_STARTUP_ATTEMPTS = 4;
@@ -455,6 +455,35 @@ export async function checkRealtimeRedisHealth(): Promise<'ok' | 'not_configured
     });
     return 'fail';
   }
+}
+
+const LIVE_TUTOR_IMAGE_PAYLOAD_TTL_SECONDS = 10 * 60;
+
+function liveTutorImagePayloadKey(requestId: string): string {
+  return `live-tutor-image:{${requestId}}:payload`;
+}
+
+export async function storeLiveTutorImagePayload(requestId: string, base64Payload: string): Promise<void> {
+  const client = assertRedisAvailable();
+  if (!client) throw new Error('Redis is required for Live Tutor image uploads.');
+  await client.set(liveTutorImagePayloadKey(requestId), base64Payload, 'EX', LIVE_TUTOR_IMAGE_PAYLOAD_TTL_SECONDS);
+}
+
+export async function consumeLiveTutorImagePayload(requestId: string): Promise<Buffer | null> {
+  const client = assertRedisAvailable();
+  if (!client) throw new Error('Redis is required for Live Tutor image retrieval.');
+  const encoded = await client.eval(
+    "local payload = redis.call('GET', KEYS[1]); if payload then redis.call('DEL', KEYS[1]); end; return payload",
+    1,
+    liveTutorImagePayloadKey(requestId),
+  );
+  return typeof encoded === 'string' ? Buffer.from(encoded, 'base64') : null;
+}
+
+export async function deleteLiveTutorImagePayload(requestId: string): Promise<void> {
+  const client = assertRedisAvailable();
+  if (!client) return;
+  await client.del(liveTutorImagePayloadKey(requestId));
 }
 
 export async function shutdownRealtimeRedis(): Promise<void> {

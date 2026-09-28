@@ -18,6 +18,7 @@ type GeminiHistoryMessage = { role: 'user' | 'model'; parts: Array<{ text: strin
 type ConversationHistoryOptions = {
   beforeMessageId?: string;
   excludeMessageIds?: string[];
+  excludeMessageRequestId?: string;
 };
 
 function normalizeSummaryLine(value: string) {
@@ -533,6 +534,12 @@ export async function getConversationHistoryForAI(
       status: 'completed',
       role: { in: ['user', 'assistant'] },
       ...(excludedIds.length > 0 ? { id: { notIn: excludedIds } } : {}),
+      ...(options.excludeMessageRequestId ? {
+        OR: [
+          { requestId: null },
+          { requestId: { not: options.excludeMessageRequestId } },
+        ],
+      } : {}),
       AND: [afterBoundary, beforeBoundary, { OR: [{ content: { not: '' } }, { text: { not: '' } }] }],
     },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],

@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import { getUserFacingErrorMessage, logErrorForDiagnostics } from '@/app/lib/errorHandling';
 
 export default function UpgradeButton() {
   const [loading, setLoading] = useState(false);
@@ -16,10 +17,13 @@ export default function UpgradeButton() {
         body: JSON.stringify({ plan: 'pro' }),
       });
       const body = await response.json();
-      if (!response.ok || typeof body?.checkoutUrl !== 'string') throw new Error(body?.error || 'Failed to initialize checkout');
+      if (!response.ok || typeof body?.checkoutUrl !== 'string') {
+        throw new Error(body?.error || 'Failed to initialize checkout');
+      }
       window.location.assign(body.checkoutUrl);
     } catch (error) {
-      alert(error instanceof Error ? error.message : 'Unable to open checkout.');
+      logErrorForDiagnostics('Upgrade checkout failed', error);
+      window.alert(getUserFacingErrorMessage(error));
       setLoading(false);
     }
   }

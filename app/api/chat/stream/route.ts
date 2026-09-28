@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../../lib/prisma';
-import { askGeminiStream, GeminiMessage } from '../../../../services/geminiService';
+import { askGeminiStream, buildGeminiFailureTelemetry, GeminiMessage } from '../../../../services/geminiService';
 import {
   getConversationHistoryForAI,
   validateConversationOwnership,
@@ -35,6 +35,13 @@ const MAX_IMAGE_BASE64_CHARS = Math.ceil(MAX_IMAGE_BYTES / 3) * 4;
 const MAX_CHAT_JSON_BYTES = MAX_IMAGE_BASE64_CHARS + 128 * 1024;
 const SLOW_FIRST_TOKEN_WARN_MS = 5_000;
 
+function getSafePreflightErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined;
+  const candidate = error as { code?: unknown; errorCode?: unknown };
+  const code = typeof candidate.code === 'string' ? candidate.code : candidate.errorCode;
+  return typeof code === 'string' && /^P\d{4}$/.test(code) ? code : undefined;
+}
+
 export async function OPTIONS(req: Request) {
   return new NextResponse(null, {
     status: 204,
@@ -44,6 +51,18 @@ export async function OPTIONS(req: Request) {
 
 export async function POST(req: Request) {
   const requestStartedAt = Date.now();
+  const startupStageMs: Record<string, number | null> = {
+    authentication: null,
+    rateLimit: null,
+    conversationOwnership: null,
+    inputSecurity: null,
+    initialOperationClaim: null,
+    idempotency: null,
+    generationLock: null,
+    billingReservation: null,
+    languageSettings: null,
+    providerUsageAttempt: null,
+  };
   try {
     logger.info('Chat stream auth attempt', {
       origin: req.headers.get('origin') ?? null,
@@ -54,14 +73,16 @@ export async function POST(req: Request) {
 
     const authStartedAt = Date.now();
     const user = await authenticateAIRequest(req);
-    observeMonitoringLatency('api', Date.now() - authStartedAt, { route: 'chat-stream', operation: 'auth' });
+    startupStageMs.authentication = Date.now() - authStartedAt;
+    observeMonitoringLatency('api', startupStageMs.authentication, { route: 'chat-stream', operation: 'auth' });
     const userId = user.id;
     logger.info('Authenticated chat stream user', { userId });
 
     const clientIp = getClientIp(req);
     const rateLimitStartedAt = Date.now();
     await enforceAIGatewayRateLimit(userId, clientIp);
-    observeMonitoringLatency('api', Date.now() - rateLimitStartedAt, { route: 'chat-stream', operation: 'rate-limit' });
+    startupStageMs.rateLimit = Date.now() - rateLimitStartedAt;
+    observeMonitoringLatency('api', startupStageMs.rateLimit, { route: 'chat-stream', operation: 'rate-limit' });
 
     let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown } | null = null;
     try {
@@ -92,8 +113,13 @@ export async function POST(req: Request) {
     let conversationId = typeof body?.conversationId === 'string' ? body.conversationId : undefined;
     let createdForRequest = false;
     let userMessageId: string | null = null;
-    if (conversationId && !(await validateConversationOwnership(conversationId, userId, 'chat'))) {
-      return NextResponse.json({ error: 'Conversation not found' }, { status: 404, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    if (conversationId) {
+      const ownershipStartedAt = Date.now();
+      const ownsConversation = await validateConversationOwnership(conversationId, userId, 'chat');
+      startupStageMs.conversationOwnership = Date.now() - ownershipStartedAt;
+      if (!ownsConversation) {
+        return NextResponse.json({ error: 'Conversation not found' }, { status: 404, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      }
     }
     const userText = message || (imagePayload ? 'Please analyze the attached image and explain it clearly as a tutor.' : '');
 
@@ -121,6 +147,7 @@ export async function POST(req: Request) {
       }
     }
 
+    const securityStartedAt = Date.now();
     const securedInput = await secureAITextInput({
       userId,
       requestId,
@@ -129,6 +156,7 @@ export async function POST(req: Request) {
       conversationId,
       hasImage: Boolean(validatedImage),
     });
+    startupStageMs.inputSecurity = Date.now() - securityStartedAt;
     const securedUserText = securedInput.sanitizedInput ?? userText;
     const savedUserText = message ? securedUserText : (validatedImage ? 'Image attached' : '');
     const operationPayloadHash = createHash('sha256')
@@ -140,6 +168,7 @@ export async function POST(req: Request) {
       .digest('hex');
     let initialOperationId: string | null = null;
     if (!conversationId) {
+      const claimStartedAt = Date.now();
       let claim;
       try {
         claim = await claimInitialChatOperation({ userId, clientRequestId: requestId, payloadHash: operationPayloadHash, initialMessage: savedUserText });
@@ -149,6 +178,7 @@ export async function POST(req: Request) {
         }
         throw error;
       }
+      startupStageMs.initialOperationClaim = Date.now() - claimStartedAt;
       conversationId = claim.conversationId;
       initialOperationId = claim.operationId;
       userMessageId = claim.userMessageId;
@@ -162,8 +192,10 @@ export async function POST(req: Request) {
       createdForRequest = true;
     }
     const operationMetadata = { conversationId, operationType: 'chat.send', payloadHash: operationPayloadHash, ...(createdForRequest ? { idempotencyScope: 'initial-chat' } : {}) };
+    const idempotencyStartedAt = Date.now();
     try {
       await assertAIRequestNotProcessed({ userId, feature: validatedImage ? 'image' : 'chat', provider: 'Gemini', clientRequestId: requestId, metadata: operationMetadata });
+      startupStageMs.idempotency = Date.now() - idempotencyStartedAt;
     } catch (error) {
       if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'idempotency_check_failed' }).catch(() => undefined);
       throw error;
@@ -177,7 +209,8 @@ export async function POST(req: Request) {
     const generationOwnerId = `${userId}:${requestId}`;
     const generationLockStartedAt = Date.now();
     const generationLockAcquired = await acquireAIGenerationLock(conversationId, generationOwnerId);
-    observeMonitoringLatency('api', Date.now() - generationLockStartedAt, {
+    startupStageMs.generationLock = Date.now() - generationLockStartedAt;
+    observeMonitoringLatency('api', startupStageMs.generationLock, {
       route: 'chat-stream',
       operation: 'generation-lock',
       status: generationLockAcquired ? 'acquired' : 'contended',
@@ -200,24 +233,9 @@ export async function POST(req: Request) {
       throw error;
     }
 
-    let historyForAI: GeminiMessage[];
+    let historyForAI: GeminiMessage[] = [];
     let historyDurationMs = 0;
-    try {
-      const historyStartedAt = Date.now();
-      historyForAI = await getConversationHistoryForAI(conversationId);
-      historyDurationMs = Date.now() - historyStartedAt;
-      observeMonitoringLatency('database', historyDurationMs, { route: 'chat-stream', operation: 'history' });
-      observeChatHistoryLoad(historyDurationMs, historyForAI.length > 30 ? 'long' : 'fresh');
-      observeMonitoringLatency('api', Date.now() - requestStartedAt, { route: 'chat-stream', operation: 'history-ready' });
-      logger.info('Chat stream history ready', {
-        conversationId,
-        elapsedMs: Date.now() - requestStartedAt,
-      });
-    } catch (error) {
-      generationLease.stop();
-      await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
-      throw error;
-    }
+    let historyReadyAt = 0;
 
     const stream = new ReadableStream({
       async start(controller) {
@@ -226,6 +244,14 @@ export async function POST(req: Request) {
         let assistantMessageId: string | null = null;
         let assistantText = '';
         let promptHash = '';
+        let turnInitializationDurationMs: number | null = null;
+        let contextPreparationDurationMs: number | null = null;
+        let geminiServiceStartedAt: number | null = null;
+        let geminiStartedAt: number | null = null;
+        let geminiFinishedAt: number | null = null;
+        let firstTokenAt: number | null = null;
+        let failureStage = 'turn_initialization';
+        let streamPreparationPromise: Promise<void> | null = null;
 
         if (generationSignal.aborted) {
           if (initialOperationId) {
@@ -242,9 +268,9 @@ export async function POST(req: Request) {
           return;
         }
 
-        try {
-          promptHash = createHash('sha256').update(savedUserText.trim().toLowerCase()).digest('hex');
-          const initializedTurn = await initializeStreamingTurn({
+        promptHash = createHash('sha256').update(savedUserText.trim().toLowerCase()).digest('hex');
+        const turnStartedAt = Date.now();
+        const turnInitializationPromise = initializeStreamingTurn({
             conversationId,
             userId,
             requestId,
@@ -252,7 +278,8 @@ export async function POST(req: Request) {
             titleText: message || null,
             userMessageAlreadySaved: createdForRequest,
             repeatedPromptHash: promptHash,
-          });
+          }).then((initializedTurn) => {
+          turnInitializationDurationMs = Date.now() - turnStartedAt;
           userMessageId = initializedTurn.userMessageId;
           assistantMessageId = initializedTurn.assistantMessageId;
           logger.info('Chat stream turn initialized', {
@@ -269,21 +296,37 @@ export async function POST(req: Request) {
           if (validatedImage) {
             enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'image', accepted: true, mimeType: validatedImage.mimeType })}\n\n`));
           }
-        } catch (dbErr) {
-          logger.error('Failed to save initial conversation state before streaming', {
-            errorName: dbErr instanceof Error ? dbErr.name : 'UnknownError',
+          return initializedTurn;
+        });
+        const historyStartedAt = Date.now();
+        const historyPromise = getConversationHistoryForAI(conversationId, { excludeMessageRequestId: requestId }).then((history) => {
+          historyForAI = history;
+          historyDurationMs = Date.now() - historyStartedAt;
+          historyReadyAt = Date.now();
+          observeMonitoringLatency('database', historyDurationMs, { route: 'chat-stream', operation: 'history' });
+          observeChatHistoryLoad(historyDurationMs, historyForAI.length > 30 ? 'long' : 'fresh');
+          observeMonitoringLatency('api', historyReadyAt - requestStartedAt, { route: 'chat-stream', operation: 'history-ready' });
+          logger.info('Chat stream history ready', {
+            conversationId,
+            elapsedMs: historyReadyAt - requestStartedAt,
           });
-          if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'persistence_start_failed' }).catch(() => undefined);
-          generationLease.stop();
-          await releaseAIGenerationLock(conversationId, generationOwnerId).catch(() => undefined);
-          if (!isStreamClosed()) {
-            enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'error', message: 'Unable to start the response. Please try again.' })}\n\n`));
-          }
-          close();
-          return;
-        }
+          return history;
+        });
+        const setupPromise = Promise.allSettled([turnInitializationPromise, historyPromise]).then(([turnResult, historyResult]) => {
+          if (turnResult.status === 'rejected') throw turnResult.reason;
+          if (historyResult.status === 'rejected') throw historyResult.reason;
+          return { initializedTurn: turnResult.value, history: historyResult.value };
+        });
+        streamPreparationPromise = setupPromise.then(() => undefined);
+        void streamPreparationPromise.catch(() => undefined);
 
         try {
+          const gatewayStartedAt = Date.now();
+          const languageLookupStartedAt = Date.now();
+          const tutorLanguagePromise = getTutorLanguage(userId).then(
+            (language) => ({ language, durationMs: Date.now() - languageLookupStartedAt }),
+            (error: unknown) => ({ error, durationMs: Date.now() - languageLookupStartedAt }),
+          );
           await executeAIRequest({
             user,
             clientIp,
@@ -297,7 +340,11 @@ export async function POST(req: Request) {
             securityDecision: securedInput,
             securityContext: { conversationId, hasImage: Boolean(validatedImage) },
             callback: async ({ billingDecision, sanitizedInput, reportUsage, reportProviderAttempt }) => {
+              startupStageMs.billingReservation = Date.now() - gatewayStartedAt;
               await generationLease.assertOwned();
+              failureStage = 'context_preparation';
+              const contextStartedAt = Date.now();
+              const { history: preparedHistory } = await setupPromise;
               const sanitizedText = sanitizedInput ?? securedUserText;
               const imageInstruction = validatedImage
                 ? '\nAn image is attached and available to you. Base the answer on visible details in that image, explicitly identify the relevant visual evidence, and say when any detail is uncertain. Do not give a generic answer that ignores the image.'
@@ -312,28 +359,33 @@ export async function POST(req: Request) {
                   ...(validatedImage ? [{ inlineData: { mimeType: validatedImage.mimeType, data: validatedImage.data } }] : []),
                 ],
               };
-              const priorHistory = createdForRequest ? historyForAI.slice(0, -1) : historyForAI;
-              const settingsStartedAt = Date.now();
-              const tutorLanguage = await getTutorLanguage(userId);
-              observeMonitoringLatency('database', Date.now() - settingsStartedAt, {
+              const priorHistory = preparedHistory;
+              const languageResult = await tutorLanguagePromise;
+              startupStageMs.languageSettings = languageResult.durationMs;
+              observeMonitoringLatency('database', startupStageMs.languageSettings, {
                 route: 'chat-stream',
                 operation: 'settings-language',
               });
+              if ('error' in languageResult) throw languageResult.error;
+              const tutorLanguage = languageResult.language;
               const contents: GeminiMessage[] = [
                 { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
                 ...priorHistory,
                 userEntry,
               ];
+              contextPreparationDurationMs = Date.now() - contextStartedAt;
 
               const modelToUse = answerMode === 'short' && !validatedImage
-                ? 'gemini-3.5-flash-lite'
+                ? 'gemini-3.1-flash-lite'
                 : billingDecision.modelUsed ?? undefined;
               assistantText = '';
-              const geminiStartedAt = Date.now();
+              geminiServiceStartedAt = Date.now();
+              geminiStartedAt = null;
+              failureStage = 'gemini_provider';
               let firstTokenObserved = false;
-              observeMonitoringLatency('api', geminiStartedAt - requestStartedAt, {
+              observeMonitoringLatency('api', geminiServiceStartedAt - requestStartedAt, {
                 route: 'chat-stream',
-                operation: 'gemini-request',
+                operation: 'gemini-service-start',
               });
               const generation = await askGeminiStream(contents, async (token: string) => {
                 if (isStreamClosed()) {
@@ -341,25 +393,31 @@ export async function POST(req: Request) {
                 }
                 if (!firstTokenObserved) {
                   firstTokenObserved = true;
-                  const firstTokenAt = Date.now();
-                  observeMonitoringLatency('gemini', Date.now() - geminiStartedAt, {
+                  firstTokenAt = Date.now();
+                  observeMonitoringLatency('gemini', firstTokenAt - geminiStartedAt!, {
                     provider: 'Gemini',
                     operation: 'first-token',
                     status: 'success',
                   });
                   observeChatTimeToFirstToken(firstTokenAt - requestStartedAt, answerMode);
                   const endToEndElapsedMs = firstTokenAt - requestStartedAt;
-                  const geminiElapsedMs = firstTokenAt - geminiStartedAt;
+                  const geminiElapsedMs = firstTokenAt - geminiStartedAt!;
                   // Production suppresses routine info logs. Keep this event at
                   // warn level so Cloud Logging can measure every user-visible
                   // first token, while the category identifies slow requests.
                   logger.warn('Chat stream first Gemini token', {
                     requestId,
                     conversationId,
+                    startupStageMs,
                     category: endToEndElapsedMs >= SLOW_FIRST_TOKEN_WARN_MS ? 'chat_first_token_slow' : 'chat_first_token',
                     answerMode,
                     historyDurationMs,
+                    requestToHistoryReadyMs: historyReadyAt ? historyReadyAt - requestStartedAt : null,
                     historyMessageCount: historyForAI.length,
+                    turnInitializationDurationMs,
+                    contextPreparationDurationMs,
+                    requestToGeminiStartMs: geminiStartedAt === null ? null : geminiStartedAt - requestStartedAt,
+                    geminiPreflightMs: geminiServiceStartedAt === null || geminiStartedAt === null ? null : geminiStartedAt - geminiServiceStartedAt,
                     endToEndElapsedMs,
                     geminiElapsedMs,
                   });
@@ -369,9 +427,35 @@ export async function POST(req: Request) {
                 enqueue(encoder.encode(`data: ${payload}\n\n`));
 
               }, modelToUse, generationSignal, sanitizedText, reportUsage, async (model) => {
-                await generationLease.assertOwned();
-                return reportProviderAttempt(model);
-              }, sanitizedText);
+                const preflightStartedAt = Date.now();
+                let preflightStep = 'generation_lease';
+                try {
+                  await generationLease.assertOwned();
+                  preflightStep = 'usage_attempt';
+                  const usageAttemptStartedAt = Date.now();
+                  const attempt = await reportProviderAttempt(model);
+                  startupStageMs.providerUsageAttempt = Date.now() - usageAttemptStartedAt;
+                  return attempt;
+                } catch (error) {
+                  logger.error('Chat provider preflight failed', {
+                    requestId,
+                    step: preflightStep,
+                    model,
+                    errorName: error instanceof Error ? error.name : 'UnknownError',
+                    errorCode: getSafePreflightErrorCode(error),
+                    elapsedMs: Date.now() - preflightStartedAt,
+                  });
+                  throw error;
+                }
+              }, sanitizedText, {
+                requestId,
+                normalChatRecovery: true,
+                onProviderStart: () => {
+                  if (geminiStartedAt === null) geminiStartedAt = Date.now();
+                },
+              });
+
+              geminiFinishedAt = Date.now();
 
               if (generationLease.signal.aborted) {
                 throw generationLease.signal.reason;
@@ -391,6 +475,7 @@ export async function POST(req: Request) {
                 throw new AIGenerationCancelledError();
               }
 
+              failureStage = 'finalization';
               return generation.text;
             },
             beforeFinalize: async (aiResponse) => {
@@ -421,8 +506,29 @@ export async function POST(req: Request) {
           const totalGenerationMs = Date.now() - requestStartedAt;
           observeMonitoringLatency('api', totalGenerationMs, { route: 'chat-stream', operation: 'total' });
           observeChatGenerationTotal(totalGenerationMs, 'success');
+          logger.warn('Chat stream stage timings', {
+            requestId,
+            conversationId,
+            startupStageMs,
+            outcome: 'completed',
+            requestToHistoryReadyMs: historyReadyAt ? historyReadyAt - requestStartedAt : null,
+            historyLoadDurationMs: historyDurationMs,
+            historyMessageCount: historyForAI.length,
+            turnInitializationDurationMs,
+            contextPreparationDurationMs,
+            requestToGeminiServiceStartMs: geminiServiceStartedAt === null ? null : geminiServiceStartedAt - requestStartedAt,
+            requestToGeminiStartMs: geminiStartedAt === null ? null : geminiStartedAt - requestStartedAt,
+            geminiPreflightMs: geminiServiceStartedAt === null || geminiStartedAt === null ? null : geminiStartedAt - geminiServiceStartedAt,
+            geminiToFirstTokenMs: geminiStartedAt === null || firstTokenAt === null ? null : firstTokenAt - geminiStartedAt,
+            requestToFirstTokenMs: firstTokenAt === null ? null : firstTokenAt - requestStartedAt,
+            geminiStreamDurationMs: geminiStartedAt === null || geminiFinishedAt === null ? null : geminiFinishedAt - geminiStartedAt,
+            requestToGeminiStreamFinishedMs: geminiFinishedAt === null ? null : geminiFinishedAt - requestStartedAt,
+            requestToResponseFinalizedMs: totalGenerationMs,
+            responseCharacterCount: assistantText.length,
+          });
           close();
         } catch (err: unknown) {
+          if (streamPreparationPromise) await streamPreparationPromise.catch(() => undefined);
           if (err instanceof AIGenerationCancelledError) {
             observeChatGenerationTotal(Date.now() - requestStartedAt, 'cancelled');
             if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'generation_cancelled' }).catch(() => undefined);
@@ -460,7 +566,34 @@ export async function POST(req: Request) {
             resetTime: typeof gatewayBody?.resetTime === 'string' ? gatewayBody.resetTime : null,
           };
           observeChatGenerationTotal(Date.now() - requestStartedAt, 'failed');
-          logger.error('Chat stream error', { error: { message: appError.message, status: appError.status } });
+          const failureTelemetry = buildGeminiFailureTelemetry(err);
+          const safeError = typeof err === 'object' && err !== null ? err as Record<string, unknown> : null;
+          const failedAt = Date.now();
+          logger.error('Chat stream error', {
+            requestId,
+            conversationId,
+            startupStageMs,
+            stage: failureStage,
+            errorName: err instanceof Error ? err.name : 'UnknownError',
+            status: appError.status,
+            providerCategory: safeError?.providerCategory ?? failureTelemetry.category,
+            providerCode: safeError?.providerCode ?? failureTelemetry.providerCode,
+            retryable: safeError?.retryable ?? failureTelemetry.retryable,
+            providerAttemptCount: safeError?.providerAttemptCount,
+            requestElapsedMs: failedAt - requestStartedAt,
+            requestToHistoryReadyMs: historyReadyAt ? historyReadyAt - requestStartedAt : null,
+            historyLoadDurationMs: historyDurationMs,
+            historyMessageCount: historyForAI.length,
+            turnInitializationDurationMs,
+            contextPreparationDurationMs,
+            requestToGeminiServiceStartMs: geminiServiceStartedAt === null ? null : geminiServiceStartedAt - requestStartedAt,
+            requestToGeminiStartMs: geminiStartedAt === null ? null : geminiStartedAt - requestStartedAt,
+            geminiPreflightMs: geminiServiceStartedAt === null || geminiStartedAt === null ? null : geminiStartedAt - geminiServiceStartedAt,
+            geminiElapsedMs: geminiStartedAt === null ? null : failedAt - geminiStartedAt,
+            geminiToFirstTokenMs: geminiStartedAt === null || firstTokenAt === null ? null : firstTokenAt - geminiStartedAt,
+            requestToFirstTokenMs: firstTokenAt === null ? null : firstTokenAt - requestStartedAt,
+            partialResponseCharacterCount: assistantText.length,
+          });
           if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'generation_failed' }).catch(() => undefined);
           if (assistantMessageId) {
             await prisma.conversationMessage.update({

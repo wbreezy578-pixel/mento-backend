@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import type { CSSProperties, FormEvent } from 'react';
+import { getUserFacingErrorMessage, logErrorForDiagnostics } from '@/app/lib/errorHandling';
 
 type AuthAction = 'verify-email' | 'reset-password' | 'confirm-email-change';
 type Status = 'idle' | 'submitting' | 'success' | 'error';
@@ -102,8 +103,9 @@ export default function AuthActionClient({ action, token, mobileScheme }: {
       setPassword('');
       setConfirmPassword('');
     } catch (error) {
+      logErrorForDiagnostics('Auth action failed', error);
       setStatus('error');
-      setMessage(error instanceof Error ? error.message : readError(null));
+      setMessage(getUserFacingErrorMessage(error));
     }
   }
 

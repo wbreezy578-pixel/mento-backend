@@ -41,7 +41,11 @@ describe('Normal Chat billing reservation path', () => {
     expect(helper).toContain('tx.userWallet.findUnique({');
     expect(helper).not.toContain('INNER JOIN "Plan"');
     expect(body).toContain('const usageWhere = {');
-    expect(body).toContain('await tx.usageLog.count({');
+    expect(body).toContain('await tx.$queryRaw<Array<{ dailyUsed: bigint; monthlyUsed: bigint }>>`');
+    expect(body).toContain('COUNT(*) FILTER (WHERE "createdAt" >= ${windowStart}) AS "dailyUsed"');
+    expect(body).toContain('COUNT(*) FILTER (WHERE "createdAt" >= ${monthlyStart} AND "createdAt" < ${monthlyEnd}) AS "monthlyUsed"');
+    expect(body).toMatch(/AND\s+\(\s+success = TRUE\s+OR \(success IS NULL AND "createdAt" >= \$\{pendingCutoff\}\)\s+\)/);
+    expect(body).toContain('used = await tx.usageLog.count({');
   });
 
   it('keeps a safe diagnostic stage if an unclassified Gemini reservation error occurs', () => {
@@ -76,5 +80,26 @@ describe('Normal Chat billing reservation path', () => {
 
     expect(budgetCheck).toBeGreaterThan(idempotencyRead);
     expect(reservationWrite).toBeGreaterThan(budgetCheck);
+  });
+
+  it('records an allowed chat request as pending until the provider finishes', () => {
+    const body = reserveUsageBody();
+    const chatReservation = body.slice(body.indexOf('const pendingCutoff ='));
+
+    expect(chatReservation).toMatch(/createUsageLedgerEntry\(\s*tx,\s*\{ \.\.\.reservationInput, pending: pendingReservation \},\s*effectivePlan,\s*true,/);
+  });
+
+  it('enforces the Free Learn daily cap from account-wide ledger rows inside the reservation transaction', () => {
+    const body = reserveUsageBody();
+    const learnCount = body.indexOf('learnDailyUsed = await tx.usageLog.count');
+    const ledgerWrite = body.indexOf('createUsageLedgerEntry(', learnCount);
+
+    expect(body).toContain("validatedInput.metadata?.source === 'learn'");
+    expect(body).toContain("metadata: { path: ['source'], equals: 'learn' }");
+    expect(body).toContain("feature: { in: ['chat', 'image'] }");
+    expect(body).toContain("{ success: null, createdAt: { gte: pendingCutoff } }");
+    expect(body).toContain('evaluateLearnDailyAllowance({ dailyUsed: learnDailyUsed');
+    expect(learnCount).toBeGreaterThan(body.indexOf('resolveWalletAndPlanInTransaction('));
+    expect(ledgerWrite).toBeGreaterThan(learnCount);
   });
 });

@@ -161,7 +161,7 @@ export async function POST(req: Request) {
               }, modelToUse, generationSignal, safePrompt, reportUsage, async (model) => {
                 await generationLease.assertOwned();
                 return reportProviderAttempt(model);
-              });
+              }, undefined, { requestId, normalChatRecovery: true });
               if (generationLease.signal.aborted) {
                 throw generationLease.signal.reason;
               }

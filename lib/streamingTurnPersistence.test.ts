@@ -194,22 +194,23 @@ describe('atomic streaming-turn persistence', () => {
     expect(state.conversation.title).toBeNull();
   });
 
-  it('keeps the provider boundary after committed initialization', () => {
+  it('waits for committed turn setup before calling the provider', () => {
     const route = readFileSync(new URL('../app/api/chat/stream/route.ts', import.meta.url), 'utf8');
-    const initialization = route.indexOf('await initializeStreamingTurn({');
+    const initialization = route.indexOf('const turnInitializationPromise = initializeStreamingTurn({');
     const providerExecution = route.indexOf('await executeAIRequest({');
-    const initializationFailureReturn = route.indexOf('return;', initialization);
+    const setupAwait = route.indexOf('await setupPromise;');
+    const geminiExecution = route.indexOf('await askGeminiStream(');
 
     expect(initialization).toBeGreaterThan(-1);
     expect(providerExecution).toBeGreaterThan(initialization);
-    expect(initializationFailureReturn).toBeGreaterThan(initialization);
-    expect(initializationFailureReturn).toBeLessThan(providerExecution);
+    expect(setupAwait).toBeGreaterThan(providerExecution);
+    expect(geminiExecution).toBeGreaterThan(setupAwait);
   });
 
   it('checks cancellation before initializing any streaming-turn state', () => {
     const route = readFileSync(new URL('../app/api/chat/stream/route.ts', import.meta.url), 'utf8');
     const cancellationGuard = route.indexOf('if (generationSignal.aborted) {');
-    const initialization = route.indexOf('await initializeStreamingTurn({');
+    const initialization = route.indexOf('const turnInitializationPromise = initializeStreamingTurn({');
 
     expect(cancellationGuard).toBeGreaterThan(-1);
     expect(cancellationGuard).toBeLessThan(initialization);
@@ -217,7 +218,7 @@ describe('atomic streaming-turn persistence', () => {
 
   it('starts Gemini without summary maintenance and refreshes only after done is queued', () => {
     const route = readFileSync(new URL('../app/api/chat/stream/route.ts', import.meta.url), 'utf8');
-    const history = route.indexOf('await getConversationHistoryForAI(conversationId)');
+    const history = route.indexOf('getConversationHistoryForAI(conversationId, { excludeMessageRequestId: requestId })');
     const providerExecution = route.indexOf('await executeAIRequest({');
     const geminiExecution = route.indexOf('await askGeminiStream(');
     const doneEvent = route.indexOf("JSON.stringify({ type: 'done' })");
@@ -232,5 +233,32 @@ describe('atomic streaming-turn persistence', () => {
     expect(route).toContain("operation: 'history-ready'");
     expect(route).toContain("operation: 'first-token'");
     expect(route).toContain('void refreshConversationSummarySafely(conversationId)');
+  });
+
+  it('overlaps the chat language lookup with billing and awaits it after reservation', () => {
+    const route = readFileSync(new URL('../app/api/chat/stream/route.ts', import.meta.url), 'utf8');
+    const turnInitialization = route.indexOf('const turnInitializationPromise = initializeStreamingTurn({');
+    const languageLookup = route.indexOf('const tutorLanguagePromise = getTutorLanguage(userId)');
+    const billingExecution = route.indexOf('await executeAIRequest({');
+    const billingCallback = route.indexOf('callback: async ({ billingDecision');
+    const languageAwait = route.indexOf('await tutorLanguagePromise');
+
+    expect(turnInitialization).toBeGreaterThan(-1);
+    expect(languageLookup).toBeGreaterThan(turnInitialization);
+    expect(languageLookup).toBeLessThan(billingExecution);
+    expect(billingExecution).toBeLessThan(billingCallback);
+    expect(billingCallback).toBeLessThan(languageAwait);
+  });
+
+  it('excludes the current operation from concurrently loaded chat history', () => {
+    const route = readFileSync(new URL('../app/api/chat/stream/route.ts', import.meta.url), 'utf8');
+    const historyRead = route.indexOf('getConversationHistoryForAI(conversationId, { excludeMessageRequestId: requestId })');
+    const contextHistory = route.indexOf('const priorHistory = preparedHistory;');
+    const conversationDb = readFileSync(new URL('./conversationDb.ts', import.meta.url), 'utf8');
+
+    expect(historyRead).toBeGreaterThan(-1);
+    expect(contextHistory).toBeGreaterThan(historyRead);
+    expect(conversationDb).toContain('excludeMessageRequestId?: string;');
+    expect(conversationDb).toContain('requestId: { not: options.excludeMessageRequestId }');
   });
 });

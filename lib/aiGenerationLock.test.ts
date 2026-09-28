@@ -157,7 +157,7 @@ describe('AI generation locks', () => {
       const source = fs.readFileSync(path.join(process.cwd(), relativePath), 'utf8');
       expect(source).toContain('const generationLease = startAIGenerationLockHeartbeat(');
       expect(source).toContain('await generationLease.assertOwned();');
-      expect(source).toContain('return reportProviderAttempt(model);');
+      expect(source).toContain('reportProviderAttempt(model)');
       expect(source).toContain('beforeFinalize: async');
       expect(source).toContain('generationLease.stop();');
     }

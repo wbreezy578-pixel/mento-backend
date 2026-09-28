@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { evaluateCompletedAllowance, getFreeMonthlyWindow, getProductPolicy, getUtcDayWindow, resolveAllowanceReset, resolvePolicyModel } from './productPolicy';
+import { evaluateCompletedAllowance, evaluateLearnDailyAllowance, getFreeLearnFeedbackDailyLimit, getFreeMonthlyWindow, getProductPolicy, getUtcDayWindow, resolveAllowanceReset, resolvePolicyModel } from './productPolicy';
 import { allocateLiveTutorConsumption, getEffectiveLiveTutorBalance, resolveIncludedSecondsForEvent, shouldApplyEntitlementEvent } from './entitlementService';
 import { classifyLiveTutorFinalizationTiming } from './simliService';
 import { isSubscriptionActive } from './planService';
@@ -33,6 +33,14 @@ describe('canonical product policy', () => {
     const now = new Date('2026-09-01T23:59:00-07:00');
     expect(getUtcDayWindow(now)).toEqual({ start: new Date('2026-09-02T00:00:00.000Z'), end: new Date('2026-09-03T00:00:00.000Z') });
     expect(getFreeMonthlyWindow(now)).toEqual({ start: new Date('2026-09-01T00:00:00.000Z'), end: new Date('2026-10-01T00:00:00.000Z') });
+  });
+
+  it('enforces the configurable Free Learn daily allowance', () => {
+    expect(getFreeLearnFeedbackDailyLimit()).toBe(3);
+    expect(evaluateLearnDailyAllowance({ dailyUsed: 2, dailyLimit: 3 })).toEqual({ allowed: true, dailyRemaining: 0 });
+    expect(evaluateLearnDailyAllowance({ dailyUsed: 3, dailyLimit: 3 })).toEqual({ allowed: false, dailyRemaining: 0 });
+    process.env.FREE_LEARN_FEEDBACK_DAILY_LIMIT = '5';
+    expect(getFreeLearnFeedbackDailyLimit()).toBe(5);
   });
 
   it('recognizes active, grace, and cancelled-through-period-end access only', () => {
@@ -121,6 +129,8 @@ describe('canonical product policy', () => {
   it('classifies Live Tutor terminal timing explicitly and rejects unknown reasons', () => {
     expect(classifyLiveTutorFinalizationTiming('transport_recovery_timeout')).toBe('transport_recovery_end');
     expect(classifyLiveTutorFinalizationTiming('Screen closed')).toBe('transport_recovery_end');
+    expect(classifyLiveTutorFinalizationTiming('App backgrounded')).toBe('transport_recovery_end');
+    expect(classifyLiveTutorFinalizationTiming('app_backgrounded')).toBe('transport_recovery_end');
     expect(classifyLiveTutorFinalizationTiming('Voice WebSocket reconnect grace expired: socket_lost')).toBe('transport_recovery_end');
     expect(classifyLiveTutorFinalizationTiming('unauthorized')).toBe('transport_recovery_end');
     expect(classifyLiveTutorFinalizationTiming('Heartbeat expired; stale session recovery')).toBe('inactivity_end');

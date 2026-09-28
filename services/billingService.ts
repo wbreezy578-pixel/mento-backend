@@ -4,12 +4,13 @@ import type { InputJsonValue } from '@prisma/client/runtime/library';
 import { prisma } from '../lib/prisma';
 import { ensureDefaultPlans, getPlanForUser, getEffectivePlanForUser, getEffectiveLimit, isSubscriptionActive, type PlanRecord } from './planService';
 import { calculateProviderCost, calculateUserCharge, calculateProfit } from './economicsService';
+import { isZeroCostPendingGeminiChatReservation } from './billingReservationEconomics';
 import type { UsageScope, UsageFeature, UsageSnapshot } from './usageService';
 import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/monitoring';
 import logger from '../lib/logger';
 import '../lib/metrics';
 import { canStartLiveTutorSession } from './liveTutorBillingPolicy';
-import { evaluateCompletedAllowance, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolveAllowanceReset, resolvePolicyModel, type AllowanceLimitScope } from './productPolicy';
+import { evaluateCompletedAllowance, evaluateLearnDailyAllowance, getFreeLearnFeedbackDailyLimit, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolveAllowanceReset, resolvePolicyModel, type AllowanceLimitScope } from './productPolicy';
 import { allocateLiveTutorConsumption, getAvailableLiveTutorSeconds } from './entitlementService';
 import { calculateGeminiProviderCostUSD, GEMINI_PRICING_SOURCE, GEMINI_PRICING_VERSION, isSupportedNormalChatModel } from './geminiPricing';
 import {
@@ -808,8 +809,21 @@ async function createUsageLedgerEntry(
 
 export async function reserveUsage(input: BillingReservationInput): Promise<BillingDecision> {
   const reservationStartedAt = Date.now();
+  const reservationStageMs: Record<string, number | null> = {
+    plans: null,
+    pricing: null,
+    transactionWait: null,
+    wallet: null,
+    idempotency: null,
+    providerBudget: null,
+    allowance: null,
+    ledgerWrite: null,
+    transactionTotal: null,
+  };
   const validatedInput = validateBillingReservationInput(input);
+  const plansStartedAt = Date.now();
   const defaultPlans = await ensureDefaultPlans();
+  reservationStageMs.plans = Date.now() - plansStartedAt;
   const fallbackPlan = validatedInput.planOverride
     ?? defaultPlans.find((candidate) => candidate.name === 'FREE');
   if (!fallbackPlan) {
@@ -823,11 +837,15 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
     tokensOutput: validatedInput.tokensOutput,
     secondsUsed: validatedInput.secondsUsed,
   };
-  const [providerCostUSD, userChargeUSD, profitUSD] = await Promise.all([
-    calculateProviderCost(economicsInput),
-    calculateUserCharge(economicsInput),
-    calculateProfit(economicsInput),
-  ]);
+  const pricingStartedAt = Date.now();
+  const [providerCostUSD, userChargeUSD, profitUSD] = isZeroCostPendingGeminiChatReservation(validatedInput)
+    ? [0, 0, 0]
+    : await Promise.all([
+        calculateProviderCost(economicsInput),
+        calculateUserCharge(economicsInput),
+        calculateProfit(economicsInput),
+      ]);
+  reservationStageMs.pricing = Date.now() - pricingStartedAt;
   logger.info('Billing reservation preflight completed', {
     requestId: validatedInput.requestId ?? null,
     elapsedMs: Date.now() - reservationStartedAt,
@@ -835,10 +853,14 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
 
   let reservationStage = 'transaction_start';
   try {
-    return await runTransactionWithRetries(validatedInput.userId, async (tx) => {
+    const transactionDispatchedAt = Date.now();
+    const decision = await runTransactionWithRetries(validatedInput.userId, async (tx) => {
       const transactionStartedAt = Date.now();
+      reservationStageMs.transactionWait = transactionStartedAt - transactionDispatchedAt;
       reservationStage = 'wallet_and_plan';
+      const walletStartedAt = Date.now();
       const { wallet, plan: effectivePlan } = await resolveWalletAndPlanInTransaction(tx, validatedInput.userId, fallbackPlan);
+      reservationStageMs.wallet = Date.now() - walletStartedAt;
       logger.info('Billing reservation wallet resolved', {
         requestId: validatedInput.requestId ?? null,
         elapsedMs: Date.now() - transactionStartedAt,
@@ -852,6 +874,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const windowStart = usageWindow.windowStart;
       const resetAt = usageWindow.resetAt;
       reservationStage = 'idempotency';
+      const idempotencyStartedAt = Date.now();
       const existing = validatedInput.requestId
         ? await tx.usageLog.findUnique({
             where: {
@@ -862,6 +885,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
             },
           })
         : null;
+      reservationStageMs.idempotency = Date.now() - idempotencyStartedAt;
 
       if (existing) {
         const used = await tx.usageLog.count({
@@ -903,9 +927,11 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
 
       const budgetSubject = isNormalChatGeminiBudgetSubject(validatedInput);
       reservationStage = 'provider_budget';
+      const budgetStartedAt = Date.now();
       const budgetReservation = budgetSubject
         ? await assertAndLockGeminiDailyBudget(tx, { requestId: validatedInput.requestId ?? 'missing-request-id' })
         : null;
+      reservationStageMs.providerBudget = Date.now() - budgetStartedAt;
       logger.info('Billing reservation budget checked', {
         requestId: validatedInput.requestId ?? null,
         elapsedMs: Date.now() - transactionStartedAt,
@@ -1026,6 +1052,10 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         ? wallet.subscriptionExpiresAt
         : freeMonth.end;
       const monthlyLimit = validatedInput.feature === 'chat' ? policy.normalChat.monthlyCompletedMessages : null;
+      const learnDay = effectivePlan.name === 'FREE' && validatedInput.metadata?.source === 'learn'
+        ? getUtcDayWindow()
+        : null;
+      const learnDailyLimit = learnDay ? getFreeLearnFeedbackDailyLimit() : null;
       const usageWhere = {
         userId: validatedInput.userId,
         feature: toUsageFeature(validatedInput.feature),
@@ -1035,15 +1065,48 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         ],
       } satisfies Prisma.UsageLogWhereInput;
       reservationStage = 'allowance_count';
-      const used = await tx.usageLog.count({
-        where: {
-          ...usageWhere,
-          createdAt: { gte: windowStart },
-        },
-      });
-      const monthlyUsed = monthlyLimit === null ? 0 : await tx.usageLog.count({
-        where: { ...usageWhere, createdAt: { gte: monthlyStart, lt: monthlyEnd } },
-      });
+      const allowanceStartedAt = Date.now();
+      let used: number;
+      let monthlyUsed = 0;
+      let learnDailyUsed = 0;
+      if (validatedInput.feature === 'chat' && monthlyLimit !== null) {
+        const [usageCounts] = await tx.$queryRaw<Array<{ dailyUsed: bigint; monthlyUsed: bigint }>>`
+          SELECT
+            COUNT(*) FILTER (WHERE "createdAt" >= ${windowStart}) AS "dailyUsed",
+            COUNT(*) FILTER (WHERE "createdAt" >= ${monthlyStart} AND "createdAt" < ${monthlyEnd}) AS "monthlyUsed"
+          FROM "UsageLog"
+          WHERE "userId" = ${validatedInput.userId}
+            AND feature = ${toUsageFeature(validatedInput.feature)}
+            AND (
+              success = TRUE
+              OR (success IS NULL AND "createdAt" >= ${pendingCutoff})
+            )
+        `;
+        used = Number(usageCounts?.dailyUsed ?? 0n);
+        monthlyUsed = Number(usageCounts?.monthlyUsed ?? 0n);
+      } else {
+        used = await tx.usageLog.count({
+          where: {
+            ...usageWhere,
+            createdAt: { gte: windowStart },
+          },
+        });
+      }
+      if (learnDay) {
+        learnDailyUsed = await tx.usageLog.count({
+          where: {
+            userId: validatedInput.userId,
+            feature: { in: ['chat', 'image'] },
+            createdAt: { gte: learnDay.start, lt: learnDay.end },
+            metadata: { path: ['source'], equals: 'learn' },
+            OR: [
+              { success: true },
+              { success: null, createdAt: { gte: pendingCutoff } },
+            ],
+          },
+        });
+      }
+      reservationStageMs.allowance = Date.now() - allowanceStartedAt;
       logger.info('Billing reservation usage counted', {
         requestId: validatedInput.requestId ?? null,
         elapsedMs: Date.now() - transactionStartedAt,
@@ -1052,28 +1115,37 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const allowance = validatedInput.feature === 'chat' && typeof usageLimit === 'number' && monthlyLimit !== null
         ? evaluateCompletedAllowance({ dailyUsed: used, monthlyUsed, dailyLimit: usageLimit, monthlyLimit, requested: validatedInput.amount })
         : null;
-      const dailyRemaining = allowance?.dailyRemaining ?? (typeof usageLimit === 'number'
+      const learnAllowance = learnDailyLimit !== null
+        ? evaluateLearnDailyAllowance({ dailyUsed: learnDailyUsed, dailyLimit: learnDailyLimit, requested: validatedInput.amount })
+        : null;
+      const learnLimitExceeded = learnAllowance?.allowed === false;
+      const baseDailyRemaining = allowance?.dailyRemaining ?? (typeof usageLimit === 'number'
         ? Math.max(usageLimit - used - (pendingReservation ? 0 : validatedInput.amount), 0)
         : null);
+      const dailyRemaining = learnAllowance
+        ? Math.min(baseDailyRemaining ?? learnAllowance.dailyRemaining, learnAllowance.dailyRemaining)
+        : baseDailyRemaining;
       const monthlyRemaining = allowance?.monthlyRemaining ?? (monthlyLimit === null
         ? null
         : Math.max(monthlyLimit - monthlyUsed - (pendingReservation ? 0 : validatedInput.amount), 0));
       const remainingUsage = dailyRemaining === null ? monthlyRemaining
         : monthlyRemaining === null ? dailyRemaining
         : Math.min(dailyRemaining, monthlyRemaining);
-      const allowed = allowance?.allowed ?? ((typeof usageLimit !== 'number' || used + validatedInput.amount <= usageLimit)
-        && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit));
+      const allowed = !learnLimitExceeded && (allowance?.allowed ?? ((typeof usageLimit !== 'number' || used + validatedInput.amount <= usageLimit)
+        && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit)));
       const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
-      const reason = pendingReservation
+      const reason = learnLimitExceeded
+        ? 'Daily Learn feedback limit reached.'
+        : pendingReservation
         ? 'Usage reservation pending.'
         : effectiveAllowed
           ? 'Usage available.'
           : validatedInput.success === false
             ? 'Usage rollback requested.'
             : 'Plan usage limit reached.';
-      const dailyExceeded = typeof usageLimit === 'number'
+      const dailyExceeded = learnLimitExceeded || (typeof usageLimit === 'number'
         ? used + validatedInput.amount > usageLimit
-        : false;
+        : false);
       const periodExceeded = monthlyLimit !== null
         ? monthlyUsed + validatedInput.amount > monthlyLimit
         : false;
@@ -1081,14 +1153,14 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         ? resolveAllowanceReset({
             dailyExceeded,
             periodExceeded,
-            dailyResetAt: usageWindow.resetAt,
+            dailyResetAt: learnDay?.end ?? usageWindow.resetAt,
             periodResetAt: monthlyLimit !== null ? monthlyEnd : null,
             periodScope: effectivePlan.name === 'PRO' ? 'subscription_period' : 'monthly',
           })
         : { resetAt: usageWindow.resetAt, scope: null };
       const allowanceTiming = {
         resetAt: allowanceReset.resetAt,
-        dailyResetAt: usageWindow.resetAt,
+        dailyResetAt: learnDay?.end ?? usageWindow.resetAt,
         monthlyResetAt: monthlyLimit !== null ? monthlyEnd : null,
         limitScope: allowanceReset.scope,
       };
@@ -1169,11 +1241,12 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         : metadata;
       const reservedProviderCostUSD = budgetReservation ? 0 : providerCostUSD;
       reservationStage = 'ledger_write';
+      const ledgerStartedAt = Date.now();
       const successRecord = await createUsageLedgerEntry(
         tx,
         { ...reservationInput, pending: pendingReservation },
         effectivePlan,
-        pendingReservation ? false : true,
+        true,
         reason,
         usage,
         reservedProviderCostUSD,
@@ -1181,6 +1254,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         userChargeUSD - reservedProviderCostUSD,
         reservationMetadata,
       );
+      reservationStageMs.ledgerWrite = Date.now() - ledgerStartedAt;
       logger.info('Billing reservation ledger written', {
         requestId: validatedInput.requestId ?? null,
         elapsedMs: Date.now() - transactionStartedAt,
@@ -1202,6 +1276,15 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         allowanceTiming,
       );
     });
+    reservationStageMs.transactionTotal = Date.now() - transactionDispatchedAt;
+    if (validatedInput.provider === 'Gemini' && (validatedInput.feature === 'chat' || validatedInput.feature === 'image')) {
+      logger.warn('Normal chat billing reservation timings', {
+        requestId: validatedInput.requestId,
+        reservationStageMs,
+        totalMs: Date.now() - reservationStartedAt,
+      });
+    }
+    return decision;
   } catch (error) {
     if (error instanceof GeminiDailyBudgetExceededError) throw error;
     if (error instanceof GeminiDailyBudgetUnavailableError) throw error;
@@ -1235,7 +1318,13 @@ export async function recordGeminiProviderAttempt(input: {
       where: { provider_requestId: { provider: 'Gemini', requestId: input.requestId } },
       select: { id: true },
     });
-    if (!initial) throw new Error('Gemini provider attempt requires an existing reservation.');
+    if (!initial) {
+      logger.error('Chat provider usage reservation rejected', {
+        requestId: input.requestId,
+        reason: 'reservation_missing',
+      });
+      throw new Error('Gemini provider attempt requires an existing reservation.');
+    }
 
     await tx.$queryRaw`SELECT id FROM "UsageLog" WHERE id = ${initial.id} FOR UPDATE`;
     const reservation = await tx.usageLog.findUnique({
@@ -1243,6 +1332,10 @@ export async function recordGeminiProviderAttempt(input: {
       select: { id: true, success: true, providerAttemptCount: true },
     });
     if (!reservation || reservation.success !== null) {
+      logger.error('Chat provider usage reservation rejected', {
+        requestId: input.requestId,
+        reason: reservation ? 'reservation_finalized' : 'reservation_missing_after_lock',
+      });
       throw new Error('Gemini provider attempt cannot start from a finalized reservation.');
     }
 

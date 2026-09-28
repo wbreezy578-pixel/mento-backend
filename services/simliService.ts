@@ -93,6 +93,8 @@ export function classifyLiveTutorFinalizationTiming(reason: string | undefined):
     normalized === 'transport_recovery_timeout'
     || normalized === 'simli disconnected'
     || normalized === 'screen closed'
+    || normalized === 'app backgrounded'
+    || normalized === 'app_backgrounded'
     || normalized === 'unauthorized'
     || normalized === 'forbidden'
     || normalized.startsWith('voice websocket reconnect grace expired:')

@@ -1,12 +1,16 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { boundGeminiContext, buildGeminiFailureTelemetry, buildGeminiHealthCheckResult, buildGeminiRequestPayload, buildNormalChatModelTelemetry, classifyGeminiError, extractLatestUserPrompt, getModelCandidatesForKind, isGeminiResponseSuccessful, normalizeGeminiUsage, shouldFallbackStreamingModel, shouldTryNextGeminiModel } from './geminiService';
+import { boundGeminiContext, buildGeminiFailureTelemetry, buildGeminiHealthCheckResult, buildGeminiRequestPayload, buildNormalChatModelTelemetry, classifyGeminiError, extractLatestUserPrompt, getModelCandidatesForKind, isGeminiResponseSuccessful, normalizeGeminiUsage, shouldFallbackStreamingModel, shouldRetryChatGeminiAttempt, shouldTryNextGeminiModel } from './geminiService';
 
 test('getModelCandidatesForKind uses a supported fallback chain', () => {
   const candidates = getModelCandidatesForKind('chat', 'gemini-3.5-flash');
 
-  assert.deepEqual(candidates, ['gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite']);
+  assert.deepEqual(candidates, ['gemini-3.5-flash', 'gemini-3.1-flash-lite']);
   assert.equal(candidates.includes('gemini-2.0-flash'), false);
+});
+
+test('normal chat defaults to a supported model with a priced fallback', () => {
+  assert.deepEqual(getModelCandidatesForKind('chat'), ['gemini-3.1-flash-lite', 'gemini-3.5-flash']);
 });
 
 test('getModelCandidatesForKind rejects models outside the supported allowlist', () => {
@@ -75,9 +79,13 @@ test('buildGeminiHealthCheckResult preserves a provider error message', () => {
 test('classifyGeminiError distinguishes invalid key and model missing cases', () => {
   const invalidKey = classifyGeminiError({ status: 401, message: 'API key not valid' });
   const modelMissing = classifyGeminiError({ status: 404, message: 'Model not found' });
+  const invalidModel = classifyGeminiError({ message: 'Invalid model name: gemini-unknown' });
+  const missingModel = classifyGeminiError({ message: 'The requested model does not exist' });
 
   assert.equal(invalidKey.category, 'invalid_api_key');
   assert.equal(modelMissing.category, 'model_not_found');
+  assert.equal(invalidModel.category, 'model_not_found');
+  assert.equal(missingModel.category, 'model_not_found');
 });
 
 test('Gemini failure telemetry never retains provider bodies, details, messages, or learner content', () => {
@@ -87,15 +95,54 @@ test('Gemini failure telemetry never retains provider bodies, details, messages,
     response: { body: { prompt: 'private learner text' } },
     details: { response: 'private model response' },
   });
-  assert.deepEqual(telemetry, { category: 'model_overloaded', status: 503 });
+  assert.deepEqual(telemetry, { category: 'model_overloaded', status: 503, retryable: true });
   assert.equal('message' in telemetry, false);
   assert.equal('responseBody' in telemetry, false);
   assert.equal('details' in telemetry, false);
 });
 
-test('tries another configured model for quota and provider-capacity failures only', () => {
+test('classifies safe nested provider status and code without retaining provider text', () => {
+  const error = {
+    message: 'provider echoed a private prompt',
+    response: {
+      status: 429,
+      data: { error: { status: 'RESOURCE_EXHAUSTED', message: 'private answer text' } },
+    },
+  };
+  assert.deepEqual(buildGeminiFailureTelemetry(error), {
+    category: 'quota_exceeded',
+    status: 429,
+    providerCode: 'RESOURCE_EXHAUSTED',
+    retryable: false,
+  });
+});
+
+test('extracts the Gemini SDK status token from its wrapped provider error safely', () => {
+  const telemetry = buildGeminiFailureTelemetry({
+    status: 429,
+    message: 'got status: RESOURCE_EXHAUSTED. {"error":{"code":429,"message":"private prompt and response","status":"RESOURCE_EXHAUSTED"}}',
+  });
+  assert.deepEqual(telemetry, {
+    category: 'quota_exceeded',
+    status: 429,
+    providerCode: 'RESOURCE_EXHAUSTED',
+    retryable: false,
+  });
+  assert.equal(JSON.stringify(telemetry).includes('private'), false);
+});
+
+test('only transient chat provider failures get one retry before any token', () => {
+  assert.equal(shouldRetryChatGeminiAttempt({ status: 429, code: 'RATE_LIMIT_EXCEEDED' }, false, 1), true);
+  assert.equal(shouldRetryChatGeminiAttempt({ status: 429, code: 'RESOURCE_EXHAUSTED' }, false, 1), false);
+  assert.equal(shouldRetryChatGeminiAttempt({ status: 401, message: 'Invalid API key' }, false, 1), false);
+  assert.equal(shouldRetryChatGeminiAttempt({ status: 503 }, true, 1), false);
+  assert.equal(shouldRetryChatGeminiAttempt({ status: 503 }, false, 2), false);
+});
+
+test('model fallback policy remains distinct from quota diagnostics', () => {
   assert.equal(shouldTryNextGeminiModel({ status: 404, message: 'Model not found' }), true);
-  assert.equal(shouldTryNextGeminiModel({ status: 429, message: 'Quota exceeded' }), true);
+  assert.equal(shouldTryNextGeminiModel({ status: 429, message: 'Quota exceeded' }), false);
+  assert.equal(shouldTryNextGeminiModel({ status: 429, message: 'Rate limit exceeded' }), true);
   assert.equal(shouldTryNextGeminiModel({ status: 503, message: 'Model overloaded' }), true);
   assert.equal(shouldTryNextGeminiModel({ status: 401, message: 'Invalid API key' }), false);
 });

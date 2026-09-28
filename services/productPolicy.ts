@@ -82,6 +82,22 @@ export function getUtcDayWindow(now = new Date()): { start: Date; end: Date } {
   return { start, end: new Date(start.getTime() + 24 * 60 * 60 * 1000) };
 }
 
+export function getFreeLearnFeedbackDailyLimit(): number {
+  return configuredPositiveInteger('FREE_LEARN_FEEDBACK_DAILY_LIMIT', 3);
+}
+
+export function evaluateLearnDailyAllowance(input: { dailyUsed: number; dailyLimit: number; requested?: number }) {
+  const requested = input.requested ?? 1;
+  if (![input.dailyUsed, input.dailyLimit, requested].every(Number.isSafeInteger)
+    || input.dailyUsed < 0 || input.dailyLimit <= 0 || requested <= 0) {
+    throw new Error('Learn allowance counters are invalid.');
+  }
+  return {
+    allowed: input.dailyUsed + requested <= input.dailyLimit,
+    dailyRemaining: Math.max(input.dailyLimit - input.dailyUsed - requested, 0),
+  };
+}
+
 export function getFreeMonthlyWindow(now = new Date()): { start: Date; end: Date } {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));

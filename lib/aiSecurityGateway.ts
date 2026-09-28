@@ -119,10 +119,33 @@ export async function assertAIRequestNotProcessed(options: {
     clientRequestId: options.clientRequestId,
     metadata: operationMetadata,
   });
-  const existing = await prisma.usageLog.findUnique({
+  const existingLookup = prisma.usageLog.findUnique({
     where: { provider_requestId: { provider: options.provider, requestId: boundRequestId } },
     select: { id: true, metadata: true },
   });
+  const payloadHash = typeof operationMetadata.payloadHash === 'string' ? operationMetadata.payloadHash : null;
+  const priorLookup = payloadHash
+    ? prisma.usageLog.findFirst({
+        where: {
+          userId: options.userId,
+          provider: options.provider,
+          metadata: {
+            path: ['clientOperationId'],
+            equals: options.clientRequestId,
+          },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, metadata: true },
+      })
+    : Promise.resolve(null);
+  let existing: Awaited<typeof existingLookup>;
+  let prior: Awaited<typeof priorLookup>;
+  if (options.feature === 'chat') {
+    [existing, prior] = await Promise.all([existingLookup, priorLookup]);
+  } else {
+    existing = await existingLookup;
+    prior = existing ? null : await priorLookup;
+  }
   if (existing) {
     const metadata = existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
       ? existing.metadata as Record<string, unknown>
@@ -136,31 +159,16 @@ export async function assertAIRequestNotProcessed(options: {
     });
   }
 
-  const payloadHash = typeof operationMetadata.payloadHash === 'string' ? operationMetadata.payloadHash : null;
-  if (payloadHash) {
-    const prior = await prisma.usageLog.findFirst({
-      where: {
-        userId: options.userId,
-        provider: options.provider,
-        metadata: {
-          path: ['clientOperationId'],
-          equals: options.clientRequestId,
-        },
-      },
-      orderBy: { createdAt: 'desc' },
-      select: { id: true, metadata: true },
-    });
-    if (prior) {
-      const metadata = prior.metadata && typeof prior.metadata === 'object' && !Array.isArray(prior.metadata)
-        ? prior.metadata as Record<string, unknown>
-        : null;
-      const priorPayloadHash = typeof metadata?.payloadHash === 'string' ? metadata.payloadHash : null;
-      if (priorPayloadHash && priorPayloadHash !== payloadHash) {
-        throw new AIRequestGatewayError(409, {
-          error: 'This request ID is already bound to different input. Use a new operation ID for a new prompt.',
-          code: 'operation_id_conflict',
-        });
-      }
+  if (prior) {
+    const metadata = prior.metadata && typeof prior.metadata === 'object' && !Array.isArray(prior.metadata)
+      ? prior.metadata as Record<string, unknown>
+      : null;
+    const priorPayloadHash = typeof metadata?.payloadHash === 'string' ? metadata.payloadHash : null;
+    if (priorPayloadHash && priorPayloadHash !== payloadHash) {
+      throw new AIRequestGatewayError(409, {
+        error: 'This request ID is already bound to different input. Use a new operation ID for a new prompt.',
+        code: 'operation_id_conflict',
+      });
     }
   }
 }
@@ -492,8 +500,12 @@ export async function executeAIRequest<T>(options: ExecuteAIRequestOptions<T>): 
   }
   if (!billingDecision.allowed) {
     recordEntitlementTelemetry(options.feature === 'chat' ? 'chat_allowance_exhausted' : options.feature === 'live_tutor' ? 'live_allowance_exhausted' : 'entitlement_denied', { userId, feature: options.feature });
+    const learnLimitReached = options.metadata?.source === 'learn'
+      && billingDecision.reason === 'Daily Learn feedback limit reached.';
     throw new AIRequestGatewayError(429, {
-      error: 'Your current Mento usage allowance has been reached.',
+      error: learnLimitReached
+        ? "You've reached today's free Learn feedback limit. It resets at midnight UTC."
+        : 'Your current Mento usage allowance has been reached.',
       code: 'product_allowance_exhausted',
       retryable: false,
       feature: options.feature,

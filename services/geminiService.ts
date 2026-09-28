@@ -26,6 +26,7 @@ logger.info('Gemini environment loaded', {
 const client = new GoogleGenAI({
   apiKey: geminiApiKey,
 });
+const GEMINI_CHAT_FIRST_TOKEN_TIMEOUT_MS = 12_000;
 
 export type GeminiMessage = {
   role: 'user' | 'model' | 'system' | string;
@@ -108,7 +109,21 @@ type GeminiRequestPayload = {
   maxOutputTokens: number;
 };
 
-type GeminiErrorCategory = 'invalid_api_key' | 'model_not_found' | 'rate_limit' | 'model_overloaded' | 'timeout' | 'network_failure' | 'unknown';
+export type GeminiErrorCategory = 'invalid_api_key' | 'permission_denied' | 'invalid_request' | 'quota_exceeded' | 'model_not_found' | 'rate_limit' | 'model_overloaded' | 'provider_unavailable' | 'timeout' | 'network_failure' | 'unknown';
+
+export type GeminiFailureTelemetry = {
+  category: GeminiErrorCategory;
+  status?: number;
+  providerCode?: string;
+  retryable: boolean;
+};
+
+const SAFE_GEMINI_PROVIDER_CODES = new Set([
+  'ABORTED', 'API_KEY_INVALID', 'CANCELLED', 'DEADLINE_EXCEEDED', 'FAILED_PRECONDITION',
+  'INTERNAL', 'INVALID_ARGUMENT', 'INVALID_API_KEY', 'MODEL_NOT_FOUND', 'NOT_FOUND',
+  'PERMISSION_DENIED', 'QUOTA_EXCEEDED', 'RATE_LIMIT_EXCEEDED', 'RESOURCE_EXHAUSTED',
+  'SERVICE_UNAVAILABLE', 'UNAUTHENTICATED', 'UNAVAILABLE',
+]);
 
 function getConfiguredModelName(kind: GeminiModelKind): string {
   switch (kind) {
@@ -198,50 +213,155 @@ function getErrorDetails(error: unknown): unknown {
   return undefined;
 }
 
-export function classifyGeminiError(error: unknown): { category: GeminiErrorCategory; status?: number; message: string; responseBody?: unknown; details?: unknown } {
-  const status = typeof error === 'object' && error !== null && 'status' in error && typeof (error as { status?: unknown }).status === 'number'
-    ? (error as { status?: number }).status
-    : undefined;
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined;
+}
+
+function getNestedGeminiStatus(error: unknown): number | undefined {
+  const root = asRecord(error);
+  const response = asRecord(root?.response);
+  const cause = asRecord(root?.cause);
+  const nestedError = asRecord(root?.error);
+  const responseData = asRecord(response?.data);
+  const responseBody = asRecord(response?.body);
+  const responseDataError = asRecord(responseData?.error);
+  const responseBodyError = asRecord(responseBody?.error);
+  const candidates = [
+    root?.status, root?.statusCode, root?.httpStatus,
+    response?.status, cause?.status, nestedError?.status,
+    responseDataError?.code, responseBodyError?.code,
+  ];
+  return candidates.find((value): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599);
+}
+
+function normalizeProviderCode(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim().toUpperCase().replace(/[.\s-]+/g, '_');
+  return SAFE_GEMINI_PROVIDER_CODES.has(normalized) ? normalized : undefined;
+}
+
+function getSafeGeminiProviderCode(error: unknown): string | undefined {
+  const root = asRecord(error);
+  const response = asRecord(root?.response);
+  const cause = asRecord(root?.cause);
+  const nestedError = asRecord(root?.error);
+  const responseData = asRecord(response?.data);
+  const responseBody = asRecord(response?.body);
+  const responseDataError = asRecord(responseData?.error);
+  const responseBodyError = asRecord(responseBody?.error);
+  const details = Array.isArray(responseDataError?.details)
+    ? responseDataError.details
+    : Array.isArray(responseBodyError?.details)
+      ? responseBodyError.details
+      : [];
+  const detailReason = details.map(asRecord).map((detail) => detail?.reason ?? detail?.domain).find(Boolean);
+  const message = typeof root?.message === 'string' ? root.message : '';
+  const statusFromMessage = message.match(/\bgot status:\s*([A-Z][A-Z0-9_]{1,63})\b/i)?.[1];
+  let messageError: Record<string, unknown> | undefined;
+  const jsonStart = message.indexOf('{');
+  if (jsonStart >= 0) {
+    try {
+      const parsed = asRecord(JSON.parse(message.slice(jsonStart)));
+      messageError = asRecord(parsed?.error);
+    } catch {
+      // Provider messages are untrusted; only parse valid JSON and extract an allowlisted code.
+    }
+  }
+  const candidates = [
+    root?.code, root?.reason, root?.status, nestedError?.code, nestedError?.status,
+    responseDataError?.status, responseDataError?.code, responseBodyError?.status,
+    responseBodyError?.code, cause?.code, detailReason, statusFromMessage,
+    messageError?.status, messageError?.code,
+  ];
+  for (const candidate of candidates) {
+    const safeCode = normalizeProviderCode(candidate);
+    if (safeCode) return safeCode;
+  }
+  return undefined;
+}
+
+export function classifyGeminiError(error: unknown): { category: GeminiErrorCategory; status?: number; providerCode?: string; message: string; responseBody?: unknown; details?: unknown } {
+  const status = getNestedGeminiStatus(error);
   const message = getErrorText(error);
   const responseBody = getErrorBody(error);
   const details = getErrorDetails(error);
+  const providerCode = getSafeGeminiProviderCode(error);
+  const signal = `${message} ${providerCode ?? ''}`.toLowerCase();
 
-  if (status === 401 || /api key|invalid api|unauthorized|authentication/i.test(message)) {
-    return { category: 'invalid_api_key', status, message, responseBody, details };
+  if (/quota|resource_exhausted|billing limit/.test(signal) || providerCode === 'RESOURCE_EXHAUSTED' || providerCode === 'QUOTA_EXCEEDED') {
+    return { category: 'quota_exceeded', status, providerCode, message, responseBody, details };
   }
 
-  if (status === 404 || /model not found|not found/i.test(message)) {
-    return { category: 'model_not_found', status, message, responseBody, details };
+  if (status === 401 || providerCode === 'UNAUTHENTICATED' || providerCode === 'API_KEY_INVALID' || providerCode === 'INVALID_API_KEY' || /api key|invalid api|unauthorized|authentication/i.test(message)) {
+    return { category: 'invalid_api_key', status, providerCode, message, responseBody, details };
   }
 
-  if (status === 429 || /rate limit|too many requests/i.test(message)) {
-    return { category: 'rate_limit', status, message, responseBody, details };
+  if (status === 403 || providerCode === 'PERMISSION_DENIED') {
+    return { category: 'permission_denied', status, providerCode, message, responseBody, details };
   }
 
-  if (status === 503 || /overloaded|service unavailable|temporarily unavailable/i.test(message)) {
-    return { category: 'model_overloaded', status, message, responseBody, details };
+  if (status === 400 || providerCode === 'INVALID_ARGUMENT') {
+    return { category: 'invalid_request', status, providerCode, message, responseBody, details };
   }
 
-  if (status === 408 || status === 504 || /timeout|timed out|deadline exceeded/i.test(message)) {
-    return { category: 'timeout', status, message, responseBody, details };
+  if (
+    status === 404
+    || providerCode === 'NOT_FOUND'
+    || providerCode === 'MODEL_NOT_FOUND'
+    || /not found|invalid model|model.{0,40}(?:does not exist|not exist|unknown|unrecognized|not recognized)/i.test(message)
+  ) {
+    return { category: 'model_not_found', status, providerCode, message, responseBody, details };
   }
 
-  const code = typeof error === 'object' && error !== null && 'code' in error ? (error as { code?: unknown }).code : undefined;
+  if (status === 429 || providerCode === 'RATE_LIMIT_EXCEEDED' || /rate limit|too many requests/i.test(message)) {
+    return { category: 'rate_limit', status, providerCode, message, responseBody, details };
+  }
+
+  if (status === 408 || status === 504 || providerCode === 'DEADLINE_EXCEEDED' || /timeout|timed out|deadline exceeded/i.test(message)) {
+    return { category: 'timeout', status, providerCode, message, responseBody, details };
+  }
+
+  if (status === 503 || providerCode === 'UNAVAILABLE' || providerCode === 'SERVICE_UNAVAILABLE' || /overloaded|service unavailable|temporarily unavailable/i.test(message)) {
+    return { category: 'model_overloaded', status, providerCode, message, responseBody, details };
+  }
+
+  if ((status !== undefined && status >= 500) || providerCode === 'INTERNAL') {
+    return { category: 'provider_unavailable', status, providerCode, message, responseBody, details };
+  }
+
+  const root = asRecord(error);
+  const code = root?.code ?? asRecord(root?.cause)?.code;
   if (/network|econnreset|econnrefused|socket hang up|fetch failed|etimedout/i.test(message) || ['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT'].includes(String(code || '').toUpperCase())) {
-    return { category: 'network_failure', status, message, responseBody, details };
+    return { category: 'network_failure', status, providerCode, message, responseBody, details };
   }
 
-  return { category: 'unknown', status, message, responseBody, details };
+  return { category: 'unknown', status, providerCode, message, responseBody, details };
 }
 
-export function buildGeminiFailureTelemetry(error: unknown): { category: GeminiErrorCategory; status?: number } {
+export function buildGeminiFailureTelemetry(error: unknown): GeminiFailureTelemetry {
+  const safeError = asRecord(error);
+  if (typeof safeError?.providerCategory === 'string' && typeof safeError.retryable === 'boolean') {
+    const category = safeError.providerCategory as GeminiErrorCategory;
+    const status = typeof safeError.status === 'number' ? safeError.status : undefined;
+    const providerCode = normalizeProviderCode(safeError.providerCode);
+    return { category, status, ...(providerCode ? { providerCode } : {}), retryable: safeError.retryable };
+  }
   const classification = classifyGeminiError(error);
-  return { category: classification.category, status: classification.status };
+  const retryable = ['rate_limit', 'model_overloaded', 'provider_unavailable', 'timeout', 'network_failure'].includes(classification.category);
+  return {
+    category: classification.category,
+    status: classification.status,
+    ...(classification.providerCode ? { providerCode: classification.providerCode } : {}),
+    retryable,
+  };
 }
 
 function isTransientGeminiError(error: unknown): boolean {
-  const classification = classifyGeminiError(error);
-  return classification.category === 'rate_limit' || classification.category === 'model_overloaded' || classification.category === 'timeout' || classification.category === 'network_failure';
+  return buildGeminiFailureTelemetry(error).retryable;
+}
+
+export function shouldRetryChatGeminiAttempt(error: unknown, emittedToken: boolean, attempt: number): boolean {
+  return attempt < 2 && !emittedToken && buildGeminiFailureTelemetry(error).retryable;
 }
 
 export function shouldTryNextGeminiModel(error: unknown): boolean {
@@ -546,10 +666,18 @@ function createGeminiError(message: string, error: unknown): Error {
 }
 
 function createSafeNormalChatGeminiError(error: unknown, message: string): Error {
-  const safeError = new Error(message) as Error & { status?: number; providerCategory?: GeminiErrorCategory };
+  const safeError = new Error(message) as Error & {
+    status?: number;
+    providerCode?: string;
+    providerCategory?: GeminiErrorCategory;
+    retryable?: boolean;
+    providerAttemptCount?: number;
+  };
   const telemetry = buildGeminiFailureTelemetry(error);
   safeError.status = telemetry.status;
   safeError.providerCategory = telemetry.category;
+  safeError.providerCode = telemetry.providerCode;
+  safeError.retryable = telemetry.retryable;
   return safeError;
 }
 
@@ -790,6 +918,44 @@ export type GeminiStreamResult = {
   usage: GeminiUsage;
 };
 
+export type GeminiStreamDiagnostics = {
+  requestId?: string;
+  normalChatRecovery?: boolean;
+  onProviderStart?: (attempt: number) => void;
+};
+
+function nextGeminiChunkWithTimeout<T>(
+  iterator: AsyncIterator<T>,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+): Promise<IteratorResult<T>> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      abortSignal?.removeEventListener('abort', onAbort);
+    };
+    const finish = <TResult>(callback: (value: TResult) => void, value: TResult) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const onAbort = () => finish(reject, new Error('Gemini chat stream aborted'));
+    const timeout = setTimeout(() => finish(reject, new Error('Gemini chat first token timed out')), timeoutMs);
+
+    if (abortSignal?.aborted) {
+      onAbort();
+      return;
+    }
+    abortSignal?.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve().then(() => iterator.next()).then(
+      (result) => finish(resolve, result),
+      (error: unknown) => finish(reject, error),
+    );
+  });
+}
+
 export async function askGeminiStream(
   input: string | GeminiContent[],
   onToken: (token: string) => Promise<void> | void,
@@ -799,6 +965,7 @@ export async function askGeminiStream(
   onUsage?: (usage: GeminiUsage) => void,
   onProviderAttempt?: (model: string) => Promise<unknown>,
   approvedSecurityInput?: string,
+  diagnostics?: GeminiStreamDiagnostics,
 ): Promise<GeminiStreamResult> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
   assertFeatureEnabled(AI_FEATURES.STREAMING, 'Streaming is currently disabled.');
@@ -827,7 +994,11 @@ export async function askGeminiStream(
   }
   const payload = await buildGeminiRequestPayload(input, requestKind);
   const requestStartedAt = Date.now();
-  const candidates = getModelCandidatesForKind(requestKind, modelOverride);
+  const configuredCandidates = getModelCandidatesForKind(requestKind, modelOverride);
+  const normalChatRecovery = requestKind === 'chat' && diagnostics?.normalChatRecovery === true;
+  // The normal chat route stays on its selected model while failures are
+  // diagnosed. Other Gemini streaming features retain their prior fallback.
+  const candidates = normalChatRecovery ? configuredCandidates.slice(0, 1) : configuredCandidates;
   const requestedModel = modelOverride?.trim() || getConfiguredModelName(requestKind);
   let fallbackReason: string | undefined;
 
@@ -838,6 +1009,7 @@ export async function askGeminiStream(
   });
 
   let lastError: unknown;
+  let providerAttemptCount = 0;
   let currentStream: AsyncIterable<{ text?: string; usageMetadata?: GeminiUsageMetadata }> | null = null;
   const abortHandler = async () => {
     const cancellableStream = currentStream as (AsyncIterable<{ text?: string; usageMetadata?: GeminiUsageMetadata }> & {
@@ -860,6 +1032,19 @@ export async function askGeminiStream(
     abortSignal.addEventListener('abort', abortListener, { once: true });
   }
 
+  const waitBeforeChatRetry = async () => {
+    if (abortSignal?.aborted) return;
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timeout);
+        abortSignal?.removeEventListener('abort', finish);
+        resolve();
+      };
+      const timeout = setTimeout(finish, 500);
+      abortSignal?.addEventListener('abort', finish, { once: true });
+    });
+  };
+
   try {
     for (const model of candidates) {
       if (abortSignal?.aborted) {
@@ -869,35 +1054,85 @@ export async function askGeminiStream(
         return { outcome: 'cancelled', text: '', usage };
       }
 
-      let emittedTokenForModel = false;
-      let completionText = '';
-      let usageMetadata: GeminiUsageMetadata | undefined;
-      try {
-        currentStream = await retryGeminiCall(async () => {
-          await onProviderAttempt?.(model);
-          logger.info('Calling Gemini streaming provider', {
-            model,
-            kind: requestKind,
-            promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
+      let attempt = 1;
+      while (true) {
+        let emittedTokenForModel = false;
+        let completionText = '';
+        let usageMetadata: GeminiUsageMetadata | undefined;
+        let finishReason: string | null = null;
+        let attemptStartedAt = Date.now();
+        let streamIterator: AsyncIterator<{ text?: string; usageMetadata?: GeminiUsageMetadata }> | null = null;
+        let attemptTimeout: ReturnType<typeof setTimeout> | null = null;
+        let attemptTimedOut = false;
+        const clearAttemptTimeout = () => {
+          if (attemptTimeout) clearTimeout(attemptTimeout);
+          attemptTimeout = null;
+        };
+        try {
+          if (normalChatRecovery) {
+            // Keep billing/attempt accounting outside the timeout race so an
+            // abandoned callback cannot start a late, duplicate provider call.
+            await onProviderAttempt?.(model);
+            attemptStartedAt = Date.now();
+            providerAttemptCount += 1;
+            diagnostics?.onProviderStart?.(providerAttemptCount);
+          }
+          currentStream = await retryGeminiCall(async () => {
+            if (!normalChatRecovery) {
+              await onProviderAttempt?.(model);
+              attemptStartedAt = Date.now();
+              providerAttemptCount += 1;
+              diagnostics?.onProviderStart?.(providerAttemptCount);
+            }
+            const configAbortController = normalChatRecovery ? new AbortController() : null;
+            const providerAbortSignal = configAbortController
+              ? (abortSignal ? AbortSignal.any([abortSignal, configAbortController.signal]) : configAbortController.signal)
+              : undefined;
+            if (configAbortController) {
+              attemptTimeout = setTimeout(() => {
+                attemptTimedOut = true;
+                configAbortController.abort(new Error('Gemini chat first token timed out'));
+              }, GEMINI_CHAT_FIRST_TOKEN_TIMEOUT_MS);
+            }
+            logger.info('Calling Gemini streaming provider', {
+              model,
+              kind: requestKind,
+              promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction),
+            });
+            return await client.models.generateContentStream({
+              model,
+              contents: payload.contents,
+              config: {
+                systemInstruction: payload.systemInstruction,
+                safetySettings: SAFETY_SETTINGS,
+                ...getGeminiGenerationTuning(model),
+                maxOutputTokens: payload.maxOutputTokens,
+                ...(providerAbortSignal ? { abortSignal: providerAbortSignal } : {}),
+              },
+            });
+          }, {
+            ...geminiProviderOptions,
+            // Normal chat owns its single retry below so stream-iteration
+            // failures and stream-creation failures follow the same policy.
+            ...(normalChatRecovery ? { retries: 0 } : {}),
+            timeoutMs: normalChatRecovery
+              ? GEMINI_CHAT_FIRST_TOKEN_TIMEOUT_MS
+              : geminiProviderOptions.timeoutMs ?? AI_CONFIG.GEMINI_TIMEOUT_MS,
+            shouldRetry: (error: unknown) => isTransientGeminiError(error),
           });
-          return await client.models.generateContentStream({
-            model,
-            contents: payload.contents,
-            config: {
-              systemInstruction: payload.systemInstruction,
-              safetySettings: SAFETY_SETTINGS,
-              ...getGeminiGenerationTuning(model),
-              maxOutputTokens: payload.maxOutputTokens,
-            },
-          });
-        }, {
-          ...geminiProviderOptions,
-          timeoutMs: geminiProviderOptions.timeoutMs ?? AI_CONFIG.GEMINI_TIMEOUT_MS,
-          shouldRetry: (error: unknown) => isTransientGeminiError(error),
-        });
 
+        streamIterator = currentStream[Symbol.asyncIterator]();
         let firstTokenObserved = false;
-        for await (const chunk of currentStream) {
+        while (true) {
+          const remainingFirstTokenMs = GEMINI_CHAT_FIRST_TOKEN_TIMEOUT_MS - (Date.now() - attemptStartedAt);
+          const next = normalChatRecovery && !emittedTokenForModel
+            ? await nextGeminiChunkWithTimeout(streamIterator, Math.max(1, remainingFirstTokenMs), abortSignal)
+            : await streamIterator.next();
+          if (next.done) {
+            clearAttemptTimeout();
+            break;
+          }
+          const chunk = next.value;
           if (abortSignal?.aborted) {
             await abortHandler();
             break;
@@ -906,6 +1141,10 @@ export async function askGeminiStream(
           if (chunk?.usageMetadata) {
             usageMetadata = chunk.usageMetadata;
           }
+          const candidateFinishReason = (chunk as { candidates?: Array<{ finishReason?: unknown }> })?.candidates?.[0]?.finishReason;
+          if (typeof candidateFinishReason === 'string') {
+            finishReason = candidateFinishReason;
+          }
           const chunkText = typeof chunk?.text === 'string' ? chunk.text : '';
           if (!chunkText) {
             continue;
@@ -913,6 +1152,7 @@ export async function askGeminiStream(
 
           completionText += chunkText;
           emittedTokenForModel = true;
+          clearAttemptTimeout();
           if (!firstTokenObserved) {
             firstTokenObserved = true;
             observeMonitoringLatency('gemini', Date.now() - requestStartedAt, { provider: 'gemini', operation: 'first-token' });
@@ -938,6 +1178,16 @@ export async function askGeminiStream(
         const providerDurationMs = Date.now() - requestStartedAt;
         observeMonitoringLatency('gemini', providerDurationMs, { provider: 'gemini', operation: requestKind });
         if (requestKind === 'chat') observeChatGeminiResponse(providerDurationMs, model);
+        if (requestKind === 'chat' && finishReason === 'MAX_TOKENS') {
+          logger.warn('Gemini chat response reached the output token limit', {
+            provider: 'gemini',
+            kind: requestKind,
+            model,
+            finishReason,
+            maxOutputTokens: payload.maxOutputTokens,
+            responseSizeBytes: Buffer.byteLength(completionText, 'utf8'),
+          });
+        }
         logger.info('Gemini stream completed', {
           provider: 'gemini',
           kind: requestKind,
@@ -946,37 +1196,61 @@ export async function askGeminiStream(
           responseSizeBytes: Buffer.byteLength(completionText, 'utf8'),
           ...(requestKind === 'chat' ? buildNormalChatModelTelemetry(requestedModel, model, fallbackReason) : {}),
         });
-        return { outcome: 'completed', text: completionText.trim(), usage };
-      } catch (error: unknown) {
-        if (abortSignal?.aborted) {
-          logger.info('Gemini stream aborted during provider attempt', { provider: 'gemini', kind: requestKind, model });
-          const usage = normalizeGeminiUsage(model, usageMetadata);
-          onUsage?.(usage);
-          return { outcome: 'cancelled', text: completionText.trim(), usage };
-        }
+          return { outcome: 'completed', text: completionText.trim(), usage };
+        } catch (error: unknown) {
+          clearAttemptTimeout();
+          if (abortSignal?.aborted) {
+            logger.info('Gemini stream aborted during provider attempt', { provider: 'gemini', kind: requestKind, model });
+            const usage = normalizeGeminiUsage(model, usageMetadata);
+            onUsage?.(usage);
+            return { outcome: 'cancelled', text: completionText.trim(), usage };
+          }
 
-        // A stream may fail after Gemini has already emitted billable work.
-        // Preserve provider-reported metadata when available; otherwise mark
-        // the usage UNKNOWN rather than fabricating token counts.
-        if (emittedTokenForModel || usageMetadata) {
-          onUsage?.(normalizeGeminiUsage(model, usageMetadata));
-        }
+          // A stream may fail after Gemini has already emitted billable work.
+          // Preserve provider-reported metadata when available; otherwise mark
+          // the usage UNKNOWN rather than fabricating token counts.
+          if (emittedTokenForModel || usageMetadata) {
+            onUsage?.(normalizeGeminiUsage(model, usageMetadata));
+          }
 
-        lastError = error;
-        const classification = classifyGeminiError(error);
-        logger.warn('Gemini stream attempt failed', {
-          provider: 'gemini',
-          kind: requestKind,
-          model,
-          classification: buildGeminiFailureTelemetry(error),
-          latencyMs: Date.now() - requestStartedAt,
-        });
+          const attemptError = attemptTimedOut ? new Error('Gemini chat first token timed out') : error;
+          lastError = attemptError;
+          const classification = buildGeminiFailureTelemetry(attemptError);
+          const retryScheduled = normalChatRecovery && shouldRetryChatGeminiAttempt(attemptError, emittedTokenForModel, attempt);
+          if (retryScheduled && streamIterator?.return) {
+            void Promise.resolve(streamIterator.return()).catch(() => undefined);
+          }
+          logger.warn(normalChatRecovery ? 'Gemini chat provider attempt failed' : 'Gemini stream attempt failed', {
+            provider: 'gemini',
+            kind: requestKind,
+            requestId: diagnostics?.requestId,
+            model,
+            attempt,
+            providerAttemptCount,
+            elapsedMs: Date.now() - attemptStartedAt,
+            emittedToken: emittedTokenForModel,
+            retryScheduled,
+            classification,
+          });
 
-        if (!shouldFallbackStreamingModel(error, emittedTokenForModel)) {
-          break;
+          if (retryScheduled) {
+            attempt += 1;
+            await waitBeforeChatRetry();
+            if (abortSignal?.aborted) {
+              const usage = normalizeGeminiUsage(model, usageMetadata);
+              onUsage?.(usage);
+              return { outcome: 'cancelled', text: completionText.trim(), usage };
+            }
+            continue;
+          }
+
+          if (normalChatRecovery || !shouldFallbackStreamingModel(error, emittedTokenForModel)) {
+            break;
+          }
+          fallbackReason = classification.category;
+          if (requestKind === 'chat') recordChatFallback(classification.category);
         }
-        fallbackReason = classification.category;
-        if (requestKind === 'chat') recordChatFallback(classification.category);
+        break;
       }
     }
   } finally {
@@ -987,10 +1261,14 @@ export async function askGeminiStream(
 
   const fallbackMessage = 'Gemini is temporarily unavailable. Please try again shortly.';
   logger.warn('Gemini stream degraded gracefully', {
-    fallbackMessage,
+    kind: requestKind,
+    requestId: diagnostics?.requestId,
+    providerAttemptCount,
     classification: buildGeminiFailureTelemetry(lastError),
   });
-  throw createSafeNormalChatGeminiError(lastError, fallbackMessage);
+  const safeError = createSafeNormalChatGeminiError(lastError, fallbackMessage) as Error & { providerAttemptCount?: number };
+  safeError.providerAttemptCount = providerAttemptCount;
+  throw safeError;
 }
 
 export async function analyzeImage(

@@ -79,12 +79,12 @@ describe('Live Tutor Redis leases', () => {
     );
   });
 
-  it('uses the safe one-session capacity default and accepts an explicit provider upgrade', async () => {
+  it('uses the current safe default capacity and accepts an explicit provider upgrade', async () => {
     const { getLiveTutorCapacityConfig } = await import('./realtimeRedis');
 
     expect(getLiveTutorCapacityConfig()).toEqual({
-      maxConcurrentSessions: 1,
-      maxConcurrentAvatarStarts: 1,
+      maxConcurrentSessions: 10,
+      maxConcurrentAvatarStarts: 10,
     });
 
     vi.stubEnv('LIVE_TUTOR_MAX_CONCURRENT_SESSIONS', '50');

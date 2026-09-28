@@ -82,6 +82,15 @@ describe('AI billing operation security', () => {
     expect(() => requireClientAIRequestId(request)).toThrow(AIRequestGatewayError);
   });
 
+  it('parallelizes only the independent Normal Chat idempotency reads', () => {
+    const source = fs.readFileSync(path.join(process.cwd(), 'lib/aiSecurityGateway.ts'), 'utf8');
+
+    expect(source).toContain("if (options.feature === 'chat') {");
+    expect(source).toContain('[existing, prior] = await Promise.all([existingLookup, priorLookup]);');
+    expect(source).toContain('existing = await existingLookup;');
+    expect(source).toContain('prior = existing ? null : await priorLookup;');
+  });
+
   it('requires stable operation IDs at every billable Normal Chat HTTP entry point', async () => {
     const fs = await import('node:fs');
     const path = await import('node:path');

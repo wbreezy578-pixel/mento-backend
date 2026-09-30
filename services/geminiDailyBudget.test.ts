@@ -7,6 +7,7 @@ import {
   GeminiDailyBudgetUnavailableError,
   getGeminiDailyBudgetPolicy,
   getGeminiDailyBudgetWindow,
+  isNormalChatGeminiBudgetSubject,
 } from './geminiDailyBudget';
 
 type LedgerRow = {
@@ -43,6 +44,13 @@ const policy = {
 };
 
 describe('Gemini provider-wide daily budget', () => {
+  it('includes spreadsheet generations in the Gemini provider budget without changing other feature classification', () => {
+    expect(isNormalChatGeminiBudgetSubject({ provider: 'Gemini', feature: 'spreadsheet', pending: true })).toBe(true);
+    expect(isNormalChatGeminiBudgetSubject({ provider: 'Gemini', feature: 'chat', pending: true })).toBe(true);
+    expect(isNormalChatGeminiBudgetSubject({ provider: 'Gemini', feature: 'image', pending: true })).toBe(true);
+    expect(isNormalChatGeminiBudgetSubject({ provider: 'Gemini', feature: 'live_tutor', pending: true })).toBe(false);
+  });
+
   it('allows a request below budget and reserves estimated exposure', async () => {
     const tx = transactionClient([{ createdAt: new Date('2026-08-31T01:00:00Z'), providerCostUSD: 2, tokensTotal: 200 }]);
     const result = await assertAndLockGeminiDailyBudget(tx as any, {

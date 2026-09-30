@@ -10,7 +10,9 @@ describe('canonical product policy', () => {
 
   it('defines the launch Free policy centrally', () => {
     const policy = getProductPolicy('FREE');
-    expect(policy.normalChat).toMatchObject({ model: 'gemini-3.5-flash-lite', dailyCompletedMessages: 30, monthlyCompletedMessages: 500, maxConcurrentGenerations: 1 });
+    expect(policy.normalChat).toMatchObject({ model: 'gemini-3.5-flash-lite', dailyCompletedMessages: 10, maxConcurrentGenerations: 1 });
+    expect(policy.normalChat.imageQuestionsPerDay).toBe(3);
+    expect(policy.spreadsheetGenerationsPerDay).toBe(1);
     expect(policy.normalChat.allowedModels).toEqual(['gemini-3.5-flash-lite']);
     expect(policy.liveTutor.enabled).toBe(false);
   });
@@ -19,7 +21,9 @@ describe('canonical product policy', () => {
     const policy = getProductPolicy('PRO');
     expect(policy.priceMonthlyUSD).toBe(29);
     expect(policy.normalChat.model).toBe('gemini-3.5-flash');
-    expect(policy.normalChat.dailyCompletedMessages).toBeGreaterThan(0);
+    expect(policy.normalChat.dailyCompletedMessages).toBe(120);
+    expect(policy.normalChat.imageQuestionsPerDay).toBe(10);
+    expect(policy.spreadsheetGenerationsPerDay).toBe(10);
     expect(policy.normalChat.monthlyCompletedMessages).toBeGreaterThan(policy.normalChat.dailyCompletedMessages);
     expect(policy.liveTutor).toMatchObject({ enabled: true, includedSecondsPerPeriod: 7200, maxConcurrentSessions: 1, maxSessionSeconds: 1800 });
   });

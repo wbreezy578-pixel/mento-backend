@@ -13,8 +13,8 @@ const pendingChat = {
   secondsUsed: 0,
 };
 
-describe('zero-cost pending Gemini chat reservation', () => {
-  it('skips a pricing lookup only before measured chat usage exists', () => {
+describe('zero-cost pending Gemini text reservation', () => {
+  it('skips a pricing lookup before measured chat or spreadsheet usage exists', () => {
     expect(isZeroCostPendingGeminiChatReservation(pendingChat)).toBe(true);
     expect(isZeroCostPendingGeminiChatReservation({ ...pendingChat, tokensInput: 1 })).toBe(false);
     expect(isZeroCostPendingGeminiChatReservation({ ...pendingChat, tokensOutput: 1 })).toBe(false);

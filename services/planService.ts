@@ -66,6 +66,7 @@ const DEFAULT_PLAN_DEFINITIONS: PlanDefinition[] = [
       fairUseChatLimit: freePolicy.normalChat.dailyCompletedMessages,
       fairUseImageLimit: freePolicy.normalChat.imageQuestionsPerDay,
       imageDailyLimit: freePolicy.normalChat.imageQuestionsPerDay,
+      spreadsheetDailyLimit: freePolicy.spreadsheetGenerationsPerDay,
       liveTutorEnabled: false,
     },
   },
@@ -89,6 +90,7 @@ const DEFAULT_PLAN_DEFINITIONS: PlanDefinition[] = [
       fairUseChatLimit: proPolicy.normalChat.dailyCompletedMessages,
       fairUseImageLimit: proPolicy.normalChat.imageQuestionsPerDay,
       imageDailyLimit: proPolicy.normalChat.imageQuestionsPerDay,
+      spreadsheetDailyLimit: proPolicy.spreadsheetGenerationsPerDay,
       liveTutorEnabled: true,
       includedLiveTutorSeconds: proPolicy.liveTutor.includedSecondsPerPeriod,
       liveTutorMaxSessionSeconds: proPolicy.liveTutor.maxSessionSeconds,
@@ -335,7 +337,7 @@ export async function getEffectivePlanForUser(userId: string): Promise<PlanRecor
 
 export function getEffectiveLimit(
   plan: PlanRecord,
-  feature: 'chat' | 'image',
+  feature: 'chat' | 'image' | 'spreadsheet',
   options?: { modelUsed?: string | null },
 ): number | null {
   if (feature === 'chat') {
@@ -359,6 +361,10 @@ export function getEffectiveLimit(
 
     const fairUseLimit = toNumber(plan.features.fairUseImageLimit);
     return fairUseLimit ?? null;
+  }
+
+  if (feature === 'spreadsheet') {
+    return toNumber(plan.features.spreadsheetDailyLimit) ?? getProductPolicy(plan.name).spreadsheetGenerationsPerDay;
   }
 
   return null;

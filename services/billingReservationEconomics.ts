@@ -10,7 +10,7 @@ export function isZeroCostPendingGeminiChatReservation(input: {
   tokensTotal: number;
   secondsUsed: number;
 }): boolean {
-  return input.feature === 'chat'
+  return (input.feature === 'chat' || input.feature === 'spreadsheet')
     && input.provider === 'Gemini'
     && input.pending
     && input.tokensInput === 0

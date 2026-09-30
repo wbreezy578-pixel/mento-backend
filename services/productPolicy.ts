@@ -7,6 +7,7 @@ export type AllowanceLimitScope = 'daily' | 'monthly' | 'subscription_period';
 export interface ProductPolicy {
   name: CanonicalPlanName;
   priceMonthlyUSD: number;
+  spreadsheetGenerationsPerDay: number;
   normalChat: {
     model: NormalChatGeminiModel;
     allowedModels: readonly NormalChatGeminiModel[];
@@ -38,6 +39,7 @@ export function getProductPolicy(plan: string | null | undefined): ProductPolicy
     return {
       name: 'PRO',
       priceMonthlyUSD: 29,
+      spreadsheetGenerationsPerDay: configuredPositiveInteger('PRO_SPREADSHEET_DAILY_LIMIT', 10),
       normalChat: {
         model: 'gemini-3.5-flash',
         allowedModels: ['gemini-3.5-flash', 'gemini-3.5-flash-lite'],
@@ -45,7 +47,7 @@ export function getProductPolicy(plan: string | null | undefined): ProductPolicy
         // may tune them centrally through server environment configuration.
         dailyCompletedMessages: configuredPositiveInteger('PRO_CHAT_DAILY_LIMIT', 120),
         monthlyCompletedMessages: configuredPositiveInteger('PRO_CHAT_MONTHLY_LIMIT', 3000),
-        imageQuestionsPerDay: configuredPositiveInteger('PRO_IMAGE_DAILY_LIMIT', 30),
+        imageQuestionsPerDay: configuredPositiveInteger('PRO_IMAGE_DAILY_LIMIT', 10),
         maxConcurrentGenerations: 1,
       },
       liveTutor: {
@@ -60,10 +62,11 @@ export function getProductPolicy(plan: string | null | undefined): ProductPolicy
   return {
     name: 'FREE',
     priceMonthlyUSD: 0,
+    spreadsheetGenerationsPerDay: configuredPositiveInteger('FREE_SPREADSHEET_DAILY_LIMIT', 1),
     normalChat: {
       model: 'gemini-3.5-flash-lite',
       allowedModels: ['gemini-3.5-flash-lite'],
-      dailyCompletedMessages: configuredPositiveInteger('FREE_CHAT_DAILY_LIMIT', 30),
+      dailyCompletedMessages: configuredPositiveInteger('FREE_CHAT_DAILY_LIMIT', 10),
       monthlyCompletedMessages: configuredPositiveInteger('FREE_CHAT_MONTHLY_LIMIT', 500),
       imageQuestionsPerDay: configuredPositiveInteger('FREE_IMAGE_DAILY_LIMIT', 3),
       maxConcurrentGenerations: 1,

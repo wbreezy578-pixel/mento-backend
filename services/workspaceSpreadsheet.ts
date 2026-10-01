@@ -48,6 +48,7 @@ interface GeneratedWorkspaceSpreadsheet {
   title: string;
   columns: Array<{ name: string; kind: WorkspaceColumnKind }>;
   rows: Array<Array<string | number | null>>;
+  formulas?: Array<{ cell: string; formula: string }>;
 }
 
 const COLUMN_KINDS = new Set<WorkspaceColumnKind>(['text', 'number', 'currency', 'percent', 'date']);
@@ -112,7 +113,125 @@ function validateGeneratedSpreadsheet(value: unknown): GeneratedWorkspaceSpreads
     rows.push(cells);
   }
 
-  return { title: value.title.trim(), columns, rows };
+  const formulas: NonNullable<GeneratedWorkspaceSpreadsheet['formulas']> = [];
+  const formulaCells = new Set<string>();
+  if (value.formulas !== undefined) {
+    if (!Array.isArray(value.formulas) || value.formulas.length > rows.length * columns.length) return null;
+    for (const formula of value.formulas) {
+      if (!isRecord(formula) || typeof formula.cell !== 'string' || typeof formula.formula !== 'string') return null;
+      const target = /^([A-J])(\d+)$/.exec(formula.cell.toUpperCase());
+      if (!target || Number(target[2]) < 2 || Number(target[2]) > rows.length + 1) return null;
+      const columnIndex = target[1].charCodeAt(0) - 65;
+      if (columnIndex >= columns.length || !isSupportedWorkspaceFormulaSource(formula.formula)) return null;
+      const cell = `${target[1]}${target[2]}`;
+      if (formulaCells.has(cell)) return null;
+      formulaCells.add(cell);
+      formulas.push({ cell, formula: formula.formula });
+    }
+  }
+
+  return { title: value.title.trim(), columns, rows, ...(formulas.length ? { formulas } : {}) };
+}
+
+function columnLetters(index: number): string {
+  let value = index + 1;
+  let letters = '';
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    letters = String.fromCharCode(65 + remainder) + letters;
+    value = Math.floor((value - 1) / 26);
+  }
+  return letters;
+}
+
+function normalizeGeneratedCategorySummary(
+  generated: GeneratedWorkspaceSpreadsheet,
+  prompt: string,
+): GeneratedWorkspaceSpreadsheet {
+  const categoryIndex = generated.columns.findIndex((column) => /^category$/i.test(column.name.trim()));
+  if (categoryIndex < 0) return generated;
+
+  const descriptionIndex = generated.columns.findIndex((column) => /^(description|summary)$/i.test(column.name.trim()));
+  const spendingIndex = generated.columns.findIndex((column) => /^(total cost|total spending|total spent|total expenses?)$/i.test(column.name.trim()))
+    >= 0
+    ? generated.columns.findIndex((column) => /^(total cost|total spending|total spent|total expenses?)$/i.test(column.name.trim()))
+    : generated.columns.findIndex((column) => /^amount$/i.test(column.name.trim()));
+  if (spendingIndex < 0) return generated;
+
+  const isCategorySummary = (row: Array<string | number | null>) => row.some((cell) => (
+    typeof cell === 'string' && /^category\s+(?:summary|breakdown)$/i.test(cell.trim())
+  ));
+  const summaryIndices = new Set(generated.rows.flatMap((row, index) => isCategorySummary(row) ? [index] : []));
+  const requested = /\b(?:category|categories)\b.{0,80}\b(?:summary|breakdown|spending|expense|total)\b|\b(?:summary|breakdown|spending|expense|total)\b.{0,80}\b(?:category|categories)\b/i.test(prompt);
+  if (!requested && summaryIndices.size === 0) return generated;
+
+  const originalRowCount = generated.rows.length;
+  const rowIndexMap = new Map<number, number>();
+  const rows = generated.rows.filter((_row, index) => !summaryIndices.has(index));
+  let nextRowIndex = 0;
+  for (let index = 0; index < originalRowCount; index += 1) {
+    if (!summaryIndices.has(index)) {
+      rowIndexMap.set(index, nextRowIndex);
+      nextRowIndex += 1;
+    }
+  }
+
+  const remappedFormulas = (generated.formulas ?? []).flatMap((entry) => {
+    const target = /^([A-J])(\d+)$/.exec(entry.cell.toUpperCase());
+    if (!target) return [];
+    const originalIndex = Number(target[2]) - 2;
+    const mappedIndex = rowIndexMap.get(originalIndex);
+    if (mappedIndex === undefined) return [];
+    const remapReference = (_match: string, column: string, rowText: string) => {
+      const referenceIndex = Number(rowText) - 2;
+      const newReferenceIndex = rowIndexMap.get(referenceIndex);
+      return newReferenceIndex === undefined ? `${column}${rowText}` : `${column}${newReferenceIndex + 2}`;
+    };
+    return [{
+      cell: `${target[1]}${mappedIndex + 2}`,
+      formula: entry.formula.replace(/(\$?[A-Z]{1,2}\$?)(\d+)/g, remapReference),
+    }];
+  });
+  generated.rows = rows;
+  generated.formulas = remappedFormulas;
+
+  const formulaCells = new Set(remappedFormulas.map((entry) => entry.cell.toUpperCase()));
+  const categories = new Map<string, { label: string; rowNumbers: number[] }>();
+  for (const [rowIndex, row] of rows.entries()) {
+    if (row.some((cell) => typeof cell === 'string' && /^(?:(?:monthly|grand)\s+)?totals?$/i.test(cell.trim()))) continue;
+    const rawCategory = row[categoryIndex];
+    if (typeof rawCategory !== 'string' || !rawCategory.trim()) continue;
+    const spendingCell = row[spendingIndex];
+    const spendingCellReference = `${columnLetters(spendingIndex)}${rowIndex + 2}`;
+    const numericText = typeof spendingCell === 'string' ? spendingCell.trim().replace(/[$,\s]/g, '') : '';
+    const hasSpendingValue = typeof spendingCell === 'number'
+      ? Number.isFinite(spendingCell)
+      : Boolean(numericText) && Number.isFinite(Number(numericText));
+    if (!hasSpendingValue && !formulaCells.has(spendingCellReference)) continue;
+
+    const label = rawCategory.trim();
+    const key = label.toLocaleLowerCase('en-US');
+    const existing = categories.get(key);
+    if (existing) existing.rowNumbers.push(rowIndex + 2);
+    else categories.set(key, { label, rowNumbers: [rowIndex + 2] });
+  }
+
+  if (rows.length + categories.size > MAX_WORKSPACE_ROWS) {
+    throw new Error('The category summary exceeds the maximum spreadsheet size.');
+  }
+
+  for (const category of categories.values()) {
+    const row = Array<string | number | null>(generated.columns.length).fill(null);
+    if (categoryIndex !== 0 && descriptionIndex !== 0) row[0] = `${category.label} Total`;
+    if (descriptionIndex >= 0 && descriptionIndex !== categoryIndex) row[descriptionIndex] = 'Category Summary';
+    row[categoryIndex] = category.label;
+    const targetCell = `${columnLetters(spendingIndex)}${rows.length + 2}`;
+    const sourceCells = category.rowNumbers.map((rowNumber) => `${columnLetters(spendingIndex)}${rowNumber}`);
+    rows.push(row);
+    remappedFormulas.push({ cell: targetCell, formula: `=SUM(${sourceCells.join(',')})` });
+  }
+
+  return generated;
 }
 
 export function validateWorkspaceWorkbook(value: unknown): WorkspaceWorkbook | null {
@@ -210,7 +329,7 @@ export function toLegacyWorkspaceSpreadsheet(workbook: WorkspaceWorkbook): Legac
     rows: sheet.rows.map((row) => row.cells.map((cell) => cell.type === 'value' ? cell.value : cell.error ?? cell.result)),
   };
 }
-export function parseGeneratedWorkspaceSpreadsheet(text: string): WorkspaceWorkbook {
+export function parseGeneratedWorkspaceSpreadsheet(text: string, prompt = ''): WorkspaceWorkbook {
   const trimmed = text.trim();
   const unfenced = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   let parsed: unknown;
@@ -220,12 +339,21 @@ export function parseGeneratedWorkspaceSpreadsheet(text: string): WorkspaceWorkb
     throw new Error('The generated spreadsheet was not valid JSON.');
   }
 
-  const generated = validateGeneratedSpreadsheet(parsed);
+  const validatedGenerated = validateGeneratedSpreadsheet(parsed);
+  const generated = validatedGenerated ? normalizeGeneratedCategorySummary(validatedGenerated, prompt) : null;
   if (!generated || generated.rows.length === 0) {
     throw new Error('The generated spreadsheet did not match the required format.');
   }
   const workbook = createWorkspaceWorkbookFromLegacySpreadsheet(generated);
   if (!workbook) throw new Error('The generated spreadsheet did not match the required format.');
+  for (const formula of generated.formulas ?? []) {
+    const target = /^([A-J])(\d+)$/.exec(formula.cell);
+    if (!target) throw new Error('The generated spreadsheet did not match the required format.');
+    const row = workbook.sheets[0].rows[Number(target[2]) - 2];
+    const columnIndex = target[1].charCodeAt(0) - 65;
+    if (!row || columnIndex >= row.cells.length) throw new Error('The generated spreadsheet did not match the required format.');
+    row.cells[columnIndex] = { type: 'formula', formula: formula.formula, result: null };
+  }
   return workbook;
 }
 

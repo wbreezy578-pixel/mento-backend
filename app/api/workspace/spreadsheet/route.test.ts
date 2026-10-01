@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   getTutorLanguage: vi.fn(),
   buildTutorLanguageInstruction: vi.fn(),
   parseGeneratedWorkspaceSpreadsheet: vi.fn(),
+  loggerError: vi.fn(),
   validateWorkspaceWorkbook: vi.fn(),
   buildWorkspaceWorkbookXlsx: vi.fn(),
   createWorkspaceWorkbookFromLegacySpreadsheet: vi.fn(),
@@ -42,6 +43,10 @@ vi.mock('../../../../services/geminiService', () => ({
 vi.mock('../../../../lib/userSettings', () => ({
   buildTutorLanguageInstruction: mocks.buildTutorLanguageInstruction,
   getTutorLanguage: mocks.getTutorLanguage,
+}));
+
+vi.mock('../../../../lib/logger', () => ({
+  default: { error: mocks.loggerError, info: vi.fn(), warn: vi.fn() },
 }));
 
 vi.mock('../../../../services/workspaceSpreadsheet', () => ({
@@ -113,6 +118,82 @@ describe('Workspace spreadsheet billing contract', () => {
       provider: 'Gemini',
       metadata: expect.objectContaining({ source: 'workspace', operationType: 'workspace.spreadsheet.generate' }),
     }));
+  });
+
+  it('logs unexpected generation failures without logging the spreadsheet prompt', async () => {
+    const prompt = 'private quarterly forecast prompt';
+    mocks.executeAIRequest.mockRejectedValueOnce(new Error('provider response could not be parsed'));
+    const response = await generateSpreadsheet(postRequest('https://mento.test/api/workspace/spreadsheet/generate', {
+      prompt,
+      requestId: 'workspace-request-error-1234',
+    }));
+
+    expect(response.status).toBe(500);
+    expect(mocks.loggerError).toHaveBeenCalledWith('Workspace spreadsheet generation failed', expect.objectContaining({
+      errorName: 'Error',
+      errorMessage: 'provider response could not be parsed',
+    }));
+    expect(JSON.stringify(mocks.loggerError.mock.calls)).not.toContain(prompt);
+  });
+
+  it('requests structured JSON and retries malformed output within one spreadsheet reservation', async () => {
+    const generated = {
+      title: 'Sales',
+      columns: [
+        { name: 'Units', kind: 'number' },
+        { name: 'Price', kind: 'currency' },
+        { name: 'Revenue', kind: 'currency' },
+      ],
+      rows: [[12, 8, null]],
+      formulas: [{ cell: 'C2', formula: '=A2*B2' }],
+    };
+    const workbookWithFormula = {
+      ...workbook,
+      sheets: [{
+        ...workbook.sheets[0],
+        rows: [{ ...workbook.sheets[0].rows[0], cells: [
+          { type: 'value', value: 'Housing' },
+          { type: 'value', value: 1500 },
+          { type: 'formula', formula: '=A2*B2', result: null },
+        ] }],
+      }],
+    };
+    mocks.getTutorLanguage.mockResolvedValueOnce('en');
+    mocks.buildTutorLanguageInstruction.mockReturnValueOnce('Respond in English.');
+    mocks.parseGeneratedWorkspaceSpreadsheet
+      .mockImplementationOnce(() => { throw new Error('invalid JSON'); })
+      .mockReturnValueOnce(workbookWithFormula);
+    mocks.askGemini
+      .mockResolvedValueOnce('Here is the workbook, but not as JSON.')
+      .mockResolvedValueOnce(JSON.stringify(generated));
+    mocks.executeAIRequest.mockImplementationOnce(async (options: {
+      callback: (context: {
+        billingDecision: { modelUsed: string };
+        sanitizedInput: string;
+        reportUsage: () => void;
+        reportProviderAttempt: () => Promise<number>;
+      }) => Promise<unknown>;
+    }) => ({
+      result: await options.callback({
+        billingDecision: { modelUsed: 'gemini-test' },
+        sanitizedInput: 'Create a sales spreadsheet with revenue formulas.',
+        reportUsage: vi.fn(),
+        reportProviderAttempt: vi.fn().mockResolvedValue(1),
+      }),
+    }));
+
+    const response = await generateSpreadsheet(postRequest('https://mento.test/api/workspace/spreadsheet/generate', {
+      prompt: 'Create a sales spreadsheet with revenue formulas.',
+      requestId: 'workspace-request-json-1234',
+    }));
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.workbook.sheets[0].rows[0].cells[2]).toEqual({ type: 'formula', formula: '=A2*B2', result: null });
+    expect(mocks.askGemini).toHaveBeenCalledTimes(2);
+    expect(mocks.askGemini.mock.calls[0][5]).toEqual({ responseMimeType: 'application/json', maxOutputTokens: 8192 });
+    expect(mocks.askGemini.mock.calls[0][0][0].parts[0].text).toContain('For percentages, use kind "number" when the formula multiplies by 100');
+    expect(mocks.executeAIRequest).toHaveBeenCalledTimes(1);
   });
 
   it('exports the edited sheet without reserving another AI usage unit', async () => {

@@ -50,6 +50,106 @@ describe('workspace workbook payloads', () => {
     expect(validateWorkspaceWorkbook(workbook)).toEqual(workbook);
   });
 
+  it('converts requested generated formulas into validated workbook formula cells', () => {
+    const generated = {
+      title: 'Sales',
+      columns: [
+        { name: 'Units', kind: 'number' },
+        { name: 'Price', kind: 'currency' },
+        { name: 'Revenue', kind: 'currency' },
+      ],
+      rows: [[12, 8, null]],
+      formulas: [{ cell: 'C2', formula: '=A2*B2' }],
+    };
+
+    const workbook = parseGeneratedWorkspaceSpreadsheet(JSON.stringify(generated));
+
+    expect(workbook.sheets[0].rows[0].cells[2]).toEqual({ type: 'formula', formula: '=A2*B2', result: null });
+    expect(validateWorkspaceWorkbook(workbook)).toEqual(workbook);
+  });
+
+  it('rejects unsafe, duplicate, and out-of-range generated formula targets', () => {
+    const generated = {
+      title: 'Sales',
+      columns: [{ name: 'Value', kind: 'number' }],
+      rows: [[10]],
+      formulas: [{ cell: 'A2', formula: '=WEBSERVICE("https://example.invalid")' }],
+    };
+
+    expect(() => parseGeneratedWorkspaceSpreadsheet(JSON.stringify(generated))).toThrow(/required format/);
+    expect(() => parseGeneratedWorkspaceSpreadsheet(JSON.stringify({
+      ...generated,
+      formulas: [{ cell: 'A2', formula: '=1+1' }, { cell: 'A2', formula: '=2+2' }],
+    }))).toThrow(/required format/);
+    expect(() => parseGeneratedWorkspaceSpreadsheet(JSON.stringify({
+      ...generated,
+      formulas: [{ cell: 'A3', formula: '=1+1' }],
+    }))).toThrow(/required format/);
+  });
+
+  it('rebuilds incomplete category summaries from every unique data category', async () => {
+    const generated = {
+      title: 'Small Business Expenses',
+      columns: [
+        { name: 'Date', kind: 'date' },
+        { name: 'Description', kind: 'text' },
+        { name: 'Category', kind: 'text' },
+        { name: 'Amount', kind: 'currency' },
+        { name: 'Tax %', kind: 'percent' },
+        { name: 'Tax Amount', kind: 'currency' },
+        { name: 'Total Cost', kind: 'currency' },
+        { name: 'Running Total', kind: 'currency' },
+      ],
+      rows: [
+        ['2023-11-01', 'Office Supplies', 'Office', 120, 0.05, null, null, null],
+        ['2023-11-03', 'Internet Bill', 'Utilities', 80, 0, null, null, null],
+        ['2023-11-05', 'Client Lunch', 'Meals', 150, 0.08, null, null, null],
+        ['2023-11-10', 'Software Subscription', 'Software', 49, 0, null, null, null],
+        ['2023-11-12', 'Marketing Ads', 'Marketing', 300, 0, null, null, null],
+        ['2023-11-19', 'Consulting Fee', 'Professional Services', 500, 0.1, null, null, null],
+        ['Total', null, null, null, null, null, null, null],
+        ['Office Total', 'Category Summary', 'Office', null, null, null, null, null],
+        ['Utilities Total', 'Category Summary', 'Utilities', null, null, null, null, null],
+        ['Meals Total', 'Category Summary', 'Meals', null, null, null, null, null],
+      ],
+      formulas: [
+        { cell: 'F2', formula: '=D2*E2' }, { cell: 'G2', formula: '=D2+F2' },
+        { cell: 'F3', formula: '=D3*E3' }, { cell: 'G3', formula: '=D3+F3' },
+        { cell: 'F4', formula: '=D4*E4' }, { cell: 'G4', formula: '=D4+F4' },
+        { cell: 'F5', formula: '=D5*E5' }, { cell: 'G5', formula: '=D5+F5' },
+        { cell: 'F6', formula: '=D6*E6' }, { cell: 'G6', formula: '=D6+F6' },
+        { cell: 'F7', formula: '=D7*E7' }, { cell: 'G7', formula: '=D7+F7' },
+        { cell: 'D8', formula: '=SUM(D2:D7)' }, { cell: 'F8', formula: '=SUM(F2:F7)' }, { cell: 'G8', formula: '=SUM(G2:G7)' },
+        { cell: 'G9', formula: '=SUM(G2)' }, { cell: 'G10', formula: '=SUM(G3)' }, { cell: 'G11', formula: '=SUM(G4)' },
+      ],
+    };
+
+    const workbook = parseGeneratedWorkspaceSpreadsheet(
+      JSON.stringify(generated),
+      'Add a monthly total and a breakdown of total spending by category.',
+    );
+    const sheet = workbook.sheets[0];
+    const categorySummaryRows = sheet.rows.filter((row) => row.cells[1].type === 'value' && row.cells[1].value === 'Category Summary');
+    const categories = categorySummaryRows.map((row) => row.cells[2].type === 'value' ? row.cells[2].value : null);
+
+    expect(categories).toEqual(['Office', 'Utilities', 'Meals', 'Software', 'Marketing', 'Professional Services']);
+    expect(categorySummaryRows.map((row) => row.cells[6])).toEqual([
+      { type: 'formula', formula: '=SUM(G2)', result: null },
+      { type: 'formula', formula: '=SUM(G3)', result: null },
+      { type: 'formula', formula: '=SUM(G4)', result: null },
+      { type: 'formula', formula: '=SUM(G5)', result: null },
+      { type: 'formula', formula: '=SUM(G6)', result: null },
+      { type: 'formula', formula: '=SUM(G7)', result: null },
+    ]);
+    expect(validateWorkspaceWorkbook(workbook)).toEqual(workbook);
+
+    const buffer = await buildWorkspaceWorkbookXlsx(workbook);
+    const exported = new ExcelJS.Workbook();
+    await exported.xlsx.load(buffer);
+    expect(exported.getWorksheet('Small Business Expenses')?.getCell('C14').value).toBe('Professional Services');
+    expect(exported.getWorksheet('Small Business Expenses')?.getCell('G14').value).toMatchObject({ formula: 'SUM(G7)' });
+  });
+
   it('exports every workbook sheet with typed values and styled headers', async () => {
     const workbookData: WorkspaceWorkbook = {
       ...validWorkbook,

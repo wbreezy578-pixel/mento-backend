@@ -11,11 +11,13 @@ import {
 } from '../../../../../lib/aiSecurityGateway';
 import { readJsonBodyWithLimit, RequestBodyError } from '../../../../../lib/requestBody';
 import { buildCorsHeaders } from '../../../../../lib/securityHeaders';
+import logger from '../../../../../lib/logger';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../../lib/userSettings';
 import { parseGeneratedWorkspaceSpreadsheet, toLegacyWorkspaceSpreadsheet } from '../../../../../services/workspaceSpreadsheet';
 
 const CORS_METHODS = 'POST, OPTIONS';
 const MAX_BODY_BYTES = 16 * 1024;
+const WORKSPACE_GENERATION_OPTIONS = { responseMimeType: 'application/json', maxOutputTokens: 8192 } as const;
 
 export async function OPTIONS(req: Request) {
   return new NextResponse(null, {
@@ -61,18 +63,33 @@ export async function POST(req: Request) {
         const contents: GeminiMessage[] = [
           {
             role: 'system',
-            parts: [{ text: `${buildTutorLanguageInstruction(language)}\nCreate a useful spreadsheet for the user's request. Return only a JSON object with this exact shape: {"title":"...","columns":[{"name":"...","kind":"text|number|currency|percent|date"}],"rows":[[cell values]]}. Use 2 to 8 columns, 3 to 25 rows, and no formulas. Each row must have one value per column. Values must be strings, finite numbers, or null. Do not wrap the JSON in markdown.` }],
+            parts: [{ text: `${buildTutorLanguageInstruction(language)}\nCreate a useful spreadsheet for the user's request. Return only valid JSON with this shape: {"title":"...","columns":[{"name":"...","kind":"text|number|currency|percent|date"}],"rows":[[literal cell values]],"formulas":[{"cell":"C2","formula":"=A2*B2"}]}. Use 2 to 8 columns and 3 to 75 rows, with one value per column in every row. Values must be strings, finite numbers, or null. Put requested formulas only in the formulas array, use A1 cell references and the supported functions SUM, AVERAGE, MIN, and MAX, and leave formula cells null in rows. Include every formula the user requests, including totals or averages, and ensure each formula target is within the returned rows and columns. For percentages, use kind "number" when the formula multiplies by 100; use kind "percent" only for fractional 0-to-1 values. Return formulas as an empty array when none are requested. Do not wrap JSON in markdown or include explanatory text.` }],
           },
           { role: 'user', parts: [{ text: sanitizedInput ?? prompt }] },
         ];
-        const response = await askGemini(contents, billingDecision.modelUsed ?? undefined, reportUsage, reportProviderAttempt, req.signal);
-        return parseGeneratedWorkspaceSpreadsheet(response);
+        const model = billingDecision.modelUsed ?? undefined;
+        const response = await askGemini(contents, model, reportUsage, reportProviderAttempt, req.signal, WORKSPACE_GENERATION_OPTIONS);
+        try {
+          return parseGeneratedWorkspaceSpreadsheet(response, sanitizedInput ?? prompt);
+        } catch {
+          const repairedResponse = await askGemini([
+            ...contents,
+            { role: 'model', parts: [{ text: response }] },
+            { role: 'user', parts: [{ text: 'The previous response did not match the required JSON workbook format. Return a corrected complete JSON object only. Preserve the requested rows and formulas.' }] },
+          ], model, reportUsage, reportProviderAttempt, req.signal, WORKSPACE_GENERATION_OPTIONS);
+          return parseGeneratedWorkspaceSpreadsheet(repairedResponse, sanitizedInput ?? prompt);
+        }
       },
     });
 
     return NextResponse.json({ workbook: result, spreadsheet: toLegacyWorkspaceSpreadsheet(result) }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Cache-Control': 'no-store, private' } });
   } catch (error) {
     const gatewayError = error instanceof AIRequestGatewayError ? error : null;
+    logger.error('Workspace spreadsheet generation failed', {
+      errorName: error instanceof Error ? error.name : 'UnknownError',
+      errorMessage: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+      gatewayStatus: gatewayError?.status,
+    });
     const message = gatewayError && gatewayError.body && typeof gatewayError.body === 'object' && 'error' in gatewayError.body
       ? String((gatewayError.body as { error?: unknown }).error ?? 'Spreadsheet generation is unavailable.')
       : 'Spreadsheet generation is unavailable. Please try again shortly.';

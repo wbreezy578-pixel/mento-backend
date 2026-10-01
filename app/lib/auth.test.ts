@@ -155,6 +155,18 @@ test('browser session responses do not expose bearer tokens to page JavaScript',
   assert.deepEqual(native, { token: 'access-token', refreshToken: 'refresh-token', sessionExpiresAt: '2099-01-01T00:00:00.000Z', user: { id: 'user-a' } });
 });
 
+test('buildUserSummary exposes a normalized account creation timestamp', () => {
+  const createdAt = new Date('2026-10-01T12:30:00.000Z');
+  const user = auth.buildUserSummary({
+    id: 'user-a',
+    email: 'Person@Example.com',
+    createdAt,
+  });
+
+  assert.equal(user.email, 'person@example.com');
+  assert.equal(user.createdAt, '2026-10-01T12:30:00.000Z');
+});
+
 test('validatePasswordStrength enforces passphrase length and bcrypt byte safety', () => {
   assert.equal(auth.validatePasswordStrength('short-password').isValid, false);
   assert.equal(auth.validatePasswordStrength('a secure phrase!').isValid, true);

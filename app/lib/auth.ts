@@ -297,6 +297,7 @@ export function buildUserSummary(user: {
   name?: string | null;
   authProvider?: string | null;
   password?: string | null;
+  createdAt?: Date | string | null;
 }) {
   return {
     id: user.id,
@@ -304,6 +305,7 @@ export function buildUserSummary(user: {
     name: user.name ?? null,
     authProvider: user.authProvider ?? null,
     hasPassword: Boolean(user.password?.trim()),
+    createdAt: user.createdAt instanceof Date ? user.createdAt.toISOString() : user.createdAt ?? null,
   };
 }
 

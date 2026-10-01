@@ -13,6 +13,12 @@ function safeStringify(obj: unknown) {
 }
 
 function emit(level: 'info' | 'warn' | 'error', message: string, meta?: Record<string, unknown>) {
+  const configuredLevel = process.env.LOG_LEVEL?.trim().toLowerCase();
+  const minimumLevel = configuredLevel === 'info' || configuredLevel === 'warn' || configuredLevel === 'error'
+    ? configuredLevel
+    : process.env.NODE_ENV === 'production' ? 'warn' : 'info';
+  const weights = { info: 10, warn: 20, error: 30 } as const;
+  if (weights[level] < weights[minimumLevel]) return;
   const out = { ts: timestamp(), level, message, meta: meta ? sanitizeForLogging(meta) : undefined };
   if (level === 'warn') {
     console.warn(safeStringify(out));

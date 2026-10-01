@@ -73,14 +73,19 @@ export function validateImageBuffer(buffer: Buffer, mimeType?: string | null): I
 
   const detectedMimeType = detectImageMimeType(new Uint8Array(buffer));
   const normalizedMimeType = normalizeMimeType(mimeType) ?? detectedMimeType;
+  const canonicalDeclaredType = normalizedMimeType === 'image/heif' ? 'image/heic' : normalizedMimeType;
 
   if (!normalizedMimeType || !isAllowedImageMimeType(normalizedMimeType) || !detectedMimeType) {
     throw new Error('Unsupported or invalid image type');
+  }
+
+  if (canonicalDeclaredType !== detectedMimeType) {
+    throw new Error('Declared image type does not match its contents');
   }
 
   if (isExecutableMimeType(normalizedMimeType)) {
     throw new Error('Executable files are not allowed');
   }
 
-  return { mimeType: normalizedMimeType, buffer };
+  return { mimeType: detectedMimeType, buffer };
 }

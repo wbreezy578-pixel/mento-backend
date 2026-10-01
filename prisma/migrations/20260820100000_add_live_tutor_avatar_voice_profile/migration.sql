@@ -1,0 +1,1 @@
+ALTER TABLE "LiveTutorSession" ADD COLUMN "avatarVoiceProfile" TEXT;

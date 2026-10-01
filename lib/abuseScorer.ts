@@ -122,11 +122,17 @@ export function scoreAbuse(
     if (toxicityScore > 40) reasons.push('Toxic content detected');
   }
 
-  // 3. Injection risk
-  breakdown.injectionScore = Math.min(100, injectionResult.score);
-  totalScore += injectionResult.score * 0.25;
-  if (injectionResult.score > 50) {
-    reasons.push('Injection attempt detected');
+  // 3. Injection risk (now riskScore, not score)
+  breakdown.injectionScore = Math.min(100, injectionResult.riskScore || 0);
+  // Weight obfuscation risk separately (Unicode/control char attacks)
+  const obfuscationComponent = (injectionResult.obfuscationRisk || 0) * 0.3;
+  const injectionComponent = (injectionResult.riskScore || 0) * 0.2;
+  totalScore += obfuscationComponent + injectionComponent;
+
+  if (injectionResult.blockingRecommended && injectionResult.riskScore > 60) {
+    reasons.push('High-confidence injection attempt');
+  } else if (injectionResult.hasInjection && injectionResult.riskScore > 50) {
+    reasons.push('Potential injection signal detected');
   }
 
   // 4. Anomaly detection

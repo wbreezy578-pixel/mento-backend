@@ -1,9 +1,8 @@
 import { NextResponse } from 'next/server';
 import { getUserFromRequest } from '../../../lib/auth';
 import logger from '../../../../lib/logger';
-import { getWalletSummary } from '../../../../services/walletService';
-import { getUsage } from '../../../../services/usageService';
-import { canGenerateImage } from '../../../../services/billingService';
+import { getEntitlementSnapshot } from '../../../../services/entitlementService';
+import { getProductPolicy } from '../../../../services/productPolicy';
 
 export async function GET(req: Request) {
   try {
@@ -11,21 +10,30 @@ export async function GET(req: Request) {
     if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
 
     const userId = user.id;
-    const wallet = await getWalletSummary(userId);
-    const imageUsage = await getUsage(userId, 'image', 'day');
-    const billingDecision = await canGenerateImage(userId);
+    const snapshot = await getEntitlementSnapshot(userId);
+    const imageLimit = getProductPolicy(snapshot.plan).normalChat.imageQuestionsPerDay;
+    const todaysImageUsage = Math.max(imageLimit - snapshot.images.dailyRemaining, 0);
 
     return NextResponse.json({
-      currentPlan: wallet.planName,
-      todaysImageUsage: imageUsage.used,
-      fairUseEnabled: wallet.fairUseEnabled,
-      liveTutorBalance: wallet.liveTutorMinutesBalance,
-      subscriptionStatus: wallet.liveTutorEnabled ? 'enabled' : 'disabled',
-      upgradeAvailable: billingDecision.upgradeAvailable,
+      currentPlan: snapshot.plan,
+      entitlementStatus: snapshot.status,
+      entitlementPeriodEnd: snapshot.periodEnd,
+      todaysImageUsage,
+      fairUseEnabled: true,
+      liveTutorBalance: Math.floor(snapshot.liveTutor.availableSeconds / 60),
+      liveTutorSeconds: snapshot.liveTutor.availableSeconds,
+      subscriptionStatus: snapshot.liveTutor.allowed ? 'enabled' : 'disabled',
+      upgradeAvailable: snapshot.plan !== 'PRO',
+      messagesRemaining: Math.min(snapshot.normalChat.dailyRemaining, snapshot.normalChat.monthlyRemaining),
+      messagesRemainingDaily: snapshot.normalChat.dailyRemaining,
+      messagesRemainingMonthly: snapshot.normalChat.monthlyRemaining,
+      imagesRemaining: snapshot.images.dailyRemaining,
+      resetTime: snapshot.normalChat.dailyResetAt,
+      dailyResetTime: snapshot.normalChat.dailyResetAt,
+      monthlyResetTime: snapshot.normalChat.monthlyResetAt,
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Internal Server Error';
-    logger.error('Wallet summary failed', { error: err });
-    return NextResponse.json({ error: message }, { status: 500 });
+    logger.error('Wallet summary failed', { errorName: err instanceof Error ? err.name : 'UnknownError' });
+    return NextResponse.json({ error: 'Product access is temporarily unavailable.', code: 'entitlement_unavailable', retryable: true }, { status: 503 });
   }
 }

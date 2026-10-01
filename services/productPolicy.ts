@@ -67,7 +67,7 @@ export function getProductPolicy(plan: string | null | undefined): ProductPolicy
       model: 'gemini-3.5-flash-lite',
       allowedModels: ['gemini-3.5-flash-lite'],
       dailyCompletedMessages: configuredPositiveInteger('FREE_CHAT_DAILY_LIMIT', 10),
-      monthlyCompletedMessages: configuredPositiveInteger('FREE_CHAT_MONTHLY_LIMIT', 500),
+      monthlyCompletedMessages: configuredPositiveInteger('FREE_CHAT_MONTHLY_LIMIT', 300),
       imageQuestionsPerDay: configuredPositiveInteger('FREE_IMAGE_DAILY_LIMIT', 3),
       maxConcurrentGenerations: 1,
     },
@@ -83,22 +83,6 @@ export function getProductPolicy(plan: string | null | undefined): ProductPolicy
 export function getUtcDayWindow(now = new Date()): { start: Date; end: Date } {
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   return { start, end: new Date(start.getTime() + 24 * 60 * 60 * 1000) };
-}
-
-export function getFreeLearnFeedbackDailyLimit(): number {
-  return configuredPositiveInteger('FREE_LEARN_FEEDBACK_DAILY_LIMIT', 3);
-}
-
-export function evaluateLearnDailyAllowance(input: { dailyUsed: number; dailyLimit: number; requested?: number }) {
-  const requested = input.requested ?? 1;
-  if (![input.dailyUsed, input.dailyLimit, requested].every(Number.isSafeInteger)
-    || input.dailyUsed < 0 || input.dailyLimit <= 0 || requested <= 0) {
-    throw new Error('Learn allowance counters are invalid.');
-  }
-  return {
-    allowed: input.dailyUsed + requested <= input.dailyLimit,
-    dailyRemaining: Math.max(input.dailyLimit - input.dailyUsed - requested, 0),
-  };
 }
 
 export function getFreeMonthlyWindow(now = new Date()): { start: Date; end: Date } {

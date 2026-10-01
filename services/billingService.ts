@@ -10,7 +10,7 @@ import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/mon
 import logger from '../lib/logger';
 import '../lib/metrics';
 import { canStartLiveTutorSession } from './liveTutorBillingPolicy';
-import { evaluateCompletedAllowance, evaluateLearnDailyAllowance, getFreeLearnFeedbackDailyLimit, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolveAllowanceReset, resolvePolicyModel, type AllowanceLimitScope } from './productPolicy';
+import { evaluateCompletedAllowance, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolveAllowanceReset, resolvePolicyModel, type AllowanceLimitScope } from './productPolicy';
 import { allocateLiveTutorConsumption, getAvailableLiveTutorSeconds } from './entitlementService';
 import { calculateGeminiProviderCostUSD, GEMINI_PRICING_SOURCE, GEMINI_PRICING_VERSION, isSupportedNormalChatModel } from './geminiPricing';
 import {
@@ -1061,10 +1061,6 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         ? wallet.subscriptionExpiresAt
         : freeMonth.end;
       const monthlyLimit = validatedInput.feature === 'chat' ? policy.normalChat.monthlyCompletedMessages : null;
-      const learnDay = effectivePlan.name === 'FREE' && validatedInput.metadata?.source === 'learn'
-        ? getUtcDayWindow()
-        : null;
-      const learnDailyLimit = learnDay ? getFreeLearnFeedbackDailyLimit() : null;
       const usageWhere = {
         userId: validatedInput.userId,
         feature: toUsageFeature(validatedInput.feature),
@@ -1077,7 +1073,6 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const allowanceStartedAt = Date.now();
       let used: number;
       let monthlyUsed = 0;
-      let learnDailyUsed = 0;
       if (validatedInput.feature === 'chat' && monthlyLimit !== null) {
         const [usageCounts] = await tx.$queryRaw<Array<{ dailyUsed: bigint; monthlyUsed: bigint }>>`
           SELECT
@@ -1101,20 +1096,6 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           },
         });
       }
-      if (learnDay) {
-        learnDailyUsed = await tx.usageLog.count({
-          where: {
-            userId: validatedInput.userId,
-            feature: { in: ['chat', 'image'] },
-            createdAt: { gte: learnDay.start, lt: learnDay.end },
-            metadata: { path: ['source'], equals: 'learn' },
-            OR: [
-              { success: true },
-              { success: null, createdAt: { gte: pendingCutoff } },
-            ],
-          },
-        });
-      }
       reservationStageMs.allowance = Date.now() - allowanceStartedAt;
       logger.info('Billing reservation usage counted', {
         requestId: validatedInput.requestId ?? null,
@@ -1124,37 +1105,28 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const allowance = validatedInput.feature === 'chat' && typeof usageLimit === 'number' && monthlyLimit !== null
         ? evaluateCompletedAllowance({ dailyUsed: used, monthlyUsed, dailyLimit: usageLimit, monthlyLimit, requested: validatedInput.amount })
         : null;
-      const learnAllowance = learnDailyLimit !== null
-        ? evaluateLearnDailyAllowance({ dailyUsed: learnDailyUsed, dailyLimit: learnDailyLimit, requested: validatedInput.amount })
-        : null;
-      const learnLimitExceeded = learnAllowance?.allowed === false;
-      const baseDailyRemaining = allowance?.dailyRemaining ?? (typeof usageLimit === 'number'
+      const dailyRemaining = allowance?.dailyRemaining ?? (typeof usageLimit === 'number'
         ? Math.max(usageLimit - used - (pendingReservation ? 0 : validatedInput.amount), 0)
         : null);
-      const dailyRemaining = learnAllowance
-        ? Math.min(baseDailyRemaining ?? learnAllowance.dailyRemaining, learnAllowance.dailyRemaining)
-        : baseDailyRemaining;
       const monthlyRemaining = allowance?.monthlyRemaining ?? (monthlyLimit === null
         ? null
         : Math.max(monthlyLimit - monthlyUsed - (pendingReservation ? 0 : validatedInput.amount), 0));
       const remainingUsage = dailyRemaining === null ? monthlyRemaining
         : monthlyRemaining === null ? dailyRemaining
         : Math.min(dailyRemaining, monthlyRemaining);
-      const allowed = !learnLimitExceeded && (allowance?.allowed ?? ((typeof usageLimit !== 'number' || used + validatedInput.amount <= usageLimit)
-        && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit)));
+      const allowed = allowance?.allowed ?? ((typeof usageLimit !== 'number' || used + validatedInput.amount <= usageLimit)
+        && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit));
       const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
-      const reason = learnLimitExceeded
-        ? 'Daily Learn feedback limit reached.'
-        : pendingReservation
+      const reason = pendingReservation
         ? 'Usage reservation pending.'
         : effectiveAllowed
           ? 'Usage available.'
           : validatedInput.success === false
             ? 'Usage rollback requested.'
             : 'Plan usage limit reached.';
-      const dailyExceeded = learnLimitExceeded || (typeof usageLimit === 'number'
+      const dailyExceeded = typeof usageLimit === 'number'
         ? used + validatedInput.amount > usageLimit
-        : false);
+        : false;
       const periodExceeded = monthlyLimit !== null
         ? monthlyUsed + validatedInput.amount > monthlyLimit
         : false;
@@ -1162,14 +1134,14 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
         ? resolveAllowanceReset({
             dailyExceeded,
             periodExceeded,
-            dailyResetAt: learnDay?.end ?? usageWindow.resetAt,
+            dailyResetAt: usageWindow.resetAt,
             periodResetAt: monthlyLimit !== null ? monthlyEnd : null,
             periodScope: effectivePlan.name === 'PRO' ? 'subscription_period' : 'monthly',
           })
         : { resetAt: usageWindow.resetAt, scope: null };
       const allowanceTiming = {
         resetAt: allowanceReset.resetAt,
-        dailyResetAt: learnDay?.end ?? usageWindow.resetAt,
+        dailyResetAt: usageWindow.resetAt,
         monthlyResetAt: monthlyLimit !== null ? monthlyEnd : null,
         limitScope: allowanceReset.scope,
       };

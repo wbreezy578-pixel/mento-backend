@@ -15,7 +15,7 @@ export interface BillingDecision {
 }
 
 export type UsageScope = 'day' | 'month' | 'rolling';
-export type UsageFeature = 'chat' | 'image' | 'live_tutor' | 'spreadsheet';
+export type UsageFeature = 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website';
 
 export interface UsageSnapshot {
   feature: UsageFeature;
@@ -100,7 +100,7 @@ export async function getUsage(userId: string, feature: UsageFeature, scope: Usa
   const resetAt = getResetTime(scope);
   const used = await getUsageCount(userId, feature, scope, windowStart);
 
-  const limit = feature === 'chat' || feature === 'image' || feature === 'spreadsheet' ? getEffectiveLimit(plan, feature) : null;
+  const limit = feature === 'chat' || feature === 'image' || feature === 'spreadsheet' || feature === 'website' ? getEffectiveLimit(plan, feature) : null;
   const remaining = typeof limit === 'number' ? Math.max(limit - used, 0) : null;
 
   return {

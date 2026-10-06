@@ -9,7 +9,7 @@ import { trackShutdownOperation } from '../lib/crashRecovery';
 import '../lib/metrics';
 
 export type PaymentProvider = 'MPESA' | 'GOOGLE_PLAY' | 'APPLE_APP_STORE';
-export type PaymentType = 'SUBSCRIPTION' | 'TOP_UP';
+export type PaymentType = 'SUBSCRIPTION' | 'TOP_UP' | 'WEBSITE_HOSTING';
 export type PaymentStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'REQUIRES_ACTION' | 'REFUNDED';
 
 export interface StartPaymentInput {
@@ -129,6 +129,16 @@ function normalizeStatus(value: string): PaymentStatus {
 function createReceiptNumber(transactionId: string): string {
   const suffix = transactionId.slice(-8).toUpperCase();
   return `RCPT-${suffix}`;
+}
+
+function addUtcMonth(start: Date): Date {
+  const end = new Date(start);
+  const day = end.getUTCDate();
+  end.setUTCDate(1);
+  end.setUTCMonth(end.getUTCMonth() + 1);
+  const daysInMonth = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() + 1, 0)).getUTCDate();
+  end.setUTCDate(Math.min(day, daysInMonth));
+  return end;
 }
 
 function createDocumentHash(payload: Record<string, unknown>): string {
@@ -348,8 +358,56 @@ async function finalizePaymentInternal(input: {
       if (!current.userId) {
         throw new Error('Payment transaction is missing an associated user.');
       }
+      const paymentUserId = current.userId;
 
-      await ensureUserBillingSetup(current.userId);
+      if (current.type === 'WEBSITE_HOSTING') {
+        const metadata = asJsonObject(current.metadata);
+        const websiteId = typeof metadata.websiteId === 'string' ? metadata.websiteId : '';
+        if (current.currency !== 'USD' || current.amountMinor !== 500 || !websiteId) {
+          throw new Error('Verified website hosting payment must be $5 USD and include a website ID.');
+        }
+        const website = await tx.website.findFirst({
+          where: { id: websiteId, userId: paymentUserId, deletedAt: null },
+          select: { id: true },
+        });
+        if (!website) throw new Error('Website hosting payment does not belong to an active website owned by the payer.');
+
+        const parsedPeriodStart = typeof metadata.billingPeriodStart === 'string' ? new Date(metadata.billingPeriodStart) : null;
+        const parsedPeriodEnd = typeof metadata.billingPeriodEnd === 'string' ? new Date(metadata.billingPeriodEnd) : null;
+        const periodStart = parsedPeriodStart && !Number.isNaN(parsedPeriodStart.getTime()) ? parsedPeriodStart : new Date();
+        const periodEnd = parsedPeriodEnd && !Number.isNaN(parsedPeriodEnd.getTime())
+          ? parsedPeriodEnd
+          : addUtcMonth(periodStart);
+        current = await tx.paymentTransaction.update({
+          where: { id: current.id },
+          data: {
+            metadata: {
+              ...metadata,
+              chargeType: 'website_hosting',
+              billingPeriodStart: periodStart.toISOString(),
+              billingPeriodEnd: periodEnd.toISOString(),
+            } as Prisma.InputJsonValue,
+          },
+        });
+        await tx.websiteHostingSubscription.upsert({
+          where: { websiteId },
+          create: {
+            websiteId,
+            providerSubscriptionId: current.providerSubscriptionId,
+            status: 'active',
+            currentPeriodStart: periodStart,
+            currentPeriodEnd: periodEnd,
+          },
+          update: {
+            ...(current.providerSubscriptionId ? { providerSubscriptionId: current.providerSubscriptionId } : {}),
+            status: 'active',
+            currentPeriodStart: periodStart,
+            currentPeriodEnd: periodEnd,
+          },
+        });
+      }
+
+      await ensureUserBillingSetup(paymentUserId);
       await ensureDefaultPlans();
 
       // Subscription entitlement state (plan, status, periods and included
@@ -367,14 +425,14 @@ async function finalizePaymentInternal(input: {
         }
 
         if (topUpMinutes > 0) {
-          const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: current.userId } });
+          const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: paymentUserId } });
           if (wallet) {
             const updated = await tx.liveTutorWallet.update({
-              where: { userId: current.userId },
+              where: { userId: paymentUserId },
               data: { minutesBalance: { increment: topUpMinutes }, topUpSeconds: { increment: topUpMinutes * 60 } },
             });
             await tx.liveTutorMinuteLedger.create({ data: {
-              userId: current.userId, walletId: updated.id, idempotencyKey: `topup:${current.provider}:${current.id}`,
+              userId: paymentUserId, walletId: updated.id, idempotencyKey: `topup:${current.provider}:${current.id}`,
               entryType: 'TOP_UP_CREDIT', source: current.provider, topUpSecondsDelta: topUpMinutes * 60,
               includedSecondsAfter: updated.includedSeconds, topUpSecondsAfter: updated.topUpSeconds,
               expiresAt: null,
@@ -389,16 +447,16 @@ async function finalizePaymentInternal(input: {
       }
 
       const previousEntry = await tx.paymentLedgerEntry.findFirst({
-        where: { userId: current.userId },
+        where: { userId: paymentUserId },
         orderBy: { createdAt: 'desc' },
       });
       const balanceAfter = (previousEntry?.balanceAfter ?? 0) + current.amountUsd;
 
       await tx.paymentLedgerEntry.create({
         data: {
-          userId: current.userId,
+          userId: paymentUserId,
           transactionId: current.id,
-          entryType: current.type === 'TOP_UP' ? 'TOP_UP' : 'SUBSCRIPTION_PAYMENT',
+          entryType: current.type === 'TOP_UP' ? 'TOP_UP' : current.type === 'WEBSITE_HOSTING' ? 'WEBSITE_HOSTING' : 'SUBSCRIPTION_PAYMENT',
           amountUsd: current.amountUsd,
           amountMinor: current.amountMinor,
           currency: current.currency,
@@ -407,7 +465,9 @@ async function finalizePaymentInternal(input: {
           referenceId: current.id,
           description: current.type === 'TOP_UP'
             ? `Tutor time top-up applied via ${PROVIDER_DISPLAY_NAMES[provider]}`
-            : `Pro subscription payment received via ${PROVIDER_DISPLAY_NAMES[provider]}`,
+            : current.type === 'WEBSITE_HOSTING'
+              ? `Website hosting payment received via ${PROVIDER_DISPLAY_NAMES[provider]}`
+              : `Pro subscription payment received via ${PROVIDER_DISPLAY_NAMES[provider]}`,
           metadata: {
             provider: current.provider,
             providerTransactionId: current.providerTransactionId,
@@ -421,7 +481,7 @@ async function finalizePaymentInternal(input: {
         where: { transactionId: current.id },
         create: {
           transactionId: current.id,
-          userId: current.userId,
+          userId: paymentUserId,
           receiptNumber,
           status: 'ISSUED',
           receiptUrl: null,

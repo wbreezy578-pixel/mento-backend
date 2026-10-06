@@ -64,12 +64,12 @@ export function getGeminiDailyBudgetWindow(now = new Date()) {
 
 export function isNormalChatGeminiBudgetSubject(input: {
   provider: string;
-  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet';
+  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website';
   pending: boolean;
 }) {
   return input.provider === 'Gemini'
     && input.pending
-    && (input.feature === 'chat' || input.feature === 'image' || input.feature === 'spreadsheet');
+    && (input.feature === 'chat' || input.feature === 'image' || input.feature === 'spreadsheet' || input.feature === 'website');
 }
 
 type BudgetTransaction = Pick<Prisma.TransactionClient, '$queryRaw' | 'usageLog'>;

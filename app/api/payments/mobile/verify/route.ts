@@ -25,7 +25,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ success: true, purchase: result }, { headers: responseHeaders(req.headers.get('origin')) });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Purchase verification failed.';
-    const status = /invalid|different|not active|not completed|ownership|already associated/i.test(message) ? 400 : 502;
+    const status = /already has an active Google Play hosting subscription/i.test(message)
+      ? 409
+      : /invalid|different|not active|not completed|ownership|already associated/i.test(message) ? 400 : 502;
     return NextResponse.json({ error: status === 502 ? 'Store verification is temporarily unavailable. Please try again.' : message }, { status, headers: responseHeaders(req.headers.get('origin')) });
   }
 }

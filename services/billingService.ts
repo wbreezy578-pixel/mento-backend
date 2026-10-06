@@ -23,6 +23,7 @@ import {
 } from './geminiDailyBudget';
 import { createKeyedTransactionQueue } from './billingTransactionQueue';
 import { resolveUsageLogSuccess } from './billingLedgerStatus';
+import { WEBSITE_EDIT_LIMIT_PER_PERIOD, WEBSITE_PROJECT_LIMIT } from './websiteBillingService';
 
 // LiveTutorWallet.minutesBalance is stored in minutes; live_tutor amounts are always passed in seconds.
 const SECONDS_PER_MINUTE = 60;
@@ -66,7 +67,7 @@ export interface BillingSummary {
 
 export interface BillingReservationInput {
   userId: string;
-  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet';
+  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website';
   amount?: number;
   provider?: string;
   modelUsed?: string | null;
@@ -99,7 +100,7 @@ function validateBillingReservationInput(input: BillingReservationInput) {
   }
 
   const feature = input.feature;
-  if (feature !== 'chat' && feature !== 'image' && feature !== 'live_tutor' && feature !== 'spreadsheet') {
+  if (feature !== 'chat' && feature !== 'image' && feature !== 'live_tutor' && feature !== 'spreadsheet' && feature !== 'website') {
     throw new Error('Unsupported billing feature');
   }
 
@@ -188,18 +189,18 @@ function getWindowStart(scope: UsageScope): Date {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate());
 }
 
-function toUsageFeature(feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet'): string {
+function toUsageFeature(feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website'): string {
   return feature === 'live_tutor' ? 'live_tutor' : feature;
 }
 
-function getDefaultProvider(feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet'): string {
+function getDefaultProvider(feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website'): string {
   if (feature === 'image') return 'ImageGen';
   if (feature === 'live_tutor') return 'Simli';
   return 'Gemini';
 }
 
 function buildUsageSnapshot(
-  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet',
+  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website',
   scope: UsageScope,
   used: number,
   limit: number | null,
@@ -258,12 +259,12 @@ function toNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function resolvePlanModel(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet', requestedModel?: string | null): string {
+function resolvePlanModel(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website', requestedModel?: string | null): string {
   void feature;
   return resolvePolicyModel(plan.name, requestedModel);
 }
 
-function getUsageWindow(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet', modelUsed?: string | null, scope: UsageScope = 'day') {
+function getUsageWindow(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website', modelUsed?: string | null, scope: UsageScope = 'day') {
   const now = new Date();
   const policy = getProductPolicy(plan.name);
 
@@ -282,6 +283,15 @@ function getUsageWindow(plan: PlanRecord, feature: 'chat' | 'image' | 'live_tuto
       windowStart: day.start,
       resetAt: day.end,
       usageLimit: policy.spreadsheetGenerationsPerDay,
+    };
+  }
+
+  if (feature === 'website') {
+    const day = getUtcDayWindow(now);
+    return {
+      windowStart: day.start,
+      resetAt: day.end,
+      usageLimit: policy.websiteAiOperationsPerDay,
     };
   }
 
@@ -913,7 +923,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
 
         const usageLimit = validatedInput.feature === 'live_tutor'
           ? null
-          : getEffectiveLimit(effectivePlan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+          : getEffectiveLimit(effectivePlan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
         const remainingUsage = typeof usageLimit === 'number'
           ? Math.max(usageLimit - used - validatedInput.amount, 0)
           : null;
@@ -952,7 +962,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       resolvedModel = resolvePlanModel(effectivePlan, validatedInput.feature, validatedInput.modelUsed);
       const usageLimit = validatedInput.feature === 'live_tutor'
         ? null
-        : getEffectiveLimit(effectivePlan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+        : getEffectiveLimit(effectivePlan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
 
       if (validatedInput.feature === 'live_tutor') {
         await lockLiveTutorWalletRow(tx, validatedInput.userId);
@@ -1060,6 +1070,52 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const monthlyEnd = effectivePlan.name === 'PRO' && wallet.subscriptionExpiresAt
         ? wallet.subscriptionExpiresAt
         : freeMonth.end;
+      const websiteOperationType = typeof validatedInput.metadata.operationType === 'string'
+        ? validatedInput.metadata.operationType
+        : null;
+      const websiteGeneration = validatedInput.feature === 'website' && websiteOperationType === 'website.generate';
+      const websiteAiEdit = validatedInput.feature === 'website' && websiteOperationType === 'website.ai_edit';
+      let websiteProjectLimitExceeded = false;
+      let websiteEditLimitExceeded = false;
+      const websiteProRequired = validatedInput.feature === 'website' && effectivePlan.name !== 'PRO';
+
+      if ((websiteGeneration || websiteAiEdit) && !websiteProRequired) {
+        const periodWindow = { gte: monthlyStart, lt: monthlyEnd };
+        if (websiteGeneration) {
+          const [createdProjects, pendingCreations] = await Promise.all([
+            tx.website.count({
+              where: { userId: validatedInput.userId, deletedAt: null, createdAt: periodWindow },
+            }),
+            tx.usageLog.count({
+              where: {
+                userId: validatedInput.userId,
+                feature: 'website',
+                metadata: { path: ['operationType'], equals: 'website.generate' },
+                success: null,
+                createdAt: { gte: new Date(Math.max(monthlyStart.getTime(), Date.now() - 5 * 60 * 1000)), lt: monthlyEnd },
+              },
+            }),
+          ]);
+          websiteProjectLimitExceeded = createdProjects + pendingCreations + validatedInput.amount > WEBSITE_PROJECT_LIMIT;
+        }
+
+        if (websiteAiEdit) {
+          const editsInPeriod = await tx.usageLog.count({
+            where: {
+              userId: validatedInput.userId,
+              feature: 'website',
+              metadata: { path: ['operationType'], equals: 'website.ai_edit' },
+              createdAt: periodWindow,
+              OR: [
+                { success: true },
+                { success: null, createdAt: { gte: pendingCutoff } },
+              ],
+            },
+          });
+          websiteEditLimitExceeded = editsInPeriod + validatedInput.amount > WEBSITE_EDIT_LIMIT_PER_PERIOD;
+        }
+      }
+
       const monthlyLimit = validatedInput.feature === 'chat' ? policy.normalChat.monthlyCompletedMessages : null;
       const usageWhere = {
         userId: validatedInput.userId,
@@ -1114,8 +1170,11 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const remainingUsage = dailyRemaining === null ? monthlyRemaining
         : monthlyRemaining === null ? dailyRemaining
         : Math.min(dailyRemaining, monthlyRemaining);
-      const allowed = allowance?.allowed ?? ((typeof usageLimit !== 'number' || used + validatedInput.amount <= usageLimit)
-        && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit));
+      const allowed = !websiteProRequired
+        && !websiteProjectLimitExceeded
+        && !websiteEditLimitExceeded
+        && (allowance?.allowed ?? ((typeof usageLimit !== 'number' || used + validatedInput.amount <= usageLimit)
+          && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit)));
       const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
       const reason = pendingReservation
         ? 'Usage reservation pending.'
@@ -1123,7 +1182,13 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
           ? 'Usage available.'
           : validatedInput.success === false
             ? 'Usage rollback requested.'
-            : 'Plan usage limit reached.';
+            : websiteProRequired
+              ? 'Website creation and editing require an active Mento Pro subscription.'
+              : websiteProjectLimitExceeded
+                ? 'Pro website project limit reached for this billing period.'
+                : websiteEditLimitExceeded
+                  ? 'Pro website AI edit limit reached for this billing period.'
+                  : 'Plan usage limit reached.';
       const dailyExceeded = typeof usageLimit === 'number'
         ? used + validatedInput.amount > usageLimit
         : false;
@@ -1363,7 +1428,7 @@ export async function canUseLiveTutor(userId: string, amount = 1): Promise<Billi
   return getBillingDecision({ userId, feature: 'live_tutor', amount });
 }
 
-export async function canUseFeature(userId: string, feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet', amount = 1): Promise<BillingDecision> {
+export async function canUseFeature(userId: string, feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website', amount = 1): Promise<BillingDecision> {
   return getBillingDecision({ userId, feature, amount });
 }
 
@@ -1464,7 +1529,7 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
             createdAt: { gte: usageWindow.windowStart },
           },
         });
-        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
         const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, used, usageLimit, usageWindow.resetAt);
         return buildDecision(
           false,
@@ -1494,7 +1559,7 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
             createdAt: { gte: windowStart },
           },
         });
-        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
         const remainingUsage = typeof usageLimit === 'number'
           ? Math.max(usageLimit - used - validatedInput.amount, 0)
           : null;
@@ -1599,7 +1664,7 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
           createdAt: { gte: windowStart },
         },
       });
-      const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+      const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
       const remainingUsage = typeof usageLimit === 'number'
         ? Math.max(usageLimit - used - validatedInput.amount, 0)
         : null;
@@ -1719,7 +1784,7 @@ async function reconcileNonCompletedUsage(
         createdAt: { gte: usageWindow.windowStart },
       },
     });
-    const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+    const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
     const usage = buildUsageSnapshot(validatedInput.feature, validatedInput.scope, used, usageLimit, usageWindow.resetAt);
     return buildDecision(
       existing.success === true,
@@ -1785,7 +1850,7 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
             createdAt: { gte: windowStart },
           },
         });
-        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
         const remainingUsage = typeof usageLimit === 'number'
           ? Math.max(usageLimit - used - validatedInput.amount, 0)
           : null;
@@ -1819,7 +1884,7 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
             createdAt: { gte: windowStart },
           },
         });
-        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+        const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
         const remainingUsage = typeof usageLimit === 'number'
           ? Math.max(usageLimit - used - validatedInput.amount, 0)
           : null;
@@ -1896,7 +1961,7 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
           createdAt: { gte: windowStart },
         },
       });
-      const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : 'chat', { modelUsed: resolvedModel });
+      const usageLimit = getEffectiveLimit(plan, validatedInput.feature === 'image' ? 'image' : validatedInput.feature === 'spreadsheet' ? 'spreadsheet' : validatedInput.feature === 'website' ? 'website' : 'chat', { modelUsed: resolvedModel });
       const remainingUsage = typeof usageLimit === 'number'
         ? Math.max(usageLimit - used - validatedInput.amount, 0)
         : null;

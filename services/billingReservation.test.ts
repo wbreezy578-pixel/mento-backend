@@ -82,6 +82,23 @@ describe('Normal Chat billing reservation path', () => {
     expect(reservationWrite).toBeGreaterThan(budgetCheck);
   });
 
+  it('enforces website Pro, project, and successful AI-edit quotas inside the reservation transaction', () => {
+    const body = reserveUsageBody();
+    const idempotencyRead = body.indexOf('const existing = validatedInput.requestId');
+    const projectQuota = body.indexOf('websiteProjectLimitExceeded = createdProjects + pendingCreations');
+    const editQuota = body.indexOf('websiteEditLimitExceeded = editsInPeriod + validatedInput.amount');
+    const reservationWrite = body.lastIndexOf('const successRecord = await createUsageLedgerEntry(');
+
+    expect(body).toContain("validatedInput.feature === 'website' && effectivePlan.name !== 'PRO'");
+    expect(body).toContain("metadata: { path: ['operationType'], equals: 'website.ai_edit' }");
+    expect(body).toContain('{ success: true },');
+    expect(body).toContain('{ success: null, createdAt: { gte: pendingCutoff } }');
+    expect(projectQuota).toBeGreaterThan(idempotencyRead);
+    expect(editQuota).toBeGreaterThan(idempotencyRead);
+    expect(reservationWrite).toBeGreaterThan(projectQuota);
+    expect(reservationWrite).toBeGreaterThan(editQuota);
+  });
+
   it('records an allowed chat request as pending until the provider finishes', () => {
     const body = reserveUsageBody();
     const chatReservation = body.slice(body.indexOf('const pendingCutoff ='));

@@ -237,7 +237,9 @@ export function loadAndValidateEnvironment(): void {
 
   if (isProduction) {
     const redisUrl = resolveEnvValue('REDIS_URL') ?? resolveEnvValue('REDIS_HOST');
-    validateNonEmpty('REDIS_URL', redisUrl);
+    if (process.env.REQUIRE_REALTIME_REDIS !== 'false') {
+      validateNonEmpty('REDIS_URL', redisUrl);
+    }
 
     const trustedProxyProvider = resolveEnvValue('TRUSTED_PROXY_PROVIDER');
     const validTrustedProxyProviders = new Set(['cloud-run', 'vercel', 'none']);

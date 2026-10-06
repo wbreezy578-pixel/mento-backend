@@ -1,34 +1,86 @@
 import { createHash } from 'node:crypto';
 import { GoogleAuth } from 'google-auth-library';
 import { Environment, SignedDataVerifier } from '@apple/app-store-server-library';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { getRequiredEnv } from '../lib/env';
 import { finalizePayment, startPayment } from './paymentService';
 import { applyVerifiedEntitlementEvent, type CanonicalEntitlementStatus } from './entitlementService';
 import { isIdempotentProviderCancellationError } from './accountDeletionPolicy';
+import { WEBSITE_PAYMENT_GRACE_DAYS } from './websiteBillingService';
 
-export type NativeStoreProductId = 'mento_pro_monthly' | 'mento_live_tutor_50' | 'mento_live_tutor_100';
+const PRODUCTION_PACKAGE_NAME = 'com.trymentoapp.mento';
+const BLUE_TEST_PACKAGE_NAME = 'com.trymentoapp.mento.blue';
+const PRODUCTION_HOSTING_PRODUCT_ID = 'mento_hosting_slot';
+const BLUE_TEST_HOSTING_PRODUCT_ID = 'mento_blue_hosting_slot';
+const WEBSITE_HOSTING_BASE_PLANS = {
+  'sites-1': { tier: 'SITES_1', siteLimit: 1 },
+  'sites-3': { tier: 'SITES_3', siteLimit: 3 },
+  'sites-5': { tier: 'SITES_5', siteLimit: 5 },
+} as const;
+function getWebsiteHostingBasePlan(basePlanId?: string) {
+  switch (basePlanId) {
+    case 'sites-1': return WEBSITE_HOSTING_BASE_PLANS['sites-1'];
+    case 'sites-3': return WEBSITE_HOSTING_BASE_PLANS['sites-3'];
+    case 'sites-5': return WEBSITE_HOSTING_BASE_PLANS['sites-5'];
+    default: return undefined;
+  }
+}
 
-const PACKAGE_NAME = 'com.trymentoapp.mento';
-const PRODUCT_CATALOG: Record<NativeStoreProductId, {
-  type: 'SUBSCRIPTION' | 'TOP_UP';
-  amountUsd: number;
-  minutes?: number;
-}> = {
+type NativeStoreProduct =
+  | { type: 'SUBSCRIPTION' | 'TOP_UP'; amountUsd: number; minutes?: number }
+  | { type: 'HOSTING_SUBSCRIPTION' };
+
+const PRODUCTION_PRODUCT_CATALOG = {
   mento_pro_monthly: { type: 'SUBSCRIPTION', amountUsd: 29 },
   mento_live_tutor_50: { type: 'TOP_UP', amountUsd: 10, minutes: 50 },
   mento_live_tutor_100: { type: 'TOP_UP', amountUsd: 20, minutes: 100 },
+  [PRODUCTION_HOSTING_PRODUCT_ID]: { type: 'HOSTING_SUBSCRIPTION' },
+} satisfies Record<string, NativeStoreProduct>;
+
+const BLUE_TEST_PRODUCT_CATALOG = {
+  mento_blue_pro_monthly: { type: 'SUBSCRIPTION', amountUsd: 29 },
+  mento_blue_live_tutor_50: { type: 'TOP_UP', amountUsd: 10, minutes: 50 },
+  mento_blue_live_tutor_100: { type: 'TOP_UP', amountUsd: 20, minutes: 100 },
+  [BLUE_TEST_HOSTING_PRODUCT_ID]: { type: 'HOSTING_SUBSCRIPTION' },
+} satisfies Record<string, NativeStoreProduct>;
+
+export type NativeStoreProductId =
+  | keyof typeof PRODUCTION_PRODUCT_CATALOG
+  | keyof typeof BLUE_TEST_PRODUCT_CATALOG;
+type ProductionNativeStoreProductId = keyof typeof PRODUCTION_PRODUCT_CATALOG;
+type NativeStoreProductCatalog = Partial<Record<NativeStoreProductId, NativeStoreProduct>>;
+type GooglePlayBillingConfig = {
+  packageName: string;
+  productCatalog: NativeStoreProductCatalog;
+  hostingProductId: NativeStoreProductId;
+  environment: 'PRODUCTION' | 'TEST';
+};
+
+const GOOGLE_PLAY_PRODUCTION_CONFIG: GooglePlayBillingConfig = {
+  packageName: PRODUCTION_PACKAGE_NAME,
+  productCatalog: PRODUCTION_PRODUCT_CATALOG,
+  hostingProductId: PRODUCTION_HOSTING_PRODUCT_ID,
+  environment: 'PRODUCTION',
+};
+
+const GOOGLE_PLAY_BLUE_TEST_CONFIG: GooglePlayBillingConfig = {
+  packageName: BLUE_TEST_PACKAGE_NAME,
+  productCatalog: BLUE_TEST_PRODUCT_CATALOG,
+  hostingProductId: BLUE_TEST_HOSTING_PRODUCT_ID,
+  environment: 'TEST',
 };
 
 type GoogleSubscriptionPurchase = {
   acknowledgementState?: string;
   subscriptionState?: string;
   startTime?: string;
+  linkedPurchaseToken?: string;
   lineItems?: Array<{
     productId?: string;
     expiryTime?: string;
     latestSuccessfulOrderId?: string;
+    offerDetails?: { basePlanId?: string };
     autoRenewingPlan?: { autoRenewEnabled?: boolean };
   }>;
 };
@@ -54,7 +106,24 @@ class GooglePlayPublisherError extends Error {
 }
 
 function isNativeStoreProductId(value: string): value is NativeStoreProductId {
-  return Object.prototype.hasOwnProperty.call(PRODUCT_CATALOG, value);
+  return Object.prototype.hasOwnProperty.call(PRODUCTION_PRODUCT_CATALOG, value)
+    || Object.prototype.hasOwnProperty.call(BLUE_TEST_PRODUCT_CATALOG, value);
+}
+
+function isProductionNativeStoreProductId(value: string): value is ProductionNativeStoreProductId {
+  return Object.prototype.hasOwnProperty.call(PRODUCTION_PRODUCT_CATALOG, value);
+}
+
+function isBlueTestDatabaseUrl(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'postgresql:'
+      && url.pathname === '/mento_blue'
+      && url.searchParams.get('host') === '/cloudsql/mento-cloud-migration:us-east4:mento-blue-db';
+  } catch {
+    return false;
+  }
 }
 
 function readOptionalEnv(name: string): string | undefined {
@@ -64,6 +133,39 @@ function readOptionalEnv(name: string): string | undefined {
     if (error instanceof Error && error.message.includes(`Environment variable "${name}" is required`)) return undefined;
     throw error;
   }
+}
+
+function getGooglePlayBillingConfig(): GooglePlayBillingConfig {
+  const serviceName = readOptionalEnv('K_SERVICE');
+  const configuredMode = readOptionalEnv('GOOGLE_PLAY_BILLING_MODE');
+  const isBlueService = serviceName === 'mento-backend-blue';
+
+  if (isBlueService && configuredMode !== 'blue-test') {
+    throw new Error('Google Play billing is disabled on Blue until its isolated test configuration is enabled.');
+  }
+  if (configuredMode === 'blue-test') {
+    if (serviceName && !isBlueService) {
+      throw new Error('Blue test billing cannot be enabled on the production service.');
+    }
+    if (readOptionalEnv('GOOGLE_PLAY_PACKAGE_NAME') !== BLUE_TEST_PACKAGE_NAME) {
+      throw new Error('Blue Google Play billing requires the dedicated Blue test package.');
+    }
+    if (
+      !isBlueTestDatabaseUrl(readOptionalEnv('DATABASE_URL'))
+      || !isBlueTestDatabaseUrl(readOptionalEnv('DIRECT_URL'))
+    ) {
+      throw new Error('Blue test billing requires both database URLs to use the isolated Blue database.');
+    }
+    return GOOGLE_PLAY_BLUE_TEST_CONFIG;
+  }
+  if (configuredMode && configuredMode !== 'production') {
+    throw new Error('Google Play billing mode is invalid.');
+  }
+  const configuredPackageName = readOptionalEnv('GOOGLE_PLAY_PACKAGE_NAME');
+  if (configuredPackageName && configuredPackageName !== PRODUCTION_PACKAGE_NAME) {
+    throw new Error('Production Google Play billing cannot use a non-production package.');
+  }
+  return GOOGLE_PLAY_PRODUCTION_CONFIG;
 }
 
 function parseGooglePlayCredentials(): Record<string, unknown> {
@@ -168,6 +270,134 @@ async function assertTokenOwnership(userId: string, purchaseToken: string): Prom
   }
 }
 
+async function verifyGooglePlayHostingPurchase(
+  userId: string,
+  purchaseToken: string,
+  config: GooglePlayBillingConfig,
+): Promise<{ active: boolean; productId: NativeStoreProductId; status: string; transactionId: string }> {
+  const productId = config.hostingProductId;
+  const encodedPackage = encodeURIComponent(config.packageName);
+  const encodedToken = encodeURIComponent(purchaseToken);
+  const verified = await googlePublisherRequest<GoogleSubscriptionPurchase>(
+    `/applications/${encodedPackage}/purchases/subscriptionsv2/tokens/${encodedToken}`,
+  );
+  const lineItems = verified.lineItems?.filter((item) => item.productId === productId) ?? [];
+  if (lineItems.length !== 1) throw new Error('Google Play returned a different or ambiguous hosting subscription product.');
+  const lineItem = lineItems[0];
+  const basePlan = getWebsiteHostingBasePlan(lineItem.offerDetails?.basePlanId);
+  if (!basePlan) throw new Error('Google Play returned an unsupported website hosting tier.');
+  const expiresAt = parseDate(lineItem.expiryTime);
+  const periodStart = parseDate(verified.startTime);
+  if (!expiresAt || !periodStart) throw new Error('Google Play returned an incomplete hosting subscription period.');
+  const status = getGoogleSubscriptionStatus(verified.subscriptionState);
+  const transactionId = getGoogleSubscriptionTransactionId(
+    purchaseToken,
+    verified.startTime,
+    lineItem.expiryTime,
+    lineItem.latestSuccessfulOrderId,
+  );
+  const active = ['ACTIVE', 'GRACE_PERIOD', 'CANCELLED'].includes(status)
+    && expiresAt.getTime() > Date.now();
+  const graceDeadlineAt = status === 'ON_HOLD'
+    ? new Date(expiresAt.getTime() + WEBSITE_PAYMENT_GRACE_DAYS * 24 * 60 * 60 * 1000)
+    : status === 'GRACE_PERIOD' ? expiresAt : null;
+
+  const purchaseTokenHash = tokenKey(purchaseToken);
+  const [tokenOwner, userAccount] = await Promise.all([
+    prisma.websiteHostingAccount.findUnique({
+      where: { providerPurchaseTokenHash: purchaseTokenHash },
+      select: { userId: true },
+    }),
+    prisma.websiteHostingAccount.findUnique({
+      where: { userId },
+      select: { providerPurchaseTokenHash: true, status: true, paidThroughAt: true },
+    }),
+  ]);
+  if (tokenOwner && tokenOwner.userId !== userId) {
+    throw new Error('This Google Play hosting purchase is already associated with another account.');
+  }
+
+  const now = new Date();
+  const linkedTokenMatchesAccount = Boolean(
+    verified.linkedPurchaseToken
+    && userAccount?.providerPurchaseTokenHash
+    && tokenKey(verified.linkedPurchaseToken) === userAccount.providerPurchaseTokenHash,
+  );
+  if (
+    userAccount?.providerPurchaseTokenHash
+    && userAccount.providerPurchaseTokenHash !== purchaseTokenHash
+    && userAccount.paidThroughAt
+    && userAccount.paidThroughAt > now
+    && ['ACTIVE', 'GRACE_PERIOD', 'CANCELLED'].includes(userAccount.status)
+    && !linkedTokenMatchesAccount
+  ) {
+    throw new Error('This account already has an active Google Play hosting subscription.');
+  }
+  if (verified.acknowledgementState === 'ACKNOWLEDGEMENT_STATE_PENDING') {
+    await googlePublisherRequest(
+      `/applications/${encodedPackage}/purchases/subscriptions/${encodeURIComponent(productId)}/tokens/${encodedToken}:acknowledge`,
+      { method: 'POST', body: '{}' },
+    );
+  }
+
+  await prisma.$transaction(async (tx) => {
+    const hostingData = {
+      tier: basePlan.tier,
+      siteLimit: basePlan.siteLimit,
+      status,
+      provider: 'GOOGLE_PLAY',
+      providerProductId: productId,
+      providerSubscriptionId: purchaseTokenHash,
+      providerPurchaseTokenHash: purchaseTokenHash,
+      currentPeriodStart: periodStart,
+      paidThroughAt: expiresAt,
+      graceDeadlineAt,
+      lastVerifiedAt: now,
+    };
+    await tx.websiteHostingAccount.upsert({
+      where: { userId },
+      create: { userId, ...hostingData },
+      update: hostingData,
+    });
+    await tx.storePurchase.upsert({
+      where: { provider_purchaseToken: { provider: 'GOOGLE_PLAY', purchaseToken } },
+      create: {
+        userId,
+        provider: 'GOOGLE_PLAY',
+        productId,
+        purchaseToken,
+        transactionId,
+        originalTransactionId: purchaseTokenHash,
+        purchaseType: 'SUBSCRIPTION',
+        status: verified.subscriptionState ?? 'UNKNOWN',
+        purchasedAt: periodStart,
+        expiresAt,
+        autoRenewing: lineItem.autoRenewingPlan?.autoRenewEnabled ?? null,
+        acknowledged: true,
+        environment: config.environment,
+        rawPayload: verified as Prisma.InputJsonObject,
+      },
+      update: {
+        userId,
+        transactionId,
+        status: verified.subscriptionState ?? 'UNKNOWN',
+        expiresAt,
+        autoRenewing: lineItem.autoRenewingPlan?.autoRenewEnabled ?? null,
+        acknowledged: true,
+        rawPayload: verified as Prisma.InputJsonObject,
+        lastVerifiedAt: now,
+      },
+    });
+  });
+
+  return {
+    active,
+    productId,
+    status: verified.subscriptionState ?? 'UNKNOWN',
+    transactionId,
+  };
+}
+
 async function removeNativeSubscriptionEntitlement(userId: string): Promise<void> {
   const now = new Date();
   await prisma.$transaction(async (tx) => {
@@ -206,12 +436,16 @@ export async function verifyGooglePlayPurchase(input: {
 }): Promise<{ active: boolean; productId: NativeStoreProductId; status: string; transactionId: string }> {
   const productId = input.productId.trim();
   const purchaseToken = input.purchaseToken.trim();
-  if (!isNativeStoreProductId(productId) || !purchaseToken || purchaseToken.length > 4096) {
+  const config = getGooglePlayBillingConfig();
+  if (!isNativeStoreProductId(productId) || !config.productCatalog[productId] || !purchaseToken || purchaseToken.length > 4096) {
     throw new Error('Invalid Google Play purchase payload.');
   }
+  const product = config.productCatalog[productId]!;
   await assertTokenOwnership(input.userId, purchaseToken);
-  const product = PRODUCT_CATALOG[productId];
-  const encodedPackage = encodeURIComponent(PACKAGE_NAME);
+  if (product.type === 'HOSTING_SUBSCRIPTION') {
+    return verifyGooglePlayHostingPurchase(input.userId, purchaseToken, config);
+  }
+  const encodedPackage = encodeURIComponent(config.packageName);
   const encodedToken = encodeURIComponent(purchaseToken);
 
   if (product.type === 'SUBSCRIPTION') {
@@ -286,7 +520,7 @@ export async function verifyGooglePlayPurchase(input: {
         purchaseToken, transactionId: subscriptionTransactionId, originalTransactionId: tokenKey(purchaseToken),
         purchaseType: 'SUBSCRIPTION', status: verified.subscriptionState ?? 'UNKNOWN', purchasedAt: parseDate(verified.startTime),
         expiresAt, autoRenewing: lineItem.autoRenewingPlan?.autoRenewEnabled ?? null, acknowledged: true,
-        environment: 'PRODUCTION', rawPayload: verified as Prisma.InputJsonObject,
+        environment: config.environment, rawPayload: verified as Prisma.InputJsonObject,
       },
       update: {
         userId: input.userId, paymentTransactionId: payment.id, transactionId: subscriptionTransactionId,
@@ -347,16 +581,21 @@ export async function verifyGooglePlayPurchase(input: {
       userId: input.userId, paymentTransactionId: payment.id, provider: 'GOOGLE_PLAY', productId,
       purchaseToken, transactionId: verified.orderId, purchaseType: 'CONSUMABLE', status: 'PURCHASED',
       quantity: verified.quantity ?? 1, purchasedAt: verified.purchaseTimeMillis ? new Date(Number(verified.purchaseTimeMillis)) : null,
-      acknowledged: true, consumed: true, environment: 'PRODUCTION', rawPayload: verified as Prisma.InputJsonObject,
+      acknowledged: true, consumed: true,       environment: config.environment, rawPayload: verified as Prisma.InputJsonObject,
     },
     update: { userId: input.userId, paymentTransactionId: payment.id, status: 'PURCHASED', acknowledged: true, consumed: true, rawPayload: verified as Prisma.InputJsonObject, lastVerifiedAt: new Date() },
   });
   return { active: true, productId, status: 'PURCHASED', transactionId: payment.id };
 }
 
-export const nativeStoreCatalog = PRODUCT_CATALOG;
+export const nativeStoreCatalog = PRODUCTION_PRODUCT_CATALOG;
+
+export function getConfiguredGooglePlayHostingProductId(): NativeStoreProductId {
+  return getGooglePlayBillingConfig().hostingProductId;
+}
 
 export async function cancelGooglePlaySubscriptionsForAccountDeletion(userId: string): Promise<number> {
+  const config = getGooglePlayBillingConfig();
   const subscriptions = await prisma.storePurchase.findMany({
     where: { userId, provider: 'GOOGLE_PLAY', purchaseType: 'SUBSCRIPTION', status: { notIn: ['EXPIRED', 'REFUNDED', 'REVOKED', 'CANCELED_BY_USER'] } },
     select: { id: true, purchaseToken: true },
@@ -364,7 +603,7 @@ export async function cancelGooglePlaySubscriptionsForAccountDeletion(userId: st
   for (const subscription of subscriptions) {
     try {
       await googlePublisherRequest(
-        `/applications/${encodeURIComponent(PACKAGE_NAME)}/purchases/subscriptionsv2/tokens/${encodeURIComponent(subscription.purchaseToken)}:cancel`,
+        `/applications/${encodeURIComponent(config.packageName)}/purchases/subscriptionsv2/tokens/${encodeURIComponent(subscription.purchaseToken)}:cancel`,
         { method: 'POST', body: JSON.stringify({ cancellationContext: { cancellationType: 'USER_REQUESTED_STOP_RENEWALS' } }) },
       );
     } catch (error) {
@@ -376,12 +615,14 @@ export async function cancelGooglePlaySubscriptionsForAccountDeletion(userId: st
 }
 
 export async function processGooglePlayRtdn(encodedData: string): Promise<{ handled: boolean; type: string }> {
+  const config = getGooglePlayBillingConfig();
   const decoded = JSON.parse(Buffer.from(encodedData, 'base64').toString('utf8')) as {
     packageName?: string;
     subscriptionNotification?: { notificationType?: number; purchaseToken?: string; subscriptionId?: string };
     oneTimeProductNotification?: { notificationType?: number; purchaseToken?: string; sku?: string };
+    voidedPurchaseNotification?: { purchaseToken?: string; productType?: number; refundType?: number };
   };
-  if (decoded.packageName !== PACKAGE_NAME) throw new Error('RTDN package name mismatch.');
+  if (decoded.packageName !== config.packageName) throw new Error('RTDN package name mismatch.');
   const subscription = decoded.subscriptionNotification;
   if (subscription?.purchaseToken) {
     const existing = await prisma.storePurchase.findUnique({ where: { provider_purchaseToken: { provider: 'GOOGLE_PLAY', purchaseToken: subscription.purchaseToken } } });
@@ -392,6 +633,57 @@ export async function processGooglePlayRtdn(encodedData: string): Promise<{ hand
       if (!/not active/i.test(error instanceof Error ? error.message : '')) throw error;
     }
     return { handled: true, type: `subscription:${subscription.notificationType ?? 'unknown'}` };
+  }
+  const voidedPurchase = decoded.voidedPurchaseNotification;
+  if (voidedPurchase?.purchaseToken) {
+    const existing = await prisma.storePurchase.findUnique({
+      where: { provider_purchaseToken: { provider: 'GOOGLE_PLAY', purchaseToken: voidedPurchase.purchaseToken } },
+    });
+    if (!existing?.userId) return { handled: false, type: 'voided-purchase' };
+    if (existing.productId !== config.hostingProductId) return { handled: false, type: 'voided-purchase' };
+    const hostingUserId = existing.userId;
+    const purchaseToken = voidedPurchase.purchaseToken;
+    await prisma.$transaction(async (tx) => {
+      const update = await tx.storePurchase.updateMany({
+        where: { id: existing.id, status: { not: 'REFUNDED' } },
+        data: { status: 'REFUNDED', lastVerifiedAt: new Date() },
+      });
+      if (update.count === 0) return;
+      if (existing.paymentTransactionId) {
+        await tx.paymentTransaction.update({
+          where: { id: existing.paymentTransactionId },
+          data: { status: 'REFUNDED' },
+        });
+      }
+      await tx.websiteHostingAccount.updateMany({
+        where: { userId: hostingUserId, providerPurchaseTokenHash: tokenKey(purchaseToken) },
+        data: {
+          tier: null,
+          siteLimit: 0,
+          status: 'REFUNDED',
+          paidThroughAt: new Date(),
+          graceDeadlineAt: new Date(),
+          scheduledTier: null,
+          scheduledSiteLimit: null,
+          scheduledEffectiveAt: null,
+          scheduledKeptWebsiteIds: Prisma.DbNull,
+          lastVerifiedAt: new Date(),
+        },
+      });
+      await tx.website.updateMany({
+        where: { userId: hostingUserId, deletedAt: null, status: 'published' },
+        data: { status: 'draft', publishedVersion: null, publishedDeploymentId: null, updatedAt: new Date() },
+      });
+      await tx.websiteDeployment.updateMany({
+        where: { website: { is: { userId: hostingUserId } }, status: 'published' },
+        data: { status: 'paused', unpublishedAt: new Date() },
+      });
+      await tx.websiteDomain.updateMany({
+        where: { website: { is: { userId: hostingUserId } }, status: 'active' },
+        data: { status: 'disabled' },
+      });
+    });
+    return { handled: true, type: 'hosting-refund' };
   }
   const oneTime = decoded.oneTimeProductNotification;
   if (oneTime?.purchaseToken) {
@@ -405,7 +697,10 @@ export async function processGooglePlayRtdn(encodedData: string): Promise<{ hand
         });
         if (update.count === 0) return;
         if (existing.paymentTransactionId) await tx.paymentTransaction.update({ where: { id: existing.paymentTransactionId }, data: { status: 'REFUNDED' } });
-        const minutes = isNativeStoreProductId(existing.productId) ? PRODUCT_CATALOG[existing.productId].minutes ?? 0 : 0;
+        const product = isNativeStoreProductId(existing.productId)
+          ? config.productCatalog[existing.productId]
+          : undefined;
+        const minutes = product?.type === 'TOP_UP' ? product.minutes ?? 0 : 0;
         if (minutes > 0) {
           const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: existing.userId! } });
           if (wallet) {
@@ -454,7 +749,7 @@ function appleRootCertificates(): Buffer[] {
 
 function appleVerifier(environment: Environment): SignedDataVerifier {
   const appAppleId = environment === Environment.PRODUCTION ? Number(getRequiredEnv('APPLE_APP_ID')) : undefined;
-  return new SignedDataVerifier(appleRootCertificates(), true, environment, PACKAGE_NAME, appAppleId);
+  return new SignedDataVerifier(appleRootCertificates(), true, environment, PRODUCTION_PACKAGE_NAME, appAppleId);
 }
 
 export async function verifyAppleStorePurchase(input: {
@@ -464,7 +759,10 @@ export async function verifyAppleStorePurchase(input: {
 }): Promise<{ active: boolean; productId: NativeStoreProductId; status: string; transactionId: string }> {
   const productId = input.productId.trim();
   const signedTransaction = input.signedTransaction.trim();
-  if (!isNativeStoreProductId(productId) || !signedTransaction || signedTransaction.length > 20_000) {
+  if (!isProductionNativeStoreProductId(productId)
+    || productId === PRODUCTION_HOSTING_PRODUCT_ID
+    || !signedTransaction
+    || signedTransaction.length > 20_000) {
     throw new Error('Invalid App Store purchase payload.');
   }
   let decoded;
@@ -477,7 +775,7 @@ export async function verifyAppleStorePurchase(input: {
   }
   if (decoded.productId !== productId || !decoded.transactionId) throw new Error('Apple returned a different or incomplete product transaction.');
   if (decoded.revocationDate) throw new Error('This App Store purchase has been revoked or refunded.');
-  const product = PRODUCT_CATALOG[productId];
+  const product = PRODUCTION_PRODUCT_CATALOG[productId];
   const expiresAt = decoded.expiresDate ? new Date(decoded.expiresDate) : null;
   const active = product.type === 'TOP_UP' || Boolean(expiresAt && expiresAt.getTime() > Date.now());
   if (!active) throw new Error('The App Store subscription is not active.');
@@ -491,7 +789,11 @@ export async function verifyAppleStorePurchase(input: {
     providerTransactionId: `apple:${decoded.transactionId}`,
     providerSubscriptionId: decoded.originalTransactionId,
     idempotencyKey: `apple:${decoded.transactionId}`,
-    metadata: { productId, store: 'apple_app_store', topUpMinutes: product.minutes },
+    metadata: {
+      productId,
+      store: 'apple_app_store',
+      topUpMinutes: product.type === 'TOP_UP' ? product.minutes : undefined,
+    },
     description: product.type === 'SUBSCRIPTION' ? 'Mento Pro monthly subscription' : `Mento ${product.minutes}-minute Live Tutor top-up`,
   });
   const owner = await prisma.paymentTransaction.findUnique({ where: { id: payment.id }, select: { userId: true } });
@@ -584,8 +886,9 @@ export async function processAppleStoreNotification(signedPayload: string): Prom
       // notifications must not reverse the same entitlement more than once.
       if (update.count === 0) return;
       if (existing.paymentTransactionId && revoked) await tx.paymentTransaction.update({ where: { id: existing.paymentTransactionId }, data: { status: 'REFUNDED' } });
-      if (revoked && isNativeStoreProductId(existing.productId)) {
-        const minutes = PRODUCT_CATALOG[existing.productId].minutes ?? 0;
+      if (revoked && isProductionNativeStoreProductId(existing.productId)) {
+        const product = PRODUCTION_PRODUCT_CATALOG[existing.productId];
+        const minutes = product.type === 'TOP_UP' ? product.minutes ?? 0 : 0;
         if (minutes > 0) {
           const wallet = await tx.liveTutorWallet.findUnique({ where: { userId: existing.userId! } });
           if (wallet) {

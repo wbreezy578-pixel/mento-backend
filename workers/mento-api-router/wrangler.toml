@@ -1,0 +1,16 @@
+name = "mento-api-router"
+main = "src/index.js"
+compatibility_date = "2026-10-05"
+workers_dev = false
+preview_urls = false
+
+routes = [
+  { pattern = "api.trymentoapp.com", custom_domain = true },
+  { pattern = "blue-api.trymentoapp.com", custom_domain = true }
+]
+
+[vars]
+PRODUCTION_API_COLOR = "green"
+GREEN_API_ORIGIN = "https://mento-backend-migration-twmmcrm25a-uk.a.run.app"
+GREEN_WEBSITES_API_ORIGIN = "https://phase6-websites---mento-backend-migration-twmmcrm25a-uk.a.run.app"
+BLUE_API_ORIGIN = "https://blue-billing-test---mento-backend-blue-twmmcrm25a-uk.a.run.app"

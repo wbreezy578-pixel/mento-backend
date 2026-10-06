@@ -691,6 +691,7 @@ export async function askGemini(
   onUsage?: (usage: GeminiUsage) => void,
   onProviderAttempt?: (model: string) => Promise<unknown>,
   operationSignal?: AbortSignal,
+  generationOptions?: { responseMimeType?: string; maxOutputTokens?: number },
 ): Promise<string> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
 
@@ -717,6 +718,7 @@ export async function askGemini(
         await onProviderAttempt?.(model);
         if (operationSignal?.aborted) throw operationSignal.reason ?? new Error('Generation aborted.');
         logger.info('Calling Gemini provider', { model, kind: 'chat', promptSizeBytes: getPromptSizeBytes(payload.contents, payload.systemInstruction) });
+        const effectiveMaxOutputTokens = generationOptions?.maxOutputTokens ?? payload.maxOutputTokens;
         const result = await client.models.generateContent({
           model,
           contents: payload.contents,
@@ -724,7 +726,8 @@ export async function askGemini(
             systemInstruction: payload.systemInstruction,
             safetySettings: SAFETY_SETTINGS,
             ...getGeminiGenerationTuning(model),
-            maxOutputTokens: payload.maxOutputTokens,
+            maxOutputTokens: effectiveMaxOutputTokens,
+            ...(generationOptions?.responseMimeType ? { responseMimeType: generationOptions.responseMimeType } : {}),
           },
         });
         return result;

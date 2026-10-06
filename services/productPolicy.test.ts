@@ -14,6 +14,7 @@ describe('canonical product policy', () => {
     expect(policy.normalChat.monthlyCompletedMessages).toBe(300);
     expect(policy.normalChat.imageQuestionsPerDay).toBe(3);
     expect(policy.spreadsheetGenerationsPerDay).toBe(1);
+    expect(policy.websiteAiOperationsPerDay).toBe(1);
     expect(policy.normalChat.allowedModels).toEqual(['gemini-3.5-flash-lite']);
     expect(policy.liveTutor.enabled).toBe(false);
   });
@@ -25,6 +26,7 @@ describe('canonical product policy', () => {
     expect(policy.normalChat.dailyCompletedMessages).toBe(120);
     expect(policy.normalChat.imageQuestionsPerDay).toBe(10);
     expect(policy.spreadsheetGenerationsPerDay).toBe(10);
+    expect(policy.websiteAiOperationsPerDay).toBe(10);
     expect(policy.normalChat.monthlyCompletedMessages).toBeGreaterThan(policy.normalChat.dailyCompletedMessages);
     expect(policy.liveTutor).toMatchObject({ enabled: true, includedSecondsPerPeriod: 7200, maxConcurrentSessions: 1, maxSessionSeconds: 1800 });
   });

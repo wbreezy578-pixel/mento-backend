@@ -29,6 +29,7 @@ model User {
   lockedAt               DateTime?
   clerkUserId            String?                 @unique
   conversations          Conversation[]
+  websites               Website[]
   chatOperations         ChatOperation[]
   conversationMessages   ConversationMessage[]
   liveTutorSession       LiveTutorSession?
@@ -51,6 +52,7 @@ model User {
   chatAnalytics          ChatAnalyticsEvent[]
   userSetting            UserSetting?
   wallet                 UserWallet?
+  websiteHostingAccount  WebsiteHostingAccount?
   supportReports         SupportReport[]
 }
 
@@ -71,6 +73,166 @@ model SupportReport {
   @@index([userId, createdAt])
   @@index([status, createdAt])
   @@index([conversationId])
+}
+
+model Website {
+  id                   String            @id @default(cuid())
+  userId               String
+  type                 String
+  title                String
+  slug                 String
+  content              Json
+  status               String            @default("draft")
+  revision             Int               @default(0)
+  currentVersion       Int               @default(1)
+  publishedVersion     Int?
+  publishedDeploymentId String?
+  deletedAt            DateTime?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  user                 User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  versions             WebsiteVersion[]
+  assets               WebsiteAsset[]
+  deployments          WebsiteDeployment[]
+  domains              WebsiteDomain[]
+  reports              WebsiteReport[]
+  hostingSubscription  WebsiteHostingSubscription?
+
+  @@unique([slug], map: "Website_slug_key")
+  @@index([userId, updatedAt])
+  @@index([userId, status, deletedAt])
+}
+
+model WebsiteHostingSubscription {
+  id                   String   @id @default(cuid())
+  websiteId            String   @unique
+  providerSubscriptionId String? @unique
+  status               String   @default("pending")
+  currentPeriodStart   DateTime?
+  currentPeriodEnd     DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+  website              Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([status, currentPeriodEnd])
+}
+
+enum WebsiteHostingTier {
+  SITES_1
+  SITES_3
+  SITES_5
+}
+
+model WebsiteHostingAccount {
+  id                           String              @id @default(cuid())
+  userId                       String              @unique
+  tier                         WebsiteHostingTier?
+  siteLimit                    Int                 @default(0)
+  status                       String              @default("inactive")
+  provider                     String?
+  providerProductId            String?
+  providerSubscriptionId       String?             @unique
+  providerPurchaseTokenHash    String?             @unique
+  currentPeriodStart           DateTime?
+  paidThroughAt                DateTime?
+  graceDeadlineAt              DateTime?
+  scheduledTier                WebsiteHostingTier?
+  scheduledSiteLimit           Int?
+  scheduledEffectiveAt         DateTime?
+  scheduledKeptWebsiteIds      Json?
+  lastVerifiedAt               DateTime?
+  createdAt                    DateTime            @default(now())
+  updatedAt                    DateTime            @updatedAt
+  user                         User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, paidThroughAt])
+  @@index([scheduledEffectiveAt])
+}
+
+model WebsiteDeployment {
+  id            String    @id @default(cuid())
+  websiteId     String
+  version       Int
+  status        String    @default("building")
+  storagePath   String?
+  r2Prefix      String?
+  manifestKey   String?
+  artifactHash  String?
+  artifactSize  Int?
+  hostname      String?
+  publishedAt   DateTime?
+  unpublishedAt DateTime?
+  createdAt     DateTime  @default(now())
+  website       Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId, version])
+  @@index([websiteId, status, publishedAt])
+}
+
+model WebsiteDomain {
+  id         String   @id @default(cuid())
+  hostname   String   @unique
+  websiteId  String
+  kind       String   @default("mento_subdomain")
+  status     String   @default("pending")
+  verifiedAt DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  website    Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId, status])
+}
+
+model WebsiteReport {
+  id          String    @id @default(cuid())
+  websiteId   String
+  reason      String
+  description String
+  reporterEmail String?
+  status      String    @default("open")
+  createdAt   DateTime  @default(now())
+  reviewedAt  DateTime?
+  website     Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId, status, createdAt])
+}
+
+model WebsiteVersion {
+  id        String   @id @default(cuid())
+  websiteId String
+  version   Int
+  source    String
+  summary   String
+  changeType String   @default("manual")
+  createdBy String?
+  content   Json
+  createdAt DateTime @default(now())
+  website   Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@unique([websiteId, version])
+  @@index([websiteId, createdAt])
+}
+
+model WebsiteAsset {
+  id                String   @id @default(cuid())
+  websiteId         String
+  slotId            String
+  source            String
+  providerAssetId   String?
+  objectKey         String?  @unique
+  remoteUrl         String?
+  sourcePageUrl     String?
+  creatorName       String?
+  creatorProfileUrl String?
+  alt               String
+  mimeType          String?
+  width             Int?
+  height            Int?
+  createdAt         DateTime @default(now())
+  website           Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+
+  @@index([websiteId, slotId, createdAt])
+  @@index([websiteId, providerAssetId])
 }
 
 model ConsentRecord {

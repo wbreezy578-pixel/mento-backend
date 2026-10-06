@@ -8,6 +8,7 @@ export interface ProductPolicy {
   name: CanonicalPlanName;
   priceMonthlyUSD: number;
   spreadsheetGenerationsPerDay: number;
+  websiteAiOperationsPerDay: number;
   normalChat: {
     model: NormalChatGeminiModel;
     allowedModels: readonly NormalChatGeminiModel[];
@@ -40,6 +41,7 @@ export function getProductPolicy(plan: string | null | undefined): ProductPolicy
       name: 'PRO',
       priceMonthlyUSD: 29,
       spreadsheetGenerationsPerDay: configuredPositiveInteger('PRO_SPREADSHEET_DAILY_LIMIT', 10),
+      websiteAiOperationsPerDay: configuredPositiveInteger('PRO_WEBSITE_AI_DAILY_LIMIT', 10),
       normalChat: {
         model: 'gemini-3.5-flash',
         allowedModels: ['gemini-3.5-flash', 'gemini-3.5-flash-lite'],
@@ -63,6 +65,7 @@ export function getProductPolicy(plan: string | null | undefined): ProductPolicy
     name: 'FREE',
     priceMonthlyUSD: 0,
     spreadsheetGenerationsPerDay: configuredPositiveInteger('FREE_SPREADSHEET_DAILY_LIMIT', 1),
+    websiteAiOperationsPerDay: configuredPositiveInteger('FREE_WEBSITE_AI_DAILY_LIMIT', 1),
     normalChat: {
       model: 'gemini-3.5-flash-lite',
       allowedModels: ['gemini-3.5-flash-lite'],

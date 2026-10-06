@@ -107,7 +107,7 @@ export function buildBoundAIRequestId(options: {
 
 export async function assertAIRequestNotProcessed(options: {
   userId: string;
-  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet';
+  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website';
   provider: string;
   clientRequestId: string;
   metadata?: Record<string, unknown>;
@@ -249,7 +249,7 @@ export async function secureAITextInput(options: AIRequestSecurityOptions) {
 
 interface ReserveUsageOptions {
   userId: string;
-  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet';
+  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website';
   amount?: number;
   provider: string;
   requestId: string;
@@ -291,7 +291,7 @@ export async function rollbackAIUsage(options: BillingReservationInput): Promise
 interface ExecuteAIRequestOptions<T> {
   user: unknown;
   clientIp: string;
-  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet';
+  feature: 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website';
   provider: string;
   amount?: number;
   requestId: string;

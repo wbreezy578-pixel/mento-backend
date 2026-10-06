@@ -7,6 +7,8 @@ const mocks = vi.hoisted(() => {
       findUniqueOrThrow: vi.fn(),
       update: vi.fn(),
     },
+    website: { findFirst: vi.fn() },
+    websiteHostingSubscription: { upsert: vi.fn() },
     liveTutorWallet: {
       findUnique: vi.fn(),
       update: vi.fn(),
@@ -123,5 +125,41 @@ describe('payment finalization entitlement boundaries', () => {
     expect(mocks.tx.liveTutorWallet.findUnique).not.toHaveBeenCalled();
     expect(mocks.tx.liveTutorWallet.update).not.toHaveBeenCalled();
     expect(mocks.tx.liveTutorMinuteLedger.create).not.toHaveBeenCalled();
+  });
+
+  it('activates one website hosting month only after verified $5 owner-bound payment', async () => {
+    const pending = {
+      ...BASE_PAYMENT,
+      type: 'WEBSITE_HOSTING',
+      amountUsd: 5,
+      amountMinor: 500,
+      metadata: { websiteId: 'site-1' },
+    };
+    const succeeded = { ...pending, status: 'SUCCEEDED' };
+    mocks.prisma.paymentTransaction.findUnique.mockResolvedValue(pending);
+    mocks.tx.paymentTransaction.updateMany.mockResolvedValue({ count: 1 });
+    mocks.tx.paymentTransaction.findUniqueOrThrow.mockResolvedValue(succeeded);
+    mocks.tx.paymentTransaction.update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ ...succeeded, ...data }));
+    mocks.tx.website.findFirst.mockResolvedValue({ id: 'site-1' });
+    mocks.tx.websiteHostingSubscription.upsert.mockResolvedValue({});
+    mocks.tx.paymentLedgerEntry.findFirst.mockResolvedValue(null);
+    mocks.tx.paymentLedgerEntry.create.mockResolvedValue({});
+    mocks.tx.paymentReceipt.upsert.mockResolvedValue({});
+    mocks.prisma.paymentReceipt.findUnique.mockResolvedValue(null);
+    mocks.ensureUserBillingSetup.mockResolvedValue(undefined);
+    mocks.ensureDefaultPlans.mockResolvedValue(undefined);
+
+    await finalizePayment({ transactionId: pending.id, provider: 'GOOGLE_PLAY', status: 'SUCCEEDED' });
+
+    expect(mocks.tx.website.findFirst).toHaveBeenCalledWith({
+      where: { id: 'site-1', userId: 'user-pro', deletedAt: null },
+      select: { id: true },
+    });
+    expect(mocks.tx.paymentTransaction.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ metadata: expect.objectContaining({ chargeType: 'website_hosting' }) }),
+    }));
+    expect(mocks.tx.paymentLedgerEntry.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ entryType: 'WEBSITE_HOSTING' }),
+    }));
   });
 });

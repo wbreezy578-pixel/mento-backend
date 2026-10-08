@@ -27,6 +27,7 @@ import { observeMonitoringLatency } from '../../../../lib/monitoring';
 import { createHash } from 'node:crypto';
 import { acquireAIGenerationLock, releaseAIGenerationLock, startAIGenerationLockHeartbeat } from '../../../../lib/aiGenerationLock';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../lib/userSettings';
+import { buildChatRuntimeContext } from '../chatRuntimeContext';
 import { ChatOperationConflictError, claimInitialChatOperation, completeInitialChatOperation, failInitialChatOperation } from '../../../../services/chatOperationService';
 import { observeChatGenerationTotal, observeChatHistoryLoad, observeChatTimeToFirstToken, recordChatFirstTokenMissing } from '../../../../lib/metrics';
 
@@ -84,9 +85,9 @@ export async function POST(req: Request) {
     startupStageMs.rateLimit = Date.now() - rateLimitStartedAt;
     observeMonitoringLatency('api', startupStageMs.rateLimit, { route: 'chat-stream', operation: 'rate-limit' });
 
-    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown } | null = null;
+    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown; timeZone?: unknown; locationContext?: unknown } | null = null;
     try {
-      body = await readJsonBodyWithLimit<{ message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown }>(req, MAX_CHAT_JSON_BYTES);
+      body = await readJsonBodyWithLimit<{ message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown; timeZone?: unknown; locationContext?: unknown }>(req, MAX_CHAT_JSON_BYTES);
     } catch (error) {
       const bodyError = error instanceof RequestBodyError ? error : new RequestBodyError('Invalid JSON body.', 400, 'invalid_json');
       return NextResponse.json({ error: bodyError.message, code: bodyError.code }, { status: bodyError.status, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
@@ -98,6 +99,11 @@ export async function POST(req: Request) {
     const image = body?.image;
     const requestId = requireClientAIRequestId(req, body?.requestId);
     const answerMode = body?.answerMode === 'detailed' ? 'detailed' : 'short';
+    const runtimeContext = buildChatRuntimeContext({
+      now: new Date(requestStartedAt),
+      timeZone: body?.timeZone,
+      locationContext: body?.locationContext,
+    });
 
     if (!message && !image) {
       return NextResponse.json({ error: 'Invalid input: message or image is required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
@@ -369,7 +375,7 @@ export async function POST(req: Request) {
               if ('error' in languageResult) throw languageResult.error;
               const tutorLanguage = languageResult.language;
               const contents: GeminiMessage[] = [
-                { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
+                { role: 'system', parts: [{ text: `${buildTutorLanguageInstruction(tutorLanguage)}\n${runtimeContext}` }] },
                 ...priorHistory,
                 userEntry,
               ];

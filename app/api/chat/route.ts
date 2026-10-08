@@ -15,6 +15,7 @@ import { buildCorsHeaders } from '../../../lib/securityHeaders';
 import { classifyAppError, createApiErrorResponse } from '../../../lib/errorHandling';
 import { acquireAIGenerationLock, releaseAIGenerationLock, startAIGenerationLockHeartbeat } from '../../../lib/aiGenerationLock';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../lib/userSettings';
+import { buildChatRuntimeContext } from './chatRuntimeContext';
 import { createHash } from 'node:crypto';
 import { ChatOperationConflictError, claimInitialChatOperation, completeInitialChatOperation, failInitialChatOperation } from '../../../services/chatOperationService';
 
@@ -58,9 +59,9 @@ export async function POST(req: Request) {
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(userId, clientIp);
 
-    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown } | null = null;
+    let body: { message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown; timeZone?: unknown; locationContext?: unknown } | null = null;
     try {
-      body = await readJsonBodyWithLimit<{ message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown }>(req, MAX_CHAT_JSON_BYTES);
+      body = await readJsonBodyWithLimit<{ message?: unknown; image?: unknown; conversationId?: unknown; requestId?: unknown; answerMode?: unknown; timeZone?: unknown; locationContext?: unknown }>(req, MAX_CHAT_JSON_BYTES);
     } catch (error) {
       const bodyError = error instanceof RequestBodyError ? error : new RequestBodyError('Invalid JSON body.', 400, 'invalid_json');
       return buildErrorResponse(bodyError.message, bodyError.status, bodyError.code, req.headers.get('origin'), requestId);
@@ -70,6 +71,11 @@ export async function POST(req: Request) {
     const image = body?.image;
     requestId = requireClientAIRequestId(req, body?.requestId);
     const answerMode = body?.answerMode === 'detailed' ? 'detailed' : 'short';
+    const runtimeContext = buildChatRuntimeContext({
+      now: new Date(),
+      timeZone: body?.timeZone,
+      locationContext: body?.locationContext,
+    });
 
     if (!message && !image) {
       return buildErrorResponse('Invalid input: message or image is required', 400, 'validation_error', req.headers.get('origin'), requestId);
@@ -197,7 +203,7 @@ export async function POST(req: Request) {
         const priorHistory = createdForRequest ? historyForAI.slice(0, -1) : historyForAI;
         const tutorLanguage = await getTutorLanguage(userId);
         const contents: GeminiMessage[] = [
-          { role: 'system', parts: [{ text: buildTutorLanguageInstruction(tutorLanguage) }] },
+          { role: 'system', parts: [{ text: `${buildTutorLanguageInstruction(tutorLanguage)}\n${runtimeContext}` }] },
           ...priorHistory,
           userEntry,
         ];

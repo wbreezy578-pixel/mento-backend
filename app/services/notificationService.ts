@@ -35,6 +35,8 @@ const ALLOWED_CATEGORIES = new Set([
 const MAX_TITLE_LENGTH = 120;
 const MAX_BODY_LENGTH = 1000;
 const MAX_TYPE_LENGTH = 60;
+const NOTIFICATION_TABLE_CACHE_TTL_MS = 5 * 60 * 1000;
+let notificationTableAvailability: { exists: boolean; checkedAt: number } | null = null;
 
 function isNotificationsEnabled(): boolean {
   return process.env.NOTIFICATIONS_ENABLED !== 'false' && process.env.ENABLE_NOTIFICATIONS !== 'false';
@@ -51,15 +53,40 @@ function isMissingTableError(error: unknown): boolean {
 }
 
 async function checkNotificationTableExists(): Promise<boolean> {
+  const cached = notificationTableAvailability;
+  if (cached && Date.now() - cached.checkedAt < NOTIFICATION_TABLE_CACHE_TTL_MS) {
+    return cached.exists;
+  }
+
   try {
     const result = await prisma.$queryRaw<Array<{ table_name: string | null }>>`
       SELECT to_regclass('public."Notification"')::text AS table_name;
     `;
     const exists = Boolean(result[0]?.table_name);
+    notificationTableAvailability = { exists, checkedAt: Date.now() };
     logger.info('Notification table availability check', { exists, tableName: result[0]?.table_name ?? null });
     return exists;
   } catch (error) {
+    notificationTableAvailability = { exists: false, checkedAt: Date.now() };
     logger.warn('Unable to verify notification table availability', { error: getErrorMessage(error) });
+    return false;
+  }
+}
+
+function isSafeWebUrl(value: string | null | undefined): boolean {
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === 'https:' || url.protocol === 'http:';
+  } catch {
     return false;
   }
 }
@@ -77,6 +104,10 @@ function normalizeNotificationInput(input: CreateNotificationInput) {
     throw new Error('Notification payload exceeds supported length');
   }
 
+  if (input.actionUrl != null && input.actionUrl !== '' && !isSafeWebUrl(input.actionUrl)) {
+    throw new Error('Notification actionUrl must be a valid http(s) URL.');
+  }
+
   const rawCategory = typeof input.category === 'string' && ALLOWED_CATEGORIES.has(input.category.toUpperCase())
     ? input.category.toUpperCase()
     : 'PRODUCT_UPDATES';
@@ -88,7 +119,7 @@ function normalizeNotificationInput(input: CreateNotificationInput) {
     category: rawCategory as NotificationCategory,
     externalId: input.externalId?.trim() || undefined,
     icon: input.icon ?? null,
-    actionUrl: input.actionUrl ?? null,
+    actionUrl: input.actionUrl ? input.actionUrl.trim() : null,
     metadata: input.metadata === undefined ? undefined : (input.metadata ?? Prisma.JsonNull),
   };
 }

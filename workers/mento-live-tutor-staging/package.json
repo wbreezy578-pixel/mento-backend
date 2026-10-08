@@ -1,0 +1,17 @@
+{
+  "name": "mento-live-tutor-staging-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx src/agent.ts start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@livekit/agents": "1.7.1",
+    "@livekit/agents-plugin-openai": "1.7.1",
+    "@livekit/rtc-node": "^0.13.34",
+    "livekit-server-sdk": "^2.18.0",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3"
+  }
+}

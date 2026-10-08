@@ -1,0 +1,41 @@
+name = "mento-webs-router-local"
+main = "src/index.ts"
+compatibility_date = "2026-10-05"
+workers_dev = false
+preview_urls = false
+
+[[r2_buckets]]
+binding = "WEBSITE_DEPLOYMENTS"
+bucket_name = "mento-websites-staging-local"
+preview_bucket_name = "mento-websites-staging-local"
+
+[vars]
+WEBSITE_RESOLVER_URL = "https://staging-api.invalid/api/websites/public/resolve"
+WEBSITE_HOST_DOMAIN = "trymentoapp.com"
+
+[env.staging]
+name = "mento-webs-router-staging"
+workers_dev = true
+preview_urls = false
+
+[[env.staging.r2_buckets]]
+binding = "WEBSITE_DEPLOYMENTS"
+bucket_name = "mento-websites-staging"
+preview_bucket_name = "mento-websites-staging-local"
+
+[env.staging.vars]
+WEBSITE_RESOLVER_URL = "https://staging-api.invalid/api/websites/public/resolve"
+WEBSITE_HOST_DOMAIN = "trymentoapp.com"
+
+[env.production]
+name = "mento-webs-router-production"
+workers_dev = false
+preview_urls = false
+
+[[env.production.r2_buckets]]
+binding = "WEBSITE_DEPLOYMENTS"
+bucket_name = "mento-websites-production"
+
+[env.production.vars]
+WEBSITE_RESOLVER_URL = "https://api.trymentoapp.com/api/websites/public/resolve"
+WEBSITE_HOST_DOMAIN = "trymentoapp.com"

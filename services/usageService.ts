@@ -1,7 +1,9 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { getEffectiveLimit, getPlanForUser } from './planService';
+import { getEffectiveLimit, getEffectivePlanForUser } from './planService';
 import { reserveUsage } from './billingService';
+import { getAvailableLiveTutorSeconds } from './entitlementService';
+import { getFreeMonthlyWindow, getUtcDayWindow } from './productPolicy';
 
 export interface BillingDecision {
   allowed: boolean;
@@ -14,7 +16,7 @@ export interface BillingDecision {
 }
 
 export type UsageScope = 'day' | 'month' | 'rolling';
-export type UsageFeature = 'chat' | 'image' | 'live_tutor';
+export type UsageFeature = 'chat' | 'image' | 'live_tutor' | 'spreadsheet' | 'website';
 
 export interface UsageSnapshot {
   feature: UsageFeature;
@@ -46,27 +48,27 @@ function normalizeReason(value: string | null | undefined): string {
 function getResetTime(scope: UsageScope): Date {
   const now = new Date();
   if (scope === 'month') {
-    return new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    return getFreeMonthlyWindow(now).end;
   }
 
   if (scope === 'rolling') {
     return new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000);
   }
 
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  return getUtcDayWindow(now).end;
 }
 
 function getWindowStart(scope: UsageScope): Date {
   const now = new Date();
   if (scope === 'month') {
-    return new Date(now.getFullYear(), now.getMonth(), 1);
+    return getFreeMonthlyWindow(now).start;
   }
 
   if (scope === 'rolling') {
     return new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
   }
 
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return getUtcDayWindow(now).start;
 }
 
 function toUsageFeature(feature: UsageFeature): string {
@@ -79,24 +81,27 @@ function getDefaultProvider(feature: UsageFeature): string {
   return 'Gemini';
 }
 
+/** @deprecated Use getEntitlementSnapshot or reserveUsage. Kept for old integrations. */
 async function getUsageCount(userId: string, feature: UsageFeature, scope: UsageScope, windowStart?: Date): Promise<number> {
   const start = windowStart ?? getWindowStart(scope);
   return prisma.usageLog.count({
     where: {
       userId,
       feature: toUsageFeature(feature),
+      success: true,
       createdAt: { gte: start },
     },
   });
 }
 
+/** @deprecated Use getEntitlementSnapshot for display and reserveUsage for enforcement. */
 export async function getUsage(userId: string, feature: UsageFeature, scope: UsageScope = 'day'): Promise<UsageSnapshot> {
-  const plan = await getPlanForUser(userId);
+  const plan = await getEffectivePlanForUser(userId);
   const windowStart = getWindowStart(scope);
   const resetAt = getResetTime(scope);
   const used = await getUsageCount(userId, feature, scope, windowStart);
 
-  const limit = feature === 'chat' || feature === 'image' ? getEffectiveLimit(plan, feature) : null;
+  const limit = feature === 'chat' || feature === 'image' || feature === 'spreadsheet' || feature === 'website' ? getEffectiveLimit(plan, feature) : null;
   const remaining = typeof limit === 'number' ? Math.max(limit - used, 0) : null;
 
   return {
@@ -123,7 +128,7 @@ export async function isLimitReached(userId: string, feature: UsageFeature, amou
   const snapshot = await getUsage(userId, feature, scope);
   if (feature === 'live_tutor') {
     const wallet = await prisma.liveTutorWallet.findUnique({ where: { userId } });
-    return (wallet?.minutesBalance ?? 0) < amount;
+    return getAvailableLiveTutorSeconds(wallet) < amount * 60;
   }
 
   if (typeof snapshot.limit !== 'number') {
@@ -134,7 +139,7 @@ export async function isLimitReached(userId: string, feature: UsageFeature, amou
 }
 
 export async function checkUsage(userId: string, feature: UsageFeature, amount = 1, scope: UsageScope = 'day'): Promise<UsageCheckResult> {
-  const plan = await getPlanForUser(userId);
+  const plan = await getEffectivePlanForUser(userId);
   const usage = await getUsage(userId, feature, scope);
   const remaining = typeof usage.limit === 'number' ? Math.max(usage.limit - usage.used - amount, 0) : null;
 
@@ -143,7 +148,7 @@ export async function checkUsage(userId: string, feature: UsageFeature, amount =
 
   if (feature === 'live_tutor') {
     const wallet = await prisma.liveTutorWallet.findUnique({ where: { userId } });
-    const liveTutorMinutes = wallet?.minutesBalance ?? 0;
+    const liveTutorMinutes = Math.floor(getAvailableLiveTutorSeconds(wallet) / 60);
     if (liveTutorMinutes < amount) {
       allowed = false;
       reason = 'Live tutor minutes are exhausted.';

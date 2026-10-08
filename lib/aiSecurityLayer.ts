@@ -124,13 +124,29 @@ class AISecurityLayer {
       const sanitized = this.sanitizeInput(validation.sanitized || input);
 
       // Step 3: Prompt injection detection
-      let injectionResult: PromptInjectionResult = { hasInjection: false, score: 0, patterns: [] };
+      let injectionResult: PromptInjectionResult = {
+        hasInjection: false,
+        riskScore: 0,
+        obfuscationRisk: 0,
+        patterns: [],
+        blockingRecommended: false,
+        detectionDetails: {
+          normalized: false,
+          scriptTypes: [],
+          detectedLanguage: 'unknown',
+          characterAnomalies: [],
+        },
+      };
       if (effectiveConfig.enablePromptInjectionDetection) {
         injectionResult = detectPromptInjection(sanitized);
         if (injectionResult.hasInjection) {
-          this.logSecurityEvent('injection_detected', context, {
-            patterns: injectionResult.patterns,
-            score: injectionResult.score,
+          // Log detection for telemetry/monitoring (not automatic blocking)
+          this.logSecurityEvent('injection_signal_detected', context, {
+            riskScore: injectionResult.riskScore,
+            obfuscationRisk: injectionResult.obfuscationRisk,
+            blockingRecommended: injectionResult.blockingRecommended,
+            patterns: injectionResult.patterns.map((p) => ({ type: p.type, severity: p.severity })),
+            language: injectionResult.detectionDetails.detectedLanguage,
           });
         }
       }
@@ -154,10 +170,13 @@ class AISecurityLayer {
 
       // Step 5: Determine risk level and allow/deny decision
       const riskLevel = this.calculateRiskLevel(injectionResult, abuseScoreResult, sanitized);
-      const allowRequest = riskLevel !== 'critical' && injectionResult.score < 80;
+      // CHANGED: Only block if blockingRecommended from detector + high abuse score
+      // Never block solely on regex keyword matching
+      const allowRequest = riskLevel !== 'critical' &&
+        !(injectionResult.blockingRecommended && abuseScoreResult.score >= 70);
 
       const warnings: string[] = [];
-      if (injectionResult.hasInjection) warnings.push('Potential prompt injection pattern detected');
+      if (injectionResult.blockingRecommended) warnings.push('High-confidence prompt injection pattern detected');
       if (abuseScoreResult.isSuspicious) warnings.push(`Suspicious content pattern (abuse score: ${abuseScoreResult.score})`);
 
       const duration = Date.now() - startTime;
@@ -165,14 +184,14 @@ class AISecurityLayer {
       if (allowRequest) {
         this.logSecurityEvent('request_allowed', context, {
           riskLevel,
-          injectionScore: injectionResult.score,
+          injectionScore: injectionResult.riskScore,
           abuseScore: abuseScoreResult.score,
           processingTimeMs: duration,
         });
       } else {
         this.logSecurityEvent('request_denied', context, {
           riskLevel,
-          injectionScore: injectionResult.score,
+          injectionScore: injectionResult.riskScore,
           abuseScore: abuseScoreResult.score,
           processingTimeMs: duration,
         });
@@ -298,6 +317,8 @@ class AISecurityLayer {
 
   /**
    * Calculate overall risk level
+   * NOTE: Injection detection is now a signal, not proof.
+   * High-confidence injection + abuse score together determine blocking.
    */
   private calculateRiskLevel(
     injection: PromptInjectionResult,
@@ -306,10 +327,15 @@ class AISecurityLayer {
   ): 'low' | 'medium' | 'high' | 'critical' {
     let riskScore = 0;
 
-    // Injection detection
-    if (injection.score > 80) riskScore += 40;
-    else if (injection.score > 60) riskScore += 25;
-    else if (injection.score > 40) riskScore += 10;
+    // Injection risk (now called riskScore, not score)
+    if (injection.riskScore > 80) riskScore += 30;
+    else if (injection.riskScore > 60) riskScore += 20;
+    else if (injection.riskScore > 40) riskScore += 10;
+
+    // Obfuscation risk (Unicode/control char attacks)
+    if (injection.obfuscationRisk > 75) riskScore += 35;
+    else if (injection.obfuscationRisk > 50) riskScore += 20;
+    else if (injection.obfuscationRisk > 25) riskScore += 10;
 
     // Abuse score
     if (abuse.score > 85) riskScore += 40;
@@ -319,6 +345,8 @@ class AISecurityLayer {
     // Input characteristics
     if (input.length > 5000) riskScore += 5;
     if (/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(input)) riskScore += 15; // Control chars after sanitization = anomaly
+
+    // Critical indicators (direct manipulation syntax)
     if (/^(repeat|ignore|override|execute|system:|admin:|root:)/i.test(input)) riskScore += 20;
 
     if (riskScore >= 80) return 'critical';
@@ -341,7 +369,7 @@ class AISecurityLayer {
       sanitizedInput: '',
       assessment: {
         validation: { valid: false, error: reason },
-        injectionDetection: { hasInjection: false, score: 0, patterns: [] },
+        injectionDetection: { hasInjection: false, riskScore: 0, obfuscationRisk: 0, patterns: [], blockingRecommended: false, detectionDetails: { normalized: false, scriptTypes: [], detectedLanguage: 'unknown', characterAnomalies: [] } },
         abuseScore: {
           score: 0,
           reasons: [],
@@ -384,7 +412,7 @@ class AISecurityLayer {
     return {
       allowed: result.allowRequest,
       riskLevel: result.riskLevel,
-      injectionScore: result.assessment.injectionDetection.score,
+      injectionScore: result.assessment.injectionDetection.riskScore,
       abuseScore: result.assessment.abuseScore.score,
       warnings: result.warnings.length,
       sanitizedLength: result.sanitizedInput.length,

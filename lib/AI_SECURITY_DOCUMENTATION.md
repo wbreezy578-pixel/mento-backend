@@ -162,33 +162,7 @@ export async function POST(req: Request) {
 }
 ```
 
-#### Option 2: Middleware Wrapper
-
-```typescript
-// lib/aiSecurityMiddleware.ts
-import { createSecurityCheckMiddleware } from './aiSecurityIntegration';
-
-export async function withAISecurity(handler: Function) {
-  return async (req: Request) => {
-    const securityCheck = await createSecurityCheckMiddleware(req);
-
-    if (!securityCheck.passed) {
-      return NextResponse.json(
-        securityCheck.error,
-        { status: securityCheck.statusCode }
-      );
-    }
-
-    // Inject sanitized input back into request
-    req.sanitizedInput = securityCheck.sanitizedInput;
-    req.requestId = securityCheck.requestId;
-
-    return handler(req);
-  };
-}
-```
-
-#### Option 3: Custom Configuration
+#### Custom Configuration
 
 ```typescript
 const result = await assessAndSecureChatRequest(

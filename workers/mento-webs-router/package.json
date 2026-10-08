@@ -1,0 +1,12 @@
+{
+  "name": "mento-webs-router",
+  "private": true,
+  "scripts": {
+    "dev:local": "wrangler dev --local",
+    "dev:staging": "wrangler dev --env staging --local",
+    "deploy:staging": "wrangler deploy --env staging"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

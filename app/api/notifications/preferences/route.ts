@@ -39,6 +39,12 @@ export async function PATCH(req: Request) {
     }
 
     const updated = await updateNotificationPreferences(user.id, patch);
+    if (!updated) {
+      return NextResponse.json(
+        { error: 'Notification preferences are temporarily unavailable.' },
+        { status: 503 },
+      );
+    }
     return NextResponse.json({ preferences: updated });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : 'Internal Server Error';

@@ -3,6 +3,9 @@ import type { NextConfig } from 'next';
 const nextConfig: NextConfig = {
   serverExternalPackages: ['prom-client'],
   allowedDevOrigins: ['http://10.0.0.9:8081'],
+  turbopack: {
+    root: process.cwd(),
+  },
   async headers() {
     return [
       {

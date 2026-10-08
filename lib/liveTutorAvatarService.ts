@@ -3,6 +3,7 @@ export interface LiveTutorAvatarSessionLike {
   stop(): Promise<void>;
   attach(element: HTMLVideoElement): void;
   speak?(payload: { text: string }): Promise<void>;
+  sendAudio?(payload: { audioBase64: string; immediate?: boolean }): Promise<void>;
   interrupt?(): void;
 }
 
@@ -11,6 +12,7 @@ export interface LiveTutorAvatarService {
   stop(): Promise<void>;
   attach(element: HTMLVideoElement): void;
   speak(text: string): Promise<void>;
+  sendAudio(audioBase64: string, immediate?: boolean): Promise<void>;
   interrupt(): void;
 }
 
@@ -40,6 +42,13 @@ export class SimliLiveTutorAvatarService implements LiveTutorAvatarService {
     if (!this.session) return;
     if (typeof this.session.speak === 'function') {
       await this.session.speak({ text });
+    }
+  }
+
+  async sendAudio(audioBase64: string, immediate?: boolean): Promise<void> {
+    if (!this.session) return;
+    if (typeof this.session.sendAudio === 'function') {
+      await this.session.sendAudio({ audioBase64, immediate });
     }
   }
 

@@ -1,17 +1,27 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../lib/prisma';
 import logger from '../../../lib/logger';
-import { signToken, normalizeEmail, verifyPassword, buildUserSummary, incrementFailedLoginAttempts, resetFailedLoginAttempts, recordSecurityEvent, applyAuthCookies, getClientIp, getLoginPolicyState } from '../../lib/auth';
-import { createNotification } from '../../services/notificationService';
-import { createSessionRecord, generateSecureToken } from '../../../lib/authSession';
+import { normalizeEmail, verifyPassword, getLoginPolicyState, incrementFailedLoginAttempts, recordSecurityEvent, getClientIp, authRateLimitSubject, DUMMY_BCRYPT_HASH } from '../../lib/auth';
+import { createLoginMfaChallenge, hashClientDeviceId } from '../../../lib/authSession';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
+import { ensureSlidingWindow } from '../../../lib/rateLimiter';
+import { sendLoginMfaCode } from '../../../services/transactionalEmailService';
+import { isGooglePlayReviewAccount } from '../../../lib/googlePlayReviewAccess';
+import { createNotification } from '../../services/notificationService';
+import { createSessionRecord, generateSecureToken, getRefreshSessionExpiry, REFRESH_SESSION_ABSOLUTE_TTL_MS } from '../../../lib/authSession';
+import { applyAuthCookies, buildAuthSessionResponseBody, buildUserSummary, getSessionClientIp, isBrowserAuthRequest, resetFailedLoginAttempts, signToken } from '../../lib/auth';
+import type { RateLimitDecision } from '../../../lib/rateLimiter';
 
 const CORS_METHODS = 'POST, OPTIONS';
+const LOGIN_FAILURE_MESSAGE = 'Unable to sign in. Check your email and password.';
+
+function loginErrorMetadata(error: unknown) {
+  if (!error || typeof error !== 'object') return {};
+  const candidate = error as { code?: unknown };
+  return typeof candidate.code === 'string' ? { code: candidate.code } : {};
+}
 
 export async function OPTIONS(req: Request) {
-  logger.info('Login OPTIONS preflight', {
-    origin: req.headers.get('origin'),
-  });
   const corsHeaders = buildCorsHeaders(req.headers.get('origin'));
   return new NextResponse(null, {
     status: 204,
@@ -23,91 +33,144 @@ export async function OPTIONS(req: Request) {
 }
 
 export async function POST(req: Request) {
-  logger.info('Login POST received', {
-    origin: req.headers.get('origin'),
-  });
-
   try {
     const { email, password } = await req.json();
     const normalizedEmail = normalizeEmail(email);
     if (!normalizedEmail || !password) {
       return NextResponse.json({ error: 'Email and password are required' }, { status: 400, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
+    const clientIp = getClientIp(req);
+    const [ipLimit, accountLimit] = await Promise.all([
+      ensureSlidingWindow(`login:ip:${clientIp}`, 30, 15 * 60),
+      isGooglePlayReviewAccount(normalizedEmail)
+        ? Promise.resolve<RateLimitDecision>({ ok: true })
+        : ensureSlidingWindow(`login:account:${authRateLimitSubject(normalizedEmail)}`, 10, 15 * 60),
+    ]);
+    if (!ipLimit.ok || !accountLimit.ok) {
+      const unavailable = ipLimit.unavailable || accountLimit.unavailable;
+      const retryAfterSec = Math.max(ipLimit.retryAfterSec ?? 0, accountLimit.retryAfterSec ?? 0, 5);
+      return NextResponse.json(
+        { error: unavailable ? 'Sign-in is temporarily unavailable. Please try again shortly.' : 'Too many sign-in attempts. Please try again later.' },
+        {
+          status: unavailable ? 503 : 429,
+          headers: {
+            ...buildCorsHeaders(req.headers.get('origin')),
+            'Access-Control-Allow-Methods': CORS_METHODS,
+            'Retry-After': String(retryAfterSec),
+          },
+        },
+      );
+    }
 
     const user = await prisma.user.findFirst({
       where: { email: { equals: normalizedEmail, mode: 'insensitive' } },
     });
     if (!user) {
-      logger.info('Login lookup result', { found: false });
-      await recordSecurityEvent(null, 'login_failed', { email: normalizedEmail, reason: 'user_not_found' });
-      return NextResponse.json({ error: 'Invalid credentials' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      await verifyPassword(String(password), DUMMY_BCRYPT_HASH);
+      await recordSecurityEvent(null, 'login_failed', { accountSubject: authRateLimitSubject(normalizedEmail), reason: 'user_not_found' });
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    const policyState = getLoginPolicyState(user);
-    if (!policyState.allowed) {
-      return NextResponse.json({ error: 'Account temporarily locked. Please try again later.' }, { status: 423, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
-    }
-
-    logger.info('Login lookup result', { found: true, userId: user.id });
     const passwordFieldExists = typeof user.password === 'string' && user.password.trim().length > 0;
-    logger.info('Login password field status', { userId: user.id, passwordFieldExists });
 
     if (!passwordFieldExists) {
+      await verifyPassword(String(password), DUMMY_BCRYPT_HASH);
       return NextResponse.json(
-        { error: 'This account was created with Google. Please continue with Google or set a password.' },
+        { error: LOGIN_FAILURE_MESSAGE },
         { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } }
       );
     }
 
+    if (!user.emailVerified) {
+      const passwordMatches = await verifyPassword(String(password), user.password);
+      if (passwordMatches && user.accountStatus === 'UNVERIFIED') {
+        await recordSecurityEvent(user.id, 'login_blocked', { reason: 'email_not_verified' });
+        return NextResponse.json(
+          { error: 'Verify your email before signing in.', code: 'email_not_verified' },
+          { status: 403, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } }
+        );
+      }
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }
+
+    if (user.accountStatus !== 'ACTIVE') {
+      await verifyPassword(String(password), user.password);
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }
+
+    const loginPolicy = getLoginPolicyState(user);
+    if (!loginPolicy.allowed) {
+      const passwordMatches = await verifyPassword(String(password), user.password);
+      await recordSecurityEvent(user.id, 'login_blocked', { reason: loginPolicy.reason });
+      if (passwordMatches) {
+        const retryAfterSeconds = Math.max(1, loginPolicy.lockoutRemainingSeconds);
+        return NextResponse.json(
+          {
+            error: `This account is temporarily locked. Try again in ${Math.ceil(retryAfterSeconds / 60)} minute${retryAfterSeconds > 60 ? 's' : ''}.`,
+            code: 'account_locked',
+            retryAfterSeconds,
+          },
+          {
+            status: 423,
+            headers: {
+              ...buildCorsHeaders(req.headers.get('origin')),
+              'Access-Control-Allow-Methods': CORS_METHODS,
+              'Retry-After': String(retryAfterSeconds),
+            },
+          }
+        );
+      }
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    }
+
     const match = await verifyPassword(password, user.password);
-    logger.info('Login password compare result', { userId: user.id, match });
     if (!match) {
       await incrementFailedLoginAttempts(user.id);
       const clientIp = getClientIp(req);
-      await recordSecurityEvent(user.id, 'login_failed', { email: normalizedEmail, reason: 'invalid_password', ipAddress: clientIp });
-      return NextResponse.json({ error: 'Invalid credentials' }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      await recordSecurityEvent(user.id, 'login_failed', { reason: 'invalid_password', networkSubject: authRateLimitSubject(clientIp) });
+      return NextResponse.json({ error: LOGIN_FAILURE_MESSAGE }, { status: 401, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     }
 
-    await resetFailedLoginAttempts(user.id);
-    const clientIp = getClientIp(req);
-    const accessToken = signToken(user.id, normalizedEmail, { expiresInSeconds: 15 * 60 });
-    const refreshTokenValue = generateSecureToken();
-    const sessionExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-    await createSessionRecord({
-      userId: user.id,
-      token: refreshTokenValue,
-      userAgent: req.headers.get('user-agent') ?? null,
-      ipAddress: req.headers.get('x-forwarded-for') ?? null,
-      expiresAt: sessionExpiresAt,
-    });
-    await recordSecurityEvent(user.id, 'login_success', { email: normalizedEmail, ipAddress: clientIp });
-
-    // best-effort security notification on successful login
-    try {
-      await createNotification(user.id, {
-        title: 'New sign-in detected',
-        body: `We detected a new sign-in to your account. If this wasn't you, change your password.`,
-        type: 'security',
+    if (isGooglePlayReviewAccount(user.email)) {
+      await resetFailedLoginAttempts(user.id);
+      const refreshTokenValue = generateSecureToken();
+      const absoluteExpiresAt = new Date(Date.now() + REFRESH_SESSION_ABSOLUTE_TTL_MS);
+      const sessionExpiresAt = getRefreshSessionExpiry(absoluteExpiresAt);
+      const session = await createSessionRecord({
+        userId: user.id,
+        token: refreshTokenValue,
+        userAgent: req.headers.get('user-agent') ?? null,
+        ipAddress: getSessionClientIp(req),
+        deviceIdHash: hashClientDeviceId(req.headers.get('x-mento-device-id')),
+        expiresAt: sessionExpiresAt,
+        absoluteExpiresAt,
       });
-    } catch (e) {
-      // ignore
+      const accessToken = signToken(user.id, user.email, { sessionId: session.id, expiresInSeconds: 15 * 60 });
+      await recordSecurityEvent(user.id, 'login_success', { networkSubject: authRateLimitSubject(getSessionClientIp(req) ?? 'unknown'), mfa: 'review_account_bypass' });
+      try {
+        await createNotification(user.id, { title: 'New sign-in detected', body: `We detected a new sign-in to your account. If this wasn't you, change your password.`, type: 'security' });
+      } catch {
+        // Security notification failure must not invalidate a successful login.
+      }
+      const browserSession = isBrowserAuthRequest(req);
+      const response = NextResponse.json(buildAuthSessionResponseBody({ browserSession, accessToken, refreshToken: refreshTokenValue, sessionExpiresAt: sessionExpiresAt.toISOString(), user: buildUserSummary(user) }), { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      applyAuthCookies(response, { accessToken, refreshToken: refreshTokenValue, isProduction: process.env.NODE_ENV === 'production', browserSession });
+      return response;
     }
 
-    const response = NextResponse.json({
-      token: accessToken,
-      refreshToken: refreshTokenValue,
-      sessionExpiresAt: sessionExpiresAt.toISOString(),
-      user: buildUserSummary(user),
-    }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
-    applyAuthCookies(response, {
-      accessToken,
-      refreshToken: refreshTokenValue,
-      isProduction: process.env.NODE_ENV === 'production',
+    const { challengeToken, code } = await createLoginMfaChallenge(user.id, {
+      deviceIdHash: hashClientDeviceId(req.headers.get('x-mento-device-id')),
     });
-    return response;
+    await sendLoginMfaCode(user.email, code);
+    return NextResponse.json(
+      { requiresMfa: true, challengeToken, message: 'Enter the sign-in code sent to your email.' },
+      { status: 202, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS, 'Cache-Control': 'no-store' } },
+    );
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : 'Internal error';
-    logger.error('Login error', { error: err });
-    return NextResponse.json({ error: message }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+    logger.error('Login failed', {
+      errorName: err instanceof Error ? err.name : 'unknown',
+      ...loginErrorMetadata(err),
+    });
+    return NextResponse.json({ error: 'Unable to sign in right now.' }, { status: 500, headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
   }
 }

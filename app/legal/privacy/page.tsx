@@ -7,7 +7,7 @@ export const metadata = {
 };
 
 export default function PrivacyPolicyPage() {
-  return <LegalPage title="Privacy Policy" updated="September 14, 2026">
+  return <LegalPage title="Privacy Policy" updated="October 9, 2026">
     <p>Mento is an AI learning application operated in Kenya by VALD MWAGHALI MALUSHA. This policy explains what information Mento processes, why it is used, and the choices available to you.</p>
     <h2>Information we process</h2>
     <ul>
@@ -20,6 +20,8 @@ export default function PrivacyPolicyPage() {
     </ul>
     <h2>Camera and microphone</h2>
     <p>Camera or photo access is used only when you choose an image for tutoring. Microphone access is used only for Live Tutor voice conversations. Mento does not activate either permission in the background.</p>
+    <h2>Device location</h2>
+    <p>Mento requests foreground device-location permission from your operating system only when you ask a question that depends on your location. You must grant that permission before Mento accesses your device location. You can deny the request and continue chatting without sharing your device location. If you grant permission, Mento uses an approximate location reading and may derive a city, region, or country from it. The coordinates and any derived place information are sent to Mento and Google Gemini only to answer that request; they are not saved in your chat history. You can revoke location permission at any time in your device settings.</p>
     <h2>Advertising</h2>
     <p>Free accounts may display clearly labelled banner advertising supplied through Google Mobile Ads (AdMob). To support this feature, the Android app may initialize Google&apos;s advertising tools and request applicable consent. Google may process IP-derived approximate location, app interactions, diagnostics, and device or account identifiers to serve, measure, limit, and protect advertising, subject to its own terms, privacy policy, and any consent choices presented in the app. Paid features are not a request for advertising consent.</p>
     <h2>Service providers</h2>
@@ -28,7 +30,7 @@ export default function PrivacyPolicyPage() {
     <h2>Retention and deletion</h2>
     <p>Conversations and their messages are automatically deleted after one year without an update. You may delete individual conversations sooner. Account data remains while your account is active. You can delete your account in Mento under Settings → Delete Account. We process deletion requests promptly; if an identity or service provider is temporarily unavailable, the request is kept securely for retry. Deletion removes account content and credentials; limited payment, security, fraud-prevention, and legally required records may be retained. Google Play controls store subscription records, and Google or other providers may retain data under their own policies.</p>
     <h2>Your choices</h2>
-    <p>You may access or update account details in the app, delete conversations, revoke camera or microphone permissions in device settings, restore purchases through Google Play, and request account deletion. For access, correction, deletion, objection, or another privacy request, email <a href="mailto:mentosupport@gmail.com">mentosupport@gmail.com</a>.</p>
+    <p>You may access or update account details in the app, delete conversations, revoke camera, microphone, or location permissions in device settings, restore purchases through Google Play, and request account deletion. For access, correction, deletion, objection, or another privacy request, email <a href="mailto:mentosupport@gmail.com">mentosupport@gmail.com</a>.</p>
     <h2>Children</h2>
     <p>Mento is only for people aged 18 or older. By creating an account, you confirm that you are at least 18. Accounts reasonably believed to belong to a person under 18 may be suspended and deleted.</p>
     <h2>Security and contact</h2>

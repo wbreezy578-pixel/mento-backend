@@ -2,6 +2,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { getEffectiveLimit, getEffectivePlanForUser } from './planService';
 import { reserveUsage } from './billingService';
+import { getAvailableLiveTutorSeconds } from './entitlementService';
 import { getFreeMonthlyWindow, getUtcDayWindow } from './productPolicy';
 
 export interface BillingDecision {
@@ -127,7 +128,7 @@ export async function isLimitReached(userId: string, feature: UsageFeature, amou
   const snapshot = await getUsage(userId, feature, scope);
   if (feature === 'live_tutor') {
     const wallet = await prisma.liveTutorWallet.findUnique({ where: { userId } });
-    return (wallet?.minutesBalance ?? 0) < amount;
+    return getAvailableLiveTutorSeconds(wallet) < amount * 60;
   }
 
   if (typeof snapshot.limit !== 'number') {
@@ -147,7 +148,7 @@ export async function checkUsage(userId: string, feature: UsageFeature, amount =
 
   if (feature === 'live_tutor') {
     const wallet = await prisma.liveTutorWallet.findUnique({ where: { userId } });
-    const liveTutorMinutes = wallet?.minutesBalance ?? 0;
+    const liveTutorMinutes = Math.floor(getAvailableLiveTutorSeconds(wallet) / 60);
     if (liveTutorMinutes < amount) {
       allowed = false;
       reason = 'Live tutor minutes are exhausted.';

@@ -58,9 +58,9 @@ describe('authoritative entitlement foundation', () => {
     expect(sessionRoute).toContain('liveTutorAllowanceExhausted');
   });
 
-  it('keeps legacy minute wallets readable until they are classified', () => {
+  it('does not let legacy minute balances restore canonical entitlement', () => {
     const entitlement = source('services/entitlementService.ts');
-    expect(entitlement).toContain('if (canonicalSeconds > 0) return canonicalSeconds;');
-    expect(entitlement).toContain('wallet?.minutesBalance ?? 0) * 60');
+    expect(entitlement).toContain('return includedSeconds + topUpSeconds;');
+    expect(entitlement).not.toContain('wallet?.minutesBalance ?? 0) * 60');
   });
 });

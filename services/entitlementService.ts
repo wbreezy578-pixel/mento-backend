@@ -44,8 +44,8 @@ export function resolveIncludedSecondsForEvent(input: {
 }
 
 /**
- * Canonical wallets use exact second buckets. Keep a compatibility fallback
- * for pre-canonical wallets that only have the legacy minute field populated.
+ * Canonical second buckets are authoritative. The rounded legacy minute field
+ * must not restore a depleted balance.
  */
 export function getAvailableLiveTutorSeconds(wallet: {
   includedSeconds?: number | null;
@@ -54,9 +54,7 @@ export function getAvailableLiveTutorSeconds(wallet: {
 } | null | undefined): number {
   const includedSeconds = Math.max(0, wallet?.includedSeconds ?? 0);
   const topUpSeconds = Math.max(0, wallet?.topUpSeconds ?? 0);
-  const canonicalSeconds = includedSeconds + topUpSeconds;
-  if (canonicalSeconds > 0) return canonicalSeconds;
-  return Math.max(0, wallet?.minutesBalance ?? 0) * 60;
+  return includedSeconds + topUpSeconds;
 }
 
 /**
@@ -68,7 +66,6 @@ export function getEffectiveLiveTutorBalance(input: {
   allowed: boolean;
   includedSeconds?: number | null;
   topUpSeconds?: number | null;
-  minutesBalance?: number | null;
 }) {
   const includedSeconds = Math.max(0, input.includedSeconds ?? 0);
   const topUpSeconds = Math.max(0, input.topUpSeconds ?? 0);
@@ -129,7 +126,6 @@ export async function getEntitlementSnapshot(userId: string, now = new Date()) {
     allowed: entitlement.policy.liveTutor.enabled,
     includedSeconds: liveWallet?.includedSeconds,
     topUpSeconds: liveWallet?.topUpSeconds,
-    minutesBalance: liveWallet?.minutesBalance,
   });
   return {
     plan: entitlement.plan,

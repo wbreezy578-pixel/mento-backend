@@ -29,6 +29,8 @@ type MetricsState = {
   chatHistoryLoad: client.Histogram<'conversation_size'>;
   chatGeminiResponse: client.Histogram<'model'>;
   chatFallbacks: client.Counter<'reason'>;
+  chatGoogleSearchRequests: client.Counter<'used'>;
+  chatGoogleSearchQueries: client.Counter<never>;
 };
 
 declare global {
@@ -224,6 +226,19 @@ function initializeMetrics(): MetricsState {
     registers: [register],
   }));
 
+  const chatGoogleSearchRequests = createMetric(register, 'chat_google_search_requests_total', () => new client.Counter({
+    name: 'chat_google_search_requests_total',
+    help: 'Normal chat requests that did or did not use Gemini Google Search grounding',
+    labelNames: ['used'] as const,
+    registers: [register],
+  }));
+
+  const chatGoogleSearchQueries = createMetric(register, 'chat_google_search_queries_total', () => new client.Counter({
+    name: 'chat_google_search_queries_total',
+    help: 'Google Search queries returned by Gemini grounding metadata',
+    registers: [register],
+  }));
+
   const state: MetricsState = {
     register,
     rateLimitHits,
@@ -248,6 +263,8 @@ function initializeMetrics(): MetricsState {
     chatHistoryLoad,
     chatGeminiResponse,
     chatFallbacks,
+    chatGoogleSearchRequests,
+    chatGoogleSearchQueries,
   };
 
   (globalThis as typeof globalThis & { __mentoPromClientMetrics__?: MetricsState })[GLOBAL_METRIC_STATE] = state;
@@ -304,6 +321,8 @@ export const chatGenerationTotal = metrics.chatGenerationTotal;
 export const chatHistoryLoad = metrics.chatHistoryLoad;
 export const chatGeminiResponse = metrics.chatGeminiResponse;
 export const chatFallbacks = metrics.chatFallbacks;
+export const chatGoogleSearchRequests = metrics.chatGoogleSearchRequests;
+export const chatGoogleSearchQueries = metrics.chatGoogleSearchQueries;
 
 export function observeChatTimeToFirstToken(durationMs: number, answerMode: 'short' | 'detailed' = 'detailed'): void {
   if (Number.isFinite(durationMs) && durationMs >= 0) metrics.chatTimeToFirstToken.labels(answerMode).observe(durationMs);
@@ -327,6 +346,13 @@ export function observeChatGeminiResponse(durationMs: number, model: string): vo
 
 export function recordChatFallback(reason: string): void {
   metrics.chatFallbacks.labels(reason || 'unknown').inc();
+}
+
+export function recordChatGoogleSearchUsage(used: boolean, queryCount: number): void {
+  metrics.chatGoogleSearchRequests.labels(used ? 'true' : 'false').inc();
+  if (used && Number.isFinite(queryCount) && queryCount > 0) {
+    metrics.chatGoogleSearchQueries.inc(Math.floor(queryCount));
+  }
 }
 
 export function observeLiveTutorVoiceLatency(stage: string, durationMs: number): void {

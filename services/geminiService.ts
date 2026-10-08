@@ -1,4 +1,5 @@
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import type { GroundingMetadata } from '@google/genai';
 import { AI_CONFIG } from '../app/lib/aiConfig';
 import { AI_FEATURES } from '../app/lib/aiFeatures';
 import { SAFETY_SETTINGS } from '../app/lib/aiSafety';
@@ -46,6 +47,40 @@ export type GeminiUsage = {
   thinkingTokens: number;
   totalTokens: number;
 };
+
+export type GeminiGroundingSource = {
+  title: string;
+  url: string;
+};
+
+export type GeminiGroundingInfo = {
+  usedGoogleSearch: boolean;
+  queries: string[];
+  sources: GeminiGroundingSource[];
+};
+
+export function extractGeminiGroundingInfo(metadata?: GroundingMetadata | null): GeminiGroundingInfo {
+  const queries = [...new Set((metadata?.webSearchQueries ?? [])
+    .filter((query): query is string => typeof query === 'string')
+    .map((query) => query.trim().slice(0, 300))
+    .filter(Boolean))].slice(0, 10);
+  const sources: GeminiGroundingSource[] = [];
+  for (const chunk of metadata?.groundingChunks ?? []) {
+    const web = chunk.web;
+    if (!web?.uri || !/^https:\/\//i.test(web.uri) || sources.some((source) => source.url === web.uri)) continue;
+    sources.push({
+      title: typeof web.title === 'string' && web.title.trim() ? web.title.trim().slice(0, 300) : web.uri,
+      url: web.uri,
+    });
+    if (sources.length === 10) break;
+  }
+  const usedGoogleSearch = queries.length > 0
+    || sources.length > 0
+    || Boolean(metadata?.searchEntryPoint);
+  return { usedGoogleSearch, queries, sources };
+}
+
+export const NORMAL_CHAT_GOOGLE_SEARCH_MODEL = 'gemini-3.5-flash-lite';
 
 type GeminiUsageMetadata = {
   promptTokenCount?: number;
@@ -691,7 +726,12 @@ export async function askGemini(
   onUsage?: (usage: GeminiUsage) => void,
   onProviderAttempt?: (model: string) => Promise<unknown>,
   operationSignal?: AbortSignal,
-  generationOptions?: { responseMimeType?: string; maxOutputTokens?: number },
+  generationOptions?: {
+    responseMimeType?: string;
+    maxOutputTokens?: number;
+    googleSearch?: boolean;
+    onGrounding?: (grounding: GeminiGroundingInfo) => void;
+  },
 ): Promise<string> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
 
@@ -728,6 +768,9 @@ export async function askGemini(
             ...getGeminiGenerationTuning(model),
             maxOutputTokens: effectiveMaxOutputTokens,
             ...(generationOptions?.responseMimeType ? { responseMimeType: generationOptions.responseMimeType } : {}),
+            ...(generationOptions?.googleSearch && model === NORMAL_CHAT_GOOGLE_SEARCH_MODEL
+              ? { tools: [{ googleSearch: {} }] }
+              : {}),
           },
         });
         return result;
@@ -739,6 +782,7 @@ export async function askGemini(
 
       if (operationSignal?.aborted) throw operationSignal.reason ?? new Error('Generation aborted.');
 
+      generationOptions?.onGrounding?.(extractGeminiGroundingInfo(response?.candidates?.[0]?.groundingMetadata));
       const text = response?.text || response?.candidates?.[0]?.content?.parts?.[0]?.text || '';
       const responseSizeBytes = Buffer.byteLength(text, 'utf8');
       logger.info('Gemini request completed', {
@@ -919,6 +963,7 @@ export type GeminiStreamResult = {
   outcome: 'completed' | 'cancelled';
   text: string;
   usage: GeminiUsage;
+  grounding: GeminiGroundingInfo;
 };
 
 export type GeminiStreamDiagnostics = {
@@ -969,6 +1014,7 @@ export async function askGeminiStream(
   onProviderAttempt?: (model: string) => Promise<unknown>,
   approvedSecurityInput?: string,
   diagnostics?: GeminiStreamDiagnostics,
+  googleSearch = false,
 ): Promise<GeminiStreamResult> {
   assertFeatureEnabled(AI_FEATURES.CHAT, 'Chat AI is currently disabled.');
   assertFeatureEnabled(AI_FEATURES.STREAMING, 'Streaming is currently disabled.');
@@ -1013,9 +1059,14 @@ export async function askGeminiStream(
 
   let lastError: unknown;
   let providerAttemptCount = 0;
-  let currentStream: AsyncIterable<{ text?: string; usageMetadata?: GeminiUsageMetadata }> | null = null;
+  type GeminiStreamChunk = {
+    text?: string;
+    usageMetadata?: GeminiUsageMetadata;
+    candidates?: Array<{ finishReason?: unknown; groundingMetadata?: GroundingMetadata }>;
+  };
+  let currentStream: AsyncIterable<GeminiStreamChunk> | null = null;
   const abortHandler = async () => {
-    const cancellableStream = currentStream as (AsyncIterable<{ text?: string; usageMetadata?: GeminiUsageMetadata }> & {
+    const cancellableStream = currentStream as (AsyncIterable<GeminiStreamChunk> & {
       return?: () => Promise<unknown>;
     }) | null;
     if (typeof cancellableStream?.return === 'function') {
@@ -1054,7 +1105,7 @@ export async function askGeminiStream(
         logger.info('Gemini stream aborted before provider request', { provider: 'gemini', kind: requestKind, model });
         const usage = normalizeGeminiUsage(model);
         onUsage?.(usage);
-        return { outcome: 'cancelled', text: '', usage };
+        return { outcome: 'cancelled', text: '', usage, grounding: extractGeminiGroundingInfo() };
       }
 
       let attempt = 1;
@@ -1062,9 +1113,10 @@ export async function askGeminiStream(
         let emittedTokenForModel = false;
         let completionText = '';
         let usageMetadata: GeminiUsageMetadata | undefined;
+        let groundingMetadata: GroundingMetadata | undefined;
         let finishReason: string | null = null;
         let attemptStartedAt = Date.now();
-        let streamIterator: AsyncIterator<{ text?: string; usageMetadata?: GeminiUsageMetadata }> | null = null;
+        let streamIterator: AsyncIterator<GeminiStreamChunk> | null = null;
         let attemptTimeout: ReturnType<typeof setTimeout> | null = null;
         let attemptTimedOut = false;
         const clearAttemptTimeout = () => {
@@ -1110,6 +1162,9 @@ export async function askGeminiStream(
                 safetySettings: SAFETY_SETTINGS,
                 ...getGeminiGenerationTuning(model),
                 maxOutputTokens: payload.maxOutputTokens,
+                ...(googleSearch && requestKind === 'chat' && model === NORMAL_CHAT_GOOGLE_SEARCH_MODEL
+                  ? { tools: [{ googleSearch: {} }] }
+                  : {}),
                 ...(providerAbortSignal ? { abortSignal: providerAbortSignal } : {}),
               },
             });
@@ -1144,6 +1199,9 @@ export async function askGeminiStream(
           if (chunk?.usageMetadata) {
             usageMetadata = chunk.usageMetadata;
           }
+          if (chunk?.candidates?.[0]?.groundingMetadata) {
+            groundingMetadata = chunk.candidates[0].groundingMetadata;
+          }
           const candidateFinishReason = (chunk as { candidates?: Array<{ finishReason?: unknown }> })?.candidates?.[0]?.finishReason;
           if (typeof candidateFinishReason === 'string') {
             finishReason = candidateFinishReason;
@@ -1166,8 +1224,9 @@ export async function askGeminiStream(
         if (abortSignal?.aborted) {
           logger.info('Gemini stream aborted while receiving content', { provider: 'gemini', kind: requestKind, model });
           const usage = normalizeGeminiUsage(model, usageMetadata);
+          const grounding = extractGeminiGroundingInfo(groundingMetadata);
           onUsage?.(usage);
-          return { outcome: 'cancelled', text: completionText.trim(), usage };
+          return { outcome: 'cancelled', text: completionText.trim(), usage, grounding };
         }
 
         if (!completionText.trim()) {
@@ -1177,6 +1236,7 @@ export async function askGeminiStream(
 
         geminiBreaker.recordSuccess();
         const usage = normalizeGeminiUsage(model, usageMetadata);
+        const grounding = extractGeminiGroundingInfo(groundingMetadata);
         onUsage?.(usage);
         const providerDurationMs = Date.now() - requestStartedAt;
         observeMonitoringLatency('gemini', providerDurationMs, { provider: 'gemini', operation: requestKind });
@@ -1198,15 +1258,19 @@ export async function askGeminiStream(
           latencyMs: Date.now() - requestStartedAt,
           responseSizeBytes: Buffer.byteLength(completionText, 'utf8'),
           ...(requestKind === 'chat' ? buildNormalChatModelTelemetry(requestedModel, model, fallbackReason) : {}),
+          ...(requestKind === 'chat' && googleSearch ? {
+            googleSearchUsed: grounding.usedGoogleSearch,
+            googleSearchQueryCount: grounding.queries.length,
+          } : {}),
         });
-          return { outcome: 'completed', text: completionText.trim(), usage };
+          return { outcome: 'completed', text: completionText.trim(), usage, grounding };
         } catch (error: unknown) {
           clearAttemptTimeout();
           if (abortSignal?.aborted) {
             logger.info('Gemini stream aborted during provider attempt', { provider: 'gemini', kind: requestKind, model });
             const usage = normalizeGeminiUsage(model, usageMetadata);
             onUsage?.(usage);
-            return { outcome: 'cancelled', text: completionText.trim(), usage };
+            return { outcome: 'cancelled', text: completionText.trim(), usage, grounding: extractGeminiGroundingInfo(groundingMetadata) };
           }
 
           // A stream may fail after Gemini has already emitted billable work.
@@ -1242,7 +1306,7 @@ export async function askGeminiStream(
             if (abortSignal?.aborted) {
               const usage = normalizeGeminiUsage(model, usageMetadata);
               onUsage?.(usage);
-              return { outcome: 'cancelled', text: completionText.trim(), usage };
+              return { outcome: 'cancelled', text: completionText.trim(), usage, grounding: extractGeminiGroundingInfo(groundingMetadata) };
             }
             continue;
           }

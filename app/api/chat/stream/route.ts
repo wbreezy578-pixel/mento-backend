@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../../lib/prisma';
-import { askGeminiStream, buildGeminiFailureTelemetry, GeminiMessage } from '../../../../services/geminiService';
+import { askGeminiStream, buildGeminiFailureTelemetry, GeminiMessage, NORMAL_CHAT_GOOGLE_SEARCH_MODEL, type GeminiGroundingInfo } from '../../../../services/geminiService';
 import {
   getConversationHistoryForAI,
   validateConversationOwnership,
@@ -24,6 +24,7 @@ import logger from '../../../../lib/logger';
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import { createSafeStreamWriter } from '../../../lib/streamUtils';
 import { observeMonitoringLatency } from '../../../../lib/monitoring';
+import { recordChatGoogleSearchUsage } from '../../../../lib/metrics';
 import { createHash } from 'node:crypto';
 import { acquireAIGenerationLock, releaseAIGenerationLock, startAIGenerationLockHeartbeat } from '../../../../lib/aiGenerationLock';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../lib/userSettings';
@@ -249,6 +250,7 @@ export async function POST(req: Request) {
         const { enqueue, close, isStreamClosed } = createSafeStreamWriter(controller, generationSignal);
         let assistantMessageId: string | null = null;
         let assistantText = '';
+        let googleSearchGrounding: GeminiGroundingInfo = { usedGoogleSearch: false, queries: [], sources: [] };
         let promptHash = '';
         let turnInitializationDurationMs: number | null = null;
         let contextPreparationDurationMs: number | null = null;
@@ -381,8 +383,9 @@ export async function POST(req: Request) {
               ];
               contextPreparationDurationMs = Date.now() - contextStartedAt;
 
-              const modelToUse = answerMode === 'short' && !validatedImage
-                ? 'gemini-3.1-flash-lite'
+              const useGoogleSearch = !validatedImage;
+              const modelToUse = useGoogleSearch
+                ? NORMAL_CHAT_GOOGLE_SEARCH_MODEL
                 : billingDecision.modelUsed ?? undefined;
               assistantText = '';
               geminiServiceStartedAt = Date.now();
@@ -459,7 +462,8 @@ export async function POST(req: Request) {
                 onProviderStart: () => {
                   if (geminiStartedAt === null) geminiStartedAt = Date.now();
                 },
-              });
+              }, useGoogleSearch);
+              googleSearchGrounding = generation.grounding;
 
               geminiFinishedAt = Date.now();
 
@@ -501,7 +505,19 @@ export async function POST(req: Request) {
           }
 
           if (!isStreamClosed()) {
+            if (googleSearchGrounding.sources.length > 0) {
+              enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'sources', sources: googleSearchGrounding.sources })}\n\n`));
+            }
             enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`));
+          }
+          if (!validatedImage) {
+            recordChatGoogleSearchUsage(googleSearchGrounding.usedGoogleSearch, googleSearchGrounding.queries.length);
+            logger.info('Normal chat Google Search grounding result', {
+              requestId,
+              usedGoogleSearch: googleSearchGrounding.usedGoogleSearch,
+              searchQueries: googleSearchGrounding.queries,
+              sourceCount: googleSearchGrounding.sources.length,
+            });
           }
           void refreshConversationSummarySafely(conversationId).catch((summaryError) => {
             logger.warn('Conversation summary refresh deferred after chat response', {

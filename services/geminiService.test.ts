@@ -1,12 +1,42 @@
 import { test } from 'vitest';
 import assert from 'node:assert/strict';
-import { boundGeminiContext, buildGeminiFailureTelemetry, buildGeminiHealthCheckResult, buildGeminiRequestPayload, buildNormalChatModelTelemetry, classifyGeminiError, extractLatestUserPrompt, getModelCandidatesForKind, isGeminiResponseSuccessful, normalizeGeminiUsage, shouldFallbackStreamingModel, shouldRetryChatGeminiAttempt, shouldTryNextGeminiModel } from './geminiService';
+import { boundGeminiContext, buildGeminiFailureTelemetry, buildGeminiHealthCheckResult, buildGeminiRequestPayload, buildNormalChatModelTelemetry, classifyGeminiError, extractGeminiGroundingInfo, extractLatestUserPrompt, getModelCandidatesForKind, isGeminiResponseSuccessful, NORMAL_CHAT_GOOGLE_SEARCH_MODEL, normalizeGeminiUsage, shouldFallbackStreamingModel, shouldRetryChatGeminiAttempt, shouldTryNextGeminiModel } from './geminiService';
 
 test('getModelCandidatesForKind uses a supported fallback chain', () => {
   const candidates = getModelCandidatesForKind('chat', 'gemini-3.5-flash');
 
   assert.deepEqual(candidates, ['gemini-3.5-flash', 'gemini-3.1-flash-lite']);
   assert.equal(candidates.includes('gemini-2.0-flash'), false);
+});
+
+test('normal chat uses Gemini 3.5 Flash-Lite for native Search grounding', () => {
+  assert.equal(NORMAL_CHAT_GOOGLE_SEARCH_MODEL, 'gemini-3.5-flash-lite');
+  assert.equal(getModelCandidatesForKind('chat', NORMAL_CHAT_GOOGLE_SEARCH_MODEL)[0], NORMAL_CHAT_GOOGLE_SEARCH_MODEL);
+});
+
+test('extractGeminiGroundingInfo preserves unique queries and HTTPS citation sources', () => {
+  const grounding = extractGeminiGroundingInfo({
+    webSearchQueries: [' latest NVIDIA news ', 'latest NVIDIA news', ''],
+    groundingChunks: [
+      { web: { uri: 'https://example.com/news', title: 'Example News' } },
+      { web: { uri: 'https://example.com/news', title: 'Duplicate' } },
+      { web: { uri: 'http://insecure.example.com', title: 'Insecure' } },
+    ],
+  });
+
+  assert.deepEqual(grounding, {
+    usedGoogleSearch: true,
+    queries: ['latest NVIDIA news'],
+    sources: [{ title: 'Example News', url: 'https://example.com/news' }],
+  });
+});
+
+test('extractGeminiGroundingInfo marks ordinary responses as not searched', () => {
+  assert.deepEqual(extractGeminiGroundingInfo(), {
+    usedGoogleSearch: false,
+    queries: [],
+    sources: [],
+  });
 });
 
 test('normal chat defaults to a supported model with a priced fallback', () => {

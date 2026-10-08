@@ -34,9 +34,9 @@ describe('Normal Chat cancellation lifecycle', () => {
   it('returns an explicit cancelled outcome before and after partial output', () => {
     const gemini = source('services/geminiService.ts');
     expect(gemini).toContain("outcome: 'completed' | 'cancelled'");
-    expect(gemini).toContain("return { outcome: 'cancelled', text: '', usage }");
-    expect(gemini).toContain("return { outcome: 'cancelled', text: completionText.trim(), usage }");
-    expect(gemini).toContain("return { outcome: 'completed', text: completionText.trim(), usage }");
+    expect(gemini).toContain("return { outcome: 'cancelled', text: '', usage, grounding: extractGeminiGroundingInfo() }");
+    expect(gemini).toContain("return { outcome: 'cancelled', text: completionText.trim(), usage, grounding: extractGeminiGroundingInfo(groundingMetadata) }");
+    expect(gemini).toContain("return { outcome: 'completed', text: completionText.trim(), usage, grounding }");
   });
 
   it('never persists a cancelled partial as a completed assistant response', () => {

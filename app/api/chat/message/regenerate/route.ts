@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { prisma } from '../../../../../lib/prisma';
-import { askGeminiStream, GeminiMessage } from '../../../../../services/geminiService';
+import { askGeminiStream, GeminiMessage, NORMAL_CHAT_GOOGLE_SEARCH_MODEL, type GeminiGroundingInfo } from '../../../../../services/geminiService';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -18,6 +18,7 @@ import { createSafeStreamWriter } from '../../../../lib/streamUtils';
 import { acquireAIGenerationLock, releaseAIGenerationLock, startAIGenerationLockHeartbeat } from '../../../../../lib/aiGenerationLock';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../../lib/userSettings';
 import { buildConversationSummaryReset, getRegenerationContextForAI } from '../../../../../lib/conversationDb';
+import { recordChatGoogleSearchUsage } from '../../../../../lib/metrics';
 import { createHash } from 'node:crypto';
 
 const CORS_METHODS = 'POST, OPTIONS';
@@ -126,6 +127,7 @@ export async function POST(req: Request) {
         const { enqueue, close, isStreamClosed } = createSafeStreamWriter(controller, generationSignal);
         let finalText = '';
         let deletedMessageIds: string[] = [];
+        let googleSearchGrounding: GeminiGroundingInfo = { usedGoogleSearch: false, queries: [], sources: [] };
 
         try {
           await executeAIRequest({
@@ -139,7 +141,7 @@ export async function POST(req: Request) {
             pending: true,
             securityInput: regeneratePrompt.trim(),
             securityContext: { conversationId },
-            callback: async ({ billingDecision, sanitizedInput, reportUsage, reportProviderAttempt }) => {
+            callback: async ({ sanitizedInput, reportUsage, reportProviderAttempt }) => {
               await generationLease.assertOwned();
               const safePrompt = sanitizedInput ?? regeneratePrompt.trim();
               const modeInstruction = answerMode === 'short'
@@ -150,7 +152,7 @@ export async function POST(req: Request) {
                 ...historyForAI,
                 { role: 'user', parts: [{ text: `${safePrompt}${modeInstruction}` }] },
               ];
-              const modelToUse = billingDecision.modelUsed ?? undefined;
+              const modelToUse = NORMAL_CHAT_GOOGLE_SEARCH_MODEL;
               const generation = await askGeminiStream(contents, async (token: string) => {
                 if (isStreamClosed()) {
                   return;
@@ -161,7 +163,8 @@ export async function POST(req: Request) {
               }, modelToUse, generationSignal, safePrompt, reportUsage, async (model) => {
                 await generationLease.assertOwned();
                 return reportProviderAttempt(model);
-              }, undefined, { requestId, normalChatRecovery: true });
+              }, undefined, { requestId, normalChatRecovery: true }, true);
+              googleSearchGrounding = generation.grounding;
               if (generationLease.signal.aborted) {
                 throw generationLease.signal.reason;
               }
@@ -200,7 +203,17 @@ export async function POST(req: Request) {
             },
           });
 
+          recordChatGoogleSearchUsage(googleSearchGrounding.usedGoogleSearch, googleSearchGrounding.queries.length);
+          logger.info('Normal chat regeneration Google Search grounding result', {
+            requestId,
+            usedGoogleSearch: googleSearchGrounding.usedGoogleSearch,
+            searchQueries: googleSearchGrounding.queries,
+            sourceCount: googleSearchGrounding.sources.length,
+          });
           if (!isStreamClosed()) {
+            if (googleSearchGrounding.sources.length > 0) {
+              enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'sources', sources: googleSearchGrounding.sources })}\n\n`));
+            }
             enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done', deletedMessageIds })}\n\n`));
           }
           close();

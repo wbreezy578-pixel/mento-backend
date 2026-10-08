@@ -20,9 +20,10 @@ describe('normal chat route security ordering', () => {
 
   it('uses sanitized input to construct regeneration contents', () => {
     const source = routeSource('app/api/chat/message/regenerate/route.ts');
-    expect(source).toContain('callback: async ({ billingDecision, sanitizedInput, reportUsage, reportProviderAttempt })');
+    expect(source).toContain('callback: async ({ sanitizedInput, reportUsage, reportProviderAttempt })');
     expect(source).toContain('const safePrompt = sanitizedInput ?? regeneratePrompt.trim()');
     expect(source).toContain('text: `${safePrompt}${modeInstruction}`');
+    expect(source).toContain('NORMAL_CHAT_GOOGLE_SEARCH_MODEL');
   });
 });
 

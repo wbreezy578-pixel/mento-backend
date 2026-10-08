@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { askGemini, GeminiMessage } from '../../../services/geminiService';
+import { askGemini, GeminiMessage, NORMAL_CHAT_GOOGLE_SEARCH_MODEL, type GeminiGroundingInfo } from '../../../services/geminiService';
 import {
   getConversationHistoryForAI,
   validateConversationOwnership,
@@ -12,6 +12,7 @@ import { MAX_IMAGE_BYTES, validateImageBuffer } from '../../../lib/imageValidato
 import { readJsonBodyWithLimit, RequestBodyError } from '../../../lib/requestBody';
 import logger from '../../../lib/logger';
 import { buildCorsHeaders } from '../../../lib/securityHeaders';
+import { recordChatGoogleSearchUsage } from '../../../lib/metrics';
 import { classifyAppError, createApiErrorResponse } from '../../../lib/errorHandling';
 import { acquireAIGenerationLock, releaseAIGenerationLock, startAIGenerationLockHeartbeat } from '../../../lib/aiGenerationLock';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../lib/userSettings';
@@ -172,6 +173,7 @@ export async function POST(req: Request) {
     }
     const generationLease = startAIGenerationLockHeartbeat(conversationId, generationOwnerId);
 
+    let googleSearchGrounding: GeminiGroundingInfo = { usedGoogleSearch: false, queries: [], sources: [] };
     try {
       const historyForAI = await getConversationHistoryForAI(conversationId);
 
@@ -208,11 +210,19 @@ export async function POST(req: Request) {
           userEntry,
         ];
 
-        const modelToUse = billingDecision.modelUsed ?? undefined;
+        const useGoogleSearch = !validatedImage;
+        const modelToUse = useGoogleSearch
+          ? NORMAL_CHAT_GOOGLE_SEARCH_MODEL
+          : billingDecision.modelUsed ?? undefined;
         return askGemini(contents, modelToUse, reportUsage, async (model) => {
           await generationLease.assertOwned();
           return reportProviderAttempt(model);
-        }, generationLease.signal);
+        }, generationLease.signal, useGoogleSearch ? {
+          googleSearch: true,
+          onGrounding: (grounding) => {
+            googleSearchGrounding = grounding;
+          },
+        } : undefined);
       },
       beforeFinalize: async (aiResponse) => {
         await generationLease.assertOwned();
@@ -238,7 +248,20 @@ export async function POST(req: Request) {
     });
 
       if (initialOperationId) await completeInitialChatOperation({ operationId: initialOperationId, userId, conversationId, responseText: result.result });
-      return NextResponse.json({ result: result.result, conversationId }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
+      if (!validatedImage) {
+        recordChatGoogleSearchUsage(googleSearchGrounding.usedGoogleSearch, googleSearchGrounding.queries.length);
+        logger.info('Normal chat Google Search grounding result', {
+          requestId,
+          usedGoogleSearch: googleSearchGrounding.usedGoogleSearch,
+          searchQueries: googleSearchGrounding.queries,
+          sourceCount: googleSearchGrounding.sources.length,
+        });
+      }
+      return NextResponse.json({
+        result: result.result,
+        conversationId,
+        sources: googleSearchGrounding.sources,
+      }, { headers: { ...buildCorsHeaders(req.headers.get('origin')), 'Access-Control-Allow-Methods': CORS_METHODS } });
     } catch (error) {
       if (initialOperationId) await failInitialChatOperation({ operationId: initialOperationId, userId, conversationId, errorCode: 'generation_failed' }).catch(() => undefined);
       throw error;

@@ -1,7 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
 import { Prisma } from '@prisma/client';
 import { askGemini, type GeminiMessage } from '../../../../services/geminiService';
-import { prisma } from '../../../../lib/prisma';
 import {
   AIRequestGatewayError,
   authenticateAIRequest,
@@ -15,19 +15,108 @@ import { readJsonBodyWithLimit, RequestBodyError } from '../../../../lib/request
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import logger from '../../../../lib/logger';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../lib/userSettings';
-import { isWebsiteType, parseWebsiteContent, type WebsiteContent, type WebsiteType } from '../../../../services/websiteContent';
+import { buildWebsiteTrustInstruction, isWebsiteType, parseWebsiteContact, parseWebsiteContent, type WebsiteContent, type WebsiteType } from '../../../../services/websiteContent';
 import { buildWebsiteGenerationInstruction } from '../../../../services/websiteDesignSystem';
-import { fillWebsiteImageSlots, type WebsiteAssetCreateData } from '../../../../services/websiteAssetService';
+import type { WebsiteAssetCreateData } from '../../../../services/websiteAssetService';
+import { buildWebsiteApiView } from '../../../../services/websiteAssetApi';
 import { createDraftWebsiteSlug, slugifyWebsiteName } from '../../../../services/websiteDeploymentService';
 import { assertWebsiteFeatureAccess, createWebsiteWithinProLimit, WebsiteAccessError } from '../../../../services/websiteBillingService';
+import { getVerifiedUnsplashPhoto, trackUnsplashPhotoDownload, UnsplashSearchError, type VerifiedUnsplashPhoto } from '../../../../services/unsplashService';
+import { isWebsTestingMode } from '../../../../services/websiteTestingMode';
 
 const CORS_METHODS = 'POST, OPTIONS';
-const MAX_BODY_BYTES = 12 * 1024;
+const MAX_BODY_BYTES = 32 * 1024;
 const MAX_PROMPT_LENGTH = 7000;
+const MAX_RESTAURANT_MENU_ITEMS = 24;
+const MAX_MENU_CATEGORIES = 12;
 
 interface GeneratedWebsite {
   content: WebsiteContent;
   assets: WebsiteAssetCreateData[];
+}
+
+interface SelectedImageInput {
+  requirementId: string;
+  role: 'hero' | 'gallery' | 'menu_item' | 'section';
+  query: string;
+  alt: string;
+  source: 'user_upload' | 'unsplash';
+  photoId?: string;
+  targetId?: string;
+}
+
+interface RequestedMenuItem {
+  id: string;
+  category: string;
+  name: string;
+  description: string;
+  price: string;
+  currency: string;
+}
+
+function parseRequestedMenuItems(value: unknown): RequestedMenuItem[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_RESTAURANT_MENU_ITEMS) return null;
+  const ids = new Set<string>();
+  const items: RequestedMenuItem[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+    const item = entry as Record<string, unknown>;
+    const id = typeof item.id === 'string' ? item.id : '';
+    const name = typeof item.name === 'string' ? item.name.trim() : '';
+    const category = typeof item.category === 'string' && item.category.trim() ? item.category.trim() : 'Main Dishes';
+    const description = typeof item.description === 'string' ? item.description.trim() : '';
+    const price = typeof item.price === 'string' ? item.price.trim() : '';
+    const currency = typeof item.currency === 'string' && item.currency.trim() ? item.currency.trim() : 'KSh';
+    if (
+      !/^[A-Za-z0-9_-]{1,80}$/.test(id) || ids.has(id)
+      || !name || name.length > 100 || category.length > 60 || description.length > 240
+      || price.length > 16 || (price && !/^\d{1,9}(?:[.,]\d{1,2})?$/.test(price))
+      || !/^[\p{L}]{1,8}$/u.test(currency)
+    ) return null;
+    ids.add(id);
+    items.push({ id, category, name, description, price, currency });
+  }
+  if (new Set(items.map((item) => item.category)).size > MAX_MENU_CATEGORIES) return null;
+  return items;
+}
+
+function parseSelectedImages(value: unknown): SelectedImageInput[] | null {
+  if (!Array.isArray(value) || value.length > 32) return null;
+  const ids = new Set<string>();
+  const selections: SelectedImageInput[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const entry = item as Record<string, unknown>;
+    if (
+      typeof entry.requirementId !== 'string'
+      || !/^[a-z0-9][a-z0-9_-]{0,59}$/.test(entry.requirementId)
+      || ids.has(entry.requirementId)
+      || !['hero', 'gallery', 'menu_item', 'section'].includes(String(entry.role))
+      || typeof entry.query !== 'string' || !entry.query.trim() || entry.query.length > 120
+      || typeof entry.alt !== 'string' || !entry.alt.trim() || entry.alt.length > 180
+      || !['user_upload', 'unsplash'].includes(String(entry.source))
+      || (entry.source === 'unsplash' && (
+        typeof entry.photoId !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(entry.photoId)
+      ))
+      || (entry.source === 'user_upload' && entry.photoId !== undefined)
+      || (entry.targetId !== undefined && (
+        typeof entry.targetId !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(entry.targetId)
+        || entry.role !== 'menu_item'
+      ))
+    ) return null;
+    ids.add(entry.requirementId);
+    selections.push({
+      requirementId: entry.requirementId,
+      role: entry.role as SelectedImageInput['role'],
+      query: entry.query.trim(),
+      alt: entry.alt.trim(),
+      source: entry.source as SelectedImageInput['source'],
+      ...(entry.source === 'unsplash' ? { photoId: entry.photoId as string } : {}),
+      ...(typeof entry.targetId === 'string' ? { targetId: entry.targetId } : {}),
+    });
+  }
+  return selections;
 }
 
 function jsonHeaders(request: Request) {
@@ -42,13 +131,14 @@ export async function OPTIONS(req: Request) {
 }
 
 export async function POST(req: Request) {
+  let persistedWebsite: { id: string; content: unknown } | null = null;
   try {
     const user = await authenticateAIRequest(req);
     const userId = user.id;
     const clientIp = getClientIp(req);
     await enforceAIGatewayRateLimit(userId, clientIp);
 
-    let body: { title?: unknown; type?: unknown; brief?: unknown; requestId?: unknown };
+    let body: { title?: unknown; type?: unknown; brief?: unknown; fullPrompt?: unknown; selectedImages?: unknown; menuItems?: unknown; businessDetails?: unknown; requestId?: unknown };
     try {
       body = await readJsonBodyWithLimit(req, MAX_BODY_BYTES);
     } catch (error) {
@@ -58,13 +148,25 @@ export async function POST(req: Request) {
 
     const title = typeof body.title === 'string' ? body.title.trim() : '';
     const brief = typeof body.brief === 'string' ? body.brief.trim() : '';
-    if (!title || title.length > 100 || !brief || brief.length > MAX_PROMPT_LENGTH || !isWebsiteType(body.type)) {
-      return NextResponse.json({ error: 'Add a website name, a supported type, and a brief under 7,000 characters.', code: 'invalid_website_request' }, { status: 400, headers: jsonHeaders(req) });
+    const fullPrompt = typeof body.fullPrompt === 'string' ? body.fullPrompt.trim() : '';
+    const selectedImages = parseSelectedImages(body.selectedImages);
+    const requestedMenuItems = parseRequestedMenuItems(body.menuItems);
+    const businessDetails = parseWebsiteContact(body.businessDetails ?? {
+      address: '', phone: '', whatsappNumber: '', mapsUrl: '', email: '',
+      openingHours: '', serviceArea: '', servicesAndPricing: '', testimonials: '', bookingUrl: '',
+    });
+    if (!title || title.length > 100 || !brief || brief.length > 600 || !fullPrompt || fullPrompt.length > MAX_PROMPT_LENGTH || !isWebsiteType(body.type) || !selectedImages || !requestedMenuItems || !businessDetails || (body.type !== 'restaurant' && requestedMenuItems.length > 0)) {
+      return NextResponse.json({ error: 'Add a website name, supported type, short description, full website prompt, valid business details, and image selections.', code: 'invalid_website_request' }, { status: 400, headers: jsonHeaders(req) });
+    }
+    const requestedMenuIds = new Set(requestedMenuItems.map((item) => item.id));
+    if (selectedImages.some((selection) => selection.role === 'menu_item' && selection.targetId && !requestedMenuIds.has(selection.targetId))) {
+      return NextResponse.json({ error: 'A selected menu photo does not match a menu item in this request.', code: 'invalid_menu_image_target' }, { status: 400, headers: jsonHeaders(req) });
     }
     if (!slugifyWebsiteName(title)) {
       return NextResponse.json({ error: 'Choose a website name that can be used in a website address.', code: 'invalid_website_slug' }, { status: 400, headers: jsonHeaders(req) });
     }
     const draftSlug = createDraftWebsiteSlug(title);
+    const websiteId = randomUUID();
 
     try {
       await assertWebsiteFeatureAccess(userId, 'create');
@@ -75,12 +177,44 @@ export async function POST(req: Request) {
       throw error;
     }
 
-    const requestId = requireClientAIRequestId(req, body.requestId);
-    const prompt = JSON.stringify({ type: body.type, title, brief });
-    const securityDecision = await secureAITextInput({ userId, requestId, ip: clientIp, input: prompt });
-    let persistedWebsite: unknown = null;
+    const unsplashSelections = selectedImages.filter((selection) => selection.source === 'unsplash');
+    if (unsplashSelections.length && !isWebsTestingMode()) {
+      return NextResponse.json({ error: 'Mento photos are unavailable.', code: 'photo_source_unavailable' }, { status: 404, headers: jsonHeaders(req) });
+    }
+    const verifiedPhotos = new Map<string, VerifiedUnsplashPhoto>();
+    try {
+      const verified = await Promise.all(unsplashSelections.map((selection) => getVerifiedUnsplashPhoto(selection.photoId!)));
+      unsplashSelections.forEach((selection, index) => verifiedPhotos.set(selection.requirementId, verified[index]));
+    } catch (error) {
+      logger.warn('Selected Unsplash photo could not be verified', {
+        category: 'unsplash_photo_verification_failed',
+        errorName: error instanceof Error ? error.name : 'UnknownError',
+      });
+      if (error instanceof UnsplashSearchError && error.kind !== 'invalid_response') {
+        const status = error.kind === 'rate_limited' || error.kind === 'demo_rate_limited' ? 429 : 503;
+        return NextResponse.json({
+          error: 'Mento photos are temporarily unavailable. Try again shortly.',
+          code: 'photo_provider_unavailable',
+          retryable: true,
+        }, {
+          status,
+          headers: {
+            ...jsonHeaders(req),
+            ...(error.retryAfterSec ? { 'Retry-After': String(Math.ceil(error.retryAfterSec)) } : {}),
+          },
+        });
+      }
+      return NextResponse.json({
+        error: 'One of the selected photos is no longer available. Search again and choose another photo.',
+        code: 'unsplash_photo_unavailable',
+      }, { status: 422, headers: jsonHeaders(req) });
+    }
 
-    const { result: generated, billingDecision } = await executeAIRequest<GeneratedWebsite>({
+    const requestId = requireClientAIRequestId(req, body.requestId);
+    const prompt = JSON.stringify({ type: body.type, title, brief, fullPrompt, businessDetails, menuItems: requestedMenuItems, selectedImages });
+    const securityDecision = await secureAITextInput({ userId, requestId, ip: clientIp, input: prompt });
+
+    const { billingDecision } = await executeAIRequest<GeneratedWebsite>({
       user,
       clientIp,
       feature: 'website',
@@ -91,33 +225,242 @@ export async function POST(req: Request) {
       securityInput: prompt,
       securityDecision,
       callback: async ({ billingDecision: decision, sanitizedInput, reportUsage, reportProviderAttempt }) => {
+        const selectedImageInstructions = selectedImages.map((selection) => ({
+            requirementId: selection.requirementId,
+            role: selection.role,
+            ...(selection.targetId ? { targetId: selection.targetId } : {}),
+            query: selection.query,
+            alt: selection.alt,
+            provider: selection.source,
+          }));
+        const menuInstructions = requestedMenuItems.length
+          ? `\n\nPreserve these user-provided menu names and prices exactly:\n${JSON.stringify(requestedMenuItems)}`
+          : '';
+        const userPrompt = `${brief}\n\n${fullPrompt}\n\nOwner-provided trust details (preserve exactly; omit empty values):\n${JSON.stringify(businessDetails)}${menuInstructions}\n\nSelected image assets (use these exact requirement IDs, roles, and menu targets; do not substitute or invent image URLs):\n${JSON.stringify(selectedImageInstructions)}`;
         const language = await getTutorLanguage(userId);
         const contents: GeminiMessage[] = [
           {
             role: 'system',
-            parts: [{ text: `${buildTutorLanguageInstruction(language)}\n${buildWebsiteGenerationInstruction(body.type as WebsiteType)}\n\nReturn JSON with this exact shape: {"type":"business|restaurant|portfolio|professional|other","title":"...","description":"...","designPreset":"coastal-editorial|trustworthy-professional|creative-portfolio|local-service|modern-business","theme":{"primaryColor":"#123456"},"pages":[{"id":"stable-id","title":"...","slug":"...","sections":[{"id":"stable-id","type":"hero|about|services|menu|gallery|location|contact|whatsapp","title":"...","body":"...","imageSlotId":null}]}],"menuCategories":[{"id":"stable-id","name":"...","items":[{"id":"stable-id","name":"...","description":"...","price":"650","currency":"KSh","imageUrl":null,"imageSlotId":null,"available":true}]}],"imageSlots":[{"id":"stable-id","role":"hero|gallery|menu_item|section","targetId":"existing section or item id, or null","query":"specific stock photo search query","alt":"descriptive alt text","assetId":null}],"galleryImageUrls":[],"contact":{"address":"...","phone":"...","whatsappNumber":"..."}}. Use 2 to 6 pages, no more than 3 imageSlots, and do not invent contact details, menu prices, or factual claims. The imageSlots request imagery only; never return image URLs. Image slot targets must refer to an existing section or menu item. For restaurants, create menu categories/items only when requested. Return JSON only.` }],
+            parts: [{ text: `${buildTutorLanguageInstruction(language)}\n${buildWebsiteGenerationInstruction(body.type as WebsiteType)}\n${buildWebsiteTrustInstruction()}\n\nReturn JSON with this exact shape: {"type":"business|restaurant|portfolio|professional|other","title":"...","description":"...","designPreset":"coastal-editorial|trustworthy-professional|creative-portfolio|local-service|modern-business","theme":{"primaryColor":"#123456","secondaryColor":"#345678","backgroundColor":"#F8F8F5","surfaceColor":"#EEEEEA"},"pages":[{"id":"stable-id","title":"...","slug":"...","sections":[{"id":"stable-id","type":"hero|about|services|menu|gallery|location|contact|whatsapp","title":"...","body":"...","imageSlotId":null,"layoutVariant":"cinematic|split|centered-editorial (hero only)"}]}],"menuCategories":[{"id":"stable-id","name":"...","items":[{"id":"stable-id","name":"...","description":"...","price":"650","currency":"KSh","imageUrl":null,"imageSlotId":null,"available":true}]}],"imageSlots":[{"id":"selected requirementId","role":"hero|gallery|menu_item|section","targetId":"existing section or menu item id, or null","query":"selected image requirement query","alt":"selected image alternative text","assetId":null}],"galleryImageUrls":[],"contact":{"address":"","phone":"","whatsappNumber":"","mapsUrl":"","email":"","openingHours":"","serviceArea":"","servicesAndPricing":"","testimonials":"","bookingUrl":""}}. Use 2 to 6 pages and create exactly one image slot for each selected image, with the exact requirementId, role, query, and alt text supplied. If no images are selected, return an empty imageSlots array and do not add any image slots. Attach each selected hero image to the hero section, menu_item images to a relevant menu item, gallery images to the gallery, and section images to the most relevant about/services section. Do not add unselected images, substitute selected images, or return image URLs. Do not invent contact details, menu prices, or factual claims. For restaurants, create menu categories/items only when requested. Return JSON only.` }],
           },
-          { role: 'user', parts: [{ text: sanitizedInput ?? prompt }] },
+          { role: 'user', parts: [{ text: sanitizedInput ?? userPrompt }] },
         ];
         const model = decision.modelUsed ?? undefined;
         const generationOptions = { responseMimeType: 'application/json', maxOutputTokens: 8192 };
         const response = await askGemini(contents, model, reportUsage, reportProviderAttempt, req.signal, generationOptions);
+        let parsed: WebsiteContent;
         try {
-          const parsed = parseWebsiteContent(response, body.type as WebsiteType);
-          return await fillWebsiteImageSlots(parsed);
+          parsed = parseWebsiteContent(response, body.type as WebsiteType);
         } catch {
           const repairedResponse = await askGemini([
             ...contents,
             { role: 'model', parts: [{ text: response }] },
             { role: 'user', parts: [{ text: 'The previous response did not match the required website JSON shape. Return a corrected complete JSON object only. Preserve the requested website content and do not include code.' }] },
           ], model, reportUsage, reportProviderAttempt, req.signal, generationOptions);
-          const parsed = parseWebsiteContent(repairedResponse, body.type as WebsiteType);
-          return await fillWebsiteImageSlots(parsed);
+          parsed = parseWebsiteContent(repairedResponse, body.type as WebsiteType);
         }
+        parsed = { ...parsed, contact: businessDetails };
+        const parsedSlots = new Map(parsed.imageSlots.map((slot) => [slot.id, slot]));
+        if (parsed.imageSlots.length !== selectedImages.length) {
+          throw new Error('Gemini did not preserve your image choices. Please try generating again.');
+        }
+        for (const selection of selectedImages) {
+          const slot = parsedSlots.get(selection.requirementId);
+          if (!slot || slot.role !== selection.role) {
+            throw new Error(`Gemini could not attach the selected ${selection.role} image to its required website section. Please try generating again.`);
+          }
+        }
+
+        const menuItemIdByRequestId = new Map<string, string>();
+        if (requestedMenuItems.length) {
+          const selectedMenuSlotByTarget = new Map(
+            selectedImages
+              .filter((selection) => selection.role === 'menu_item' && selection.targetId)
+              .map((selection) => [selection.targetId!, selection.requirementId]),
+          );
+          const groupedItems = new Map<string, RequestedMenuItem[]>();
+          for (const item of requestedMenuItems) {
+            const group = groupedItems.get(item.category) ?? [];
+            group.push(item);
+            groupedItems.set(item.category, group);
+          }
+          const menuCategories = [...groupedItems.entries()].map(([category, items]) => ({
+            id: `category-${randomUUID()}`,
+            name: category,
+            items: items.map((item) => {
+              const id = `menu-${randomUUID()}`;
+              menuItemIdByRequestId.set(item.id, id);
+              return {
+                id,
+                name: item.name,
+                description: item.description,
+                price: item.price,
+                currency: item.currency,
+                imageUrl: null,
+                imageSlotId: selectedMenuSlotByTarget.get(item.id) ?? null,
+                available: true,
+              };
+            }),
+          }));
+          parsed = { ...parsed, menuCategories };
+        }
+
+        const assets: WebsiteAssetCreateData[] = selectedImages.flatMap((selection): WebsiteAssetCreateData[] => {
+          const photo = verifiedPhotos.get(selection.requirementId);
+          if (!photo) return [];
+          return [{
+            id: randomUUID(),
+            slotId: selection.requirementId,
+            source: 'unsplash',
+            providerAssetId: photo.id,
+            objectKey: null,
+            remoteUrl: photo.imageUrl,
+            providerImageUrl: photo.imageUrl,
+            providerTags: [],
+            searchQuery: selection.query,
+            retrievedAt: new Date(),
+            licenseName: 'Unsplash License',
+            licenseUrl: 'https://unsplash.com/license',
+            attributionRequired: true,
+            version: 1,
+            sourcePageUrl: photo.sourcePageUrl,
+            creatorName: photo.creatorName,
+            creatorProfileUrl: photo.creatorProfileUrl,
+            alt: selection.alt || photo.alt,
+            mimeType: 'image/jpeg',
+            width: photo.width || null,
+            height: photo.height || null,
+          }];
+        });
+        const heroSelection = selectedImages.find((selection) => selection.role === 'hero');
+        const sectionSelections = selectedImages.filter((selection) => selection.role === 'section');
+        const assignedSectionIds = new Set<string>();
+        const nextPages = parsed.pages.map((page) => ({
+          ...page,
+          sections: page.sections.map((section) => {
+            if (heroSelection && section.type === 'hero') {
+              return { ...section, imageSlotId: heroSelection.requirementId };
+            }
+            const explicitSelection = ['about', 'services'].includes(section.type)
+              ? sectionSelections.find((selection) => selection.requirementId === section.imageSlotId)
+              : undefined;
+            if (explicitSelection) {
+              assignedSectionIds.add(explicitSelection.requirementId);
+              return { ...section, imageSlotId: explicitSelection.requirementId };
+            }
+            if (section.type === 'about' || section.type === 'services') {
+              const nextSelection = sectionSelections.find((selection) => !assignedSectionIds.has(selection.requirementId));
+              if (nextSelection) {
+                assignedSectionIds.add(nextSelection.requirementId);
+                return { ...section, imageSlotId: nextSelection.requirementId };
+              }
+            }
+            return section;
+          }),
+        }));
+        const homePage = nextPages[0];
+        const appendHomeSection = (section: typeof homePage.sections[number]) => {
+          if (homePage.sections.length >= 12) return false;
+          homePage.sections.push(section);
+          return true;
+        };
+        const usedSectionIds = new Set(nextPages.flatMap((page) => page.sections.map((section) => section.id)));
+        const createSectionId = (base: string) => {
+          const stem = base.slice(0, 70);
+          let candidate = stem;
+          let suffix = 2;
+          while (usedSectionIds.has(candidate)) {
+            candidate = `${stem}-${suffix}`.slice(0, 80);
+            suffix += 1;
+          }
+          usedSectionIds.add(candidate);
+          return candidate;
+        };
+        if (heroSelection && !nextPages.some((page) => page.sections.some((section) => section.type === 'hero'))) {
+          if (homePage.sections.length < 12) {
+            homePage.sections.unshift({
+              id: createSectionId(`hero-${heroSelection.requirementId}`),
+              type: 'hero',
+              title: parsed.title,
+              body: parsed.description,
+              imageSlotId: heroSelection.requirementId,
+            });
+          } else {
+            homePage.sections[0] = { ...homePage.sections[0], imageSlotId: heroSelection.requirementId };
+          }
+        }
+        for (const selection of sectionSelections.filter((item) => !assignedSectionIds.has(item.requirementId))) {
+          if (appendHomeSection({
+            id: createSectionId(`about-${selection.requirementId}`),
+            type: 'about',
+            title: selection.alt,
+            body: '',
+            imageSlotId: selection.requirementId,
+          })) assignedSectionIds.add(selection.requirementId);
+        }
+        if (selectedImages.some((selection) => selection.role === 'gallery') && !nextPages.some((page) => page.sections.some((section) => section.type === 'gallery'))) {
+          appendHomeSection({
+            id: createSectionId('selected-image-gallery'),
+            type: 'gallery',
+            title: 'Gallery',
+            body: '',
+            imageSlotId: null,
+          });
+        }
+        if (selectedImages.some((selection) => selection.role === 'menu_item') && !nextPages.some((page) => page.sections.some((section) => section.type === 'menu'))) {
+          appendHomeSection({
+            id: createSectionId('selected-image-menu'),
+            type: 'menu',
+            title: 'Featured',
+            body: '',
+            imageSlotId: null,
+          });
+        }
+        const nextSlots = parsed.imageSlots.map((slot) => {
+          const selection = selectedImages.find((item) => item.requirementId === slot.id);
+          if (!selection) return slot;
+          const targetSection = nextPages.flatMap((page) => page.sections).find((section) =>
+            section.imageSlotId === selection.requirementId
+            && ['hero', 'about', 'services'].includes(section.type),
+          );
+          const targetGallery = selection.role === 'gallery'
+            ? nextPages.flatMap((page) => page.sections).find((section) => section.type === 'gallery')
+            : undefined;
+          return {
+            ...slot,
+            query: selection.query,
+            alt: selection.alt,
+            role: selection.role,
+            targetId: selection.role === 'menu_item' && selection.targetId
+              ? menuItemIdByRequestId.get(selection.targetId) ?? slot.targetId
+              : targetSection?.id ?? targetGallery?.id ?? slot.targetId,
+          };
+        });
+        const nextMenuCategories = parsed.menuCategories.map((category) => ({
+          ...category,
+          items: category.items.map((item) => {
+            const menuSelection = selectedImages.find((selection) =>
+              selection.role === 'menu_item'
+              && (selection.targetId ? menuItemIdByRequestId.get(selection.targetId) === item.id : selection.requirementId === item.imageSlotId),
+            );
+            return menuSelection ? { ...item, imageSlotId: menuSelection.requirementId } : item;
+          }),
+        }));
+        const contentWithAssets = {
+          ...parsed,
+          pages: nextPages,
+          menuCategories: nextMenuCategories,
+          imageSlots: nextSlots.map((slot) => {
+            const asset = assets.find((candidate) => candidate.slotId === slot.id);
+            return asset ? { ...slot, assetId: asset.id } : slot;
+          }),
+        };
+        return { content: contentWithAssets, assets };
       },
       beforeFinalize: async ({ content: generatedContent, assets }) => {
         persistedWebsite = await createWebsiteWithinProLimit(userId, async (tx) => tx.website.create({
           data: {
+            id: websiteId,
             userId,
             type: body.type as string,
             title: generatedContent.title,
@@ -143,7 +486,19 @@ export async function POST(req: Request) {
     if (!persistedWebsite) {
       throw new Error('Website persistence did not complete.');
     }
-    return NextResponse.json({ website: persistedWebsite, billing: billingDecision }, { status: 201, headers: jsonHeaders(req) });
+    const trackedPhotos = [...verifiedPhotos.values()];
+    const trackingResults = await Promise.allSettled(trackedPhotos.map((photo) => trackUnsplashPhotoDownload(photo.downloadLocation)));
+    const trackingFailures = trackingResults.filter((result) => result.status === 'rejected').length;
+    if (trackingFailures) {
+      logger.error('Unsplash download tracking failed after website image selection', {
+        category: 'unsplash_download_tracking_failed',
+        failureCount: trackingFailures,
+      });
+    }
+    return NextResponse.json({
+      website: await buildWebsiteApiView(persistedWebsite),
+      billing: billingDecision,
+    }, { status: 201, headers: jsonHeaders(req) });
   } catch (error) {
     if (error instanceof RequestBodyError) {
       return NextResponse.json({ error: error.message, code: error.code }, { status: error.status, headers: jsonHeaders(req) });

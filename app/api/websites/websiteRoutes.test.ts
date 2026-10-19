@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   authenticateAIRequest: vi.fn(),
@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
     deleteMany: vi.fn(),
   },
   websiteVersion: { findFirst: vi.fn(), create: vi.fn() },
+  websiteAsset: { findMany: vi.fn(), create: vi.fn() },
   websiteDeployment: { create: vi.fn(), findFirst: vi.fn(), findMany: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   websiteDomain: { create: vi.fn(), findFirst: vi.fn(), findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn() },
   websiteReport: { create: vi.fn(), findMany: vi.fn() },
@@ -32,9 +33,19 @@ const mocks = vi.hoisted(() => ({
   securityEvent: { create: vi.fn() },
   transaction: vi.fn(),
   uploadWebsiteDeployment: vi.fn(),
+  readPrivateWebsiteUpload: vi.fn(),
+  savePrivateWebsiteUpload: vi.fn(),
+  uploadPrivateWebsiteAssetToR2: vi.fn(),
+  deletePrivateWebsiteAssetFromR2: vi.fn(),
+  buildWebsiteApiView: vi.fn(),
+  deletePrivateWebsiteUpload: vi.fn(),
   deleteWebsiteDeploymentArtifacts: vi.fn(),
   loggerError: vi.fn(),
   ensureWebsiteWorkerDomain: vi.fn(),
+  isWebsTestingMode: vi.fn(),
+  getVerifiedUnsplashPhoto: vi.fn(),
+  trackUnsplashPhotoDownload: vi.fn(),
+  getWebsiteImageGenerationUsage: vi.fn(),
 }));
 
 vi.mock('../../../lib/aiSecurityGateway', () => ({
@@ -55,6 +66,7 @@ vi.mock('../../../lib/prisma', () => ({
   prisma: {
     website: mocks.website,
     websiteVersion: mocks.websiteVersion,
+    websiteAsset: mocks.websiteAsset,
     websiteDeployment: mocks.websiteDeployment,
     websiteDomain: mocks.websiteDomain,
     websiteReport: mocks.websiteReport,
@@ -73,10 +85,30 @@ vi.mock('../../../services/websiteDeploymentStorage', async (importOriginal) => 
   ...(await importOriginal<typeof import('../../../services/websiteDeploymentStorage')>()),
   uploadWebsiteDeployment: mocks.uploadWebsiteDeployment,
   deleteWebsiteDeploymentArtifacts: mocks.deleteWebsiteDeploymentArtifacts,
+  uploadPrivateWebsiteAssetToR2: mocks.uploadPrivateWebsiteAssetToR2,
+  deletePrivateWebsiteAssetFromR2: mocks.deletePrivateWebsiteAssetFromR2,
 }));
 vi.mock('../../../services/websiteCloudflareDomainService', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../services/websiteCloudflareDomainService')>()),
   ensureWebsiteWorkerDomain: mocks.ensureWebsiteWorkerDomain,
+}));
+vi.mock('../../../services/websiteAssetService', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../services/websiteAssetService')>()),
+  readPrivateWebsiteUpload: mocks.readPrivateWebsiteUpload,
+  savePrivateWebsiteUpload: mocks.savePrivateWebsiteUpload,
+  deletePrivateWebsiteUpload: mocks.deletePrivateWebsiteUpload,
+}));
+vi.mock('../../../services/websiteAssetApi', () => ({
+  buildWebsiteApiView: mocks.buildWebsiteApiView,
+}));
+vi.mock('../../../services/websiteTestingMode', () => ({ isWebsTestingMode: mocks.isWebsTestingMode }));
+vi.mock('../../../services/websiteImageGenerationQuota', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../services/websiteImageGenerationQuota')>()),
+  getWebsiteImageGenerationUsage: mocks.getWebsiteImageGenerationUsage,
+}));
+vi.mock('../../../services/unsplashService', () => ({
+  getVerifiedUnsplashPhoto: mocks.getVerifiedUnsplashPhoto,
+  trackUnsplashPhotoDownload: mocks.trackUnsplashPhotoDownload,
 }));
 vi.mock('../../../lib/userSettings', () => ({
   getTutorLanguage: mocks.getTutorLanguage,
@@ -87,16 +119,22 @@ vi.mock('../../../lib/logger', () => ({ default: { error: mocks.loggerError, inf
 import { GET as listWebsites } from './route';
 import { GET as getWebsiteBilling } from './billing/route';
 import { POST as generateWebsite } from './generate/route';
-import { PATCH as updateWebsite } from './[websiteId]/route';
+import { POST as analyzeWebsiteImageRequirements } from './image-requirements/route';
+import { DELETE as deleteWebsite, GET as getWebsite, PATCH as updateWebsite } from './[websiteId]/route';
 import { POST as editWebsite } from './[websiteId]/edit/route';
 import { POST as restoreWebsite } from './[websiteId]/restore/route';
 import { POST as renameWebsite } from './[websiteId]/rename/route';
 import { POST as duplicateWebsite } from './[websiteId]/duplicate/route';
 import { POST as publishWebsite } from './[websiteId]/publish/route';
 import { POST as unpublishWebsite } from './[websiteId]/unpublish/route';
+import { POST as selectWebsitePhoto } from './[websiteId]/images/select/route';
 import { GET as publicWebsite } from './public/route';
 import { createDraftWebsiteSlug, isWebsiteSlugUniqueConstraintError, slugifyWebsiteName } from '../../../services/websiteDeploymentService';
 import { getWebsiteHostingEntitlement } from '../../../services/websiteBillingService';
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 const content = {
   title: 'Bella Restaurant',
@@ -205,6 +243,27 @@ describe('Websites API ownership and AI contract', () => {
     mocks.getTutorLanguage.mockResolvedValue('en');
     mocks.buildTutorLanguageInstruction.mockReturnValue('Respond in English.');
     mocks.askGemini.mockResolvedValue(JSON.stringify(content));
+    mocks.isWebsTestingMode.mockReturnValue(false);
+    mocks.getWebsiteImageGenerationUsage.mockResolvedValue({
+      limit: 15,
+      generated: 0,
+      remaining: 15,
+      resetsAt: '2027-01-01T00:00:00.000Z',
+    });
+    mocks.getVerifiedUnsplashPhoto.mockResolvedValue({
+      id: 'photo-1',
+      imageUrl: 'https://images.unsplash.com/photo-1?ixid=demo',
+      previewUrl: 'https://images.unsplash.com/photo-1?w=400',
+      sourcePageUrl: 'https://unsplash.com/photos/photo-1?utm_source=mento&utm_medium=referral',
+      creatorName: 'Photographer',
+      creatorProfileUrl: 'https://unsplash.com/@photographer?utm_source=mento&utm_medium=referral',
+      alt: 'Coastal restaurant',
+      width: 1200,
+      height: 800,
+      averageColor: null,
+      downloadLocation: 'https://api.unsplash.com/photos/photo-1/download',
+    });
+    mocks.trackUnsplashPhotoDownload.mockResolvedValue(undefined);
     mocks.website.create.mockResolvedValue({ ...ownerWebsite, versions: [{ id: 'version-1', version: 1, source: 'initial', summary: 'Initial website', content }] });
     mocks.website.count.mockResolvedValue(0);
     mocks.website.findUnique.mockResolvedValue(null);
@@ -224,6 +283,7 @@ describe('Websites API ownership and AI contract', () => {
       createdAt: new Date('2026-10-01T00:00:00Z'),
     });
     mocks.websiteHostingAccount.findUnique.mockResolvedValue(null);
+    mocks.websiteAsset.findMany.mockResolvedValue([]);
     mocks.websiteVersion.findFirst.mockResolvedValue({ content });
     mocks.websiteDomain.findFirst.mockResolvedValue(null);
     mocks.websiteDomain.findUnique.mockResolvedValue(null);
@@ -239,6 +299,19 @@ describe('Websites API ownership and AI contract', () => {
       artifactSize: 100,
       manifest: {},
     });
+    mocks.readPrivateWebsiteUpload.mockResolvedValue(Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+    mocks.savePrivateWebsiteUpload.mockResolvedValue({
+      objectKey: 'website-assets/user-1/site-1/image.jpg',
+      mimeType: 'image/jpeg',
+      width: 1200,
+      height: 800,
+      previewUrl: 'https://storage.test/preview',
+      buffer: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+    });
+    mocks.uploadPrivateWebsiteAssetToR2.mockResolvedValue('websites/site-1/assets/asset-1/image.jpg');
+    mocks.deletePrivateWebsiteAssetFromR2.mockResolvedValue(undefined);
+    mocks.buildWebsiteApiView.mockImplementation(async (website: unknown) => website);
+    mocks.deletePrivateWebsiteUpload.mockResolvedValue(undefined);
     mocks.deleteWebsiteDeploymentArtifacts.mockResolvedValue(undefined);
     mocks.storePurchase.findFirst.mockResolvedValue(null);
     mocks.transaction.mockImplementation(async (callback: (tx: any) => Promise<unknown>) => callback({
@@ -250,6 +323,7 @@ describe('Websites API ownership and AI contract', () => {
         updateMany: mocks.website.updateMany,
         findFirst: mocks.website.findFirst,
       },
+      websiteAsset: mocks.websiteAsset,
       websiteVersion: mocks.websiteVersion,
       websiteDomain: mocks.websiteDomain,
       usageLog: { count: mocks.usageLog.count },
@@ -266,11 +340,16 @@ describe('Websites API ownership and AI contract', () => {
     });
   });
 
-  it('lists only the authenticated user\'s non-deleted websites', async () => {
+  it('lists only metadata for the authenticated user\'s non-deleted websites', async () => {
     mocks.website.findMany.mockResolvedValue([{
-      ...ownerWebsite,
+      id: ownerWebsite.id,
+      title: ownerWebsite.title,
+      type: ownerWebsite.type,
       status: 'published',
-      deletedAt: null,
+      revision: ownerWebsite.revision,
+      currentVersion: ownerWebsite.currentVersion,
+      createdAt: ownerWebsite.createdAt,
+      updatedAt: ownerWebsite.updatedAt,
       versions: [{ id: 'version-1', version: 1, source: 'initial', summary: 'Initial website', changeType: 'initial', createdAt: new Date() }],
       domains: [{ hostname: 'web-bella.trymentoapp.com' }],
     }]);
@@ -281,12 +360,198 @@ describe('Websites API ownership and AI contract', () => {
     expect(response.status).toBe(200);
     expect(mocks.website.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { userId: 'user-1', deletedAt: null },
-      include: expect.objectContaining({
+      select: expect.objectContaining({
+        id: true,
+        title: true,
+        type: true,
+        status: true,
+        revision: true,
+        currentVersion: true,
+        createdAt: true,
+        updatedAt: true,
         domains: { where: { kind: 'mento_subdomain', status: 'active' }, select: { hostname: true }, take: 1 },
       }),
     }));
     expect(body.websites[0].status).toBe('published');
     expect(body.websites[0].domains[0].hostname).toBe('web-bella.trymentoapp.com');
+    expect(body.websites[0]).toMatchObject({ id: 'site-1', title: content.title, type: 'restaurant' });
+    expect(body.websites[0]).not.toHaveProperty('content');
+  });
+
+  it('returns website content and assets only to the authenticated owner through the detail route', async () => {
+    mocks.website.findFirst.mockResolvedValue(ownerWebsite);
+    mocks.buildWebsiteApiView.mockImplementationOnce(async (website: unknown) => ({ ...(website as object), assets: [] }));
+
+    const response = await getWebsite(new Request('https://mento.test/api/websites/site-1'), { params: Promise.resolve({ websiteId: 'site-1' }) });
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(mocks.website.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'site-1', userId: 'user-1', deletedAt: null },
+    }));
+    expect(body.website.content).toEqual(content);
+  });
+
+  it('does not return a website when the authenticated user does not own it', async () => {
+    mocks.website.findFirst.mockResolvedValue(null);
+
+    const response = await getWebsite(new Request('https://mento.test/api/websites/site-1'), { params: Promise.resolve({ websiteId: 'site-1' }) });
+
+    expect(response.status).toBe(404);
+    expect(mocks.buildWebsiteApiView).not.toHaveBeenCalled();
+  });
+
+  it('keeps image suggestions bound to the user-selected website type', async () => {
+    mocks.askGemini.mockResolvedValueOnce(JSON.stringify({
+      type: 'restaurant',
+      visualStyle: 'Warm and welcoming',
+      imageRequirements: [{
+        id: 'hero',
+        role: 'hero',
+        label: 'Main image',
+        query: 'local business storefront',
+        alt: 'A welcoming local business',
+        orientation: 'landscape',
+      }],
+    }));
+
+    const response = await analyzeWebsiteImageRequirements(new Request('https://mento.test/api/websites/image-requirements', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: 'Maya Studio', brief: 'A local photography studio.', type: 'other', requestId: 'website-images-12345678' }),
+    }));
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.type).toBe('other');
+    expect(body.imageRequirements[0].role).toBe('hero');
+  });
+
+  it('keeps AI-generated menu photo suggestions when no menu is provided', async () => {
+    mocks.askGemini.mockResolvedValueOnce(JSON.stringify({
+      type: 'restaurant',
+      visualStyle: 'Warm coastal dining',
+      imageRequirements: [
+        { id: 'hero', role: 'hero', label: 'Main image', query: 'restaurant exterior', alt: 'Restaurant exterior', orientation: 'landscape' },
+        { id: 'menu-generic', role: 'menu_item', label: 'Food', query: 'restaurant meal', alt: 'Restaurant meal', orientation: 'square' },
+      ],
+    }));
+
+    const response = await analyzeWebsiteImageRequirements(request('https://mento.test/api/websites/image-requirements', {
+      title: 'Bella Restaurant',
+      brief: 'Fresh coastal food in Mombasa.',
+      type: 'restaurant',
+      requestId: 'website-images-menu-empty-1234',
+    }));
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.imageRequirements.some((item: { id: string }) => item.id === 'menu-generic')).toBe(true);
+  });
+
+  it('returns a distinct photo requirement for every named restaurant menu item, including more than ten', async () => {
+    mocks.askGemini.mockResolvedValueOnce(JSON.stringify({
+      type: 'restaurant',
+      visualStyle: 'Warm coastal dining',
+      imageRequirements: [
+        { id: 'hero', role: 'hero', label: 'Main image', query: 'restaurant exterior', alt: 'Restaurant exterior', orientation: 'landscape' },
+        { id: 'menu-generic', role: 'menu_item', label: 'Food', query: 'restaurant meal', alt: 'Restaurant meal', orientation: 'square' },
+      ],
+    }));
+    const menuItems = Array.from({ length: 24 }, (_, index) => ({
+      id: `menu-${index + 1}`,
+      name: `Dish ${index + 1}`,
+      description: `Dish description ${index + 1}`,
+    }));
+
+    const response = await analyzeWebsiteImageRequirements(request('https://mento.test/api/websites/image-requirements', {
+      title: 'Bella Restaurant',
+      brief: 'Fresh coastal food in Mombasa.',
+      type: 'restaurant',
+      menuItems,
+      requestId: 'website-images-menu-1234',
+    }));
+    const body = await response.json();
+    const menuRequirements = body.imageRequirements.filter((item: { role: string }) => item.role === 'menu_item');
+
+    expect(response.status).toBe(200);
+    expect(menuRequirements).toHaveLength(24);
+    expect(menuRequirements[23]).toMatchObject({
+      targetId: 'menu-24',
+      label: 'Dish 24',
+      query: 'Dish 24 Dish description 24 professional food photography',
+    });
+    expect(menuRequirements.every((item: { query: string }) => item.query.length <= 100)).toBe(true);
+    expect(body.imageRequirements.some((item: { id: string }) => item.id === 'menu-generic')).toBe(false);
+  });
+
+  it('preserves restaurant menu names and prices while mapping 24 selected photos to their own dishes', async () => {
+    mocks.isWebsTestingMode.mockReturnValue(true);
+    const menuItems = Array.from({ length: 24 }, (_, index) => ({
+      id: `client-menu-${index + 1}`,
+      category: index < 6 ? 'Mains' : 'Desserts',
+      name: `Dish ${index + 1}`,
+      description: `Description ${index + 1}`,
+      price: String((index + 1) * 100),
+      currency: 'KSh',
+    }));
+    const generatedMenuItems = menuItems.map((item, index) => ({
+      id: `generated-menu-${index + 1}`,
+      name: `AI dish ${index + 1}`,
+      description: 'AI description',
+      price: '1',
+      currency: 'USD',
+      imageSlotId: `menu-slot-${index + 1}`,
+      available: true,
+    }));
+    const selectedImages = menuItems.map((item, index) => ({
+      requirementId: `menu-slot-${index + 1}`,
+      targetId: item.id,
+      role: 'menu_item',
+      query: `${item.name} food photo`,
+      alt: `${item.name} on a plate`,
+      source: 'user_upload',
+    }));
+    mocks.askGemini.mockResolvedValueOnce(JSON.stringify({
+      ...content,
+      pages: [{
+        ...content.pages[0],
+        sections: [
+          ...content.pages[0].sections,
+          { id: 'menu-section', type: 'menu', title: 'Our menu', body: 'Fresh food.' },
+        ],
+      }],
+      menuCategories: [
+        { id: 'generated-mains', name: 'Mains', items: generatedMenuItems.slice(0, 6) },
+        { id: 'generated-desserts', name: 'Desserts', items: generatedMenuItems.slice(6) },
+      ],
+      imageSlots: selectedImages.map((selection, index) => ({
+        id: selection.requirementId,
+        role: 'menu_item',
+        targetId: `generated-menu-${index + 1}`,
+        query: selection.query,
+        alt: selection.alt,
+        assetId: null,
+      })),
+    }));
+
+    const response = await generateWebsite(request('https://mento.test/api/websites/generate', {
+      title: 'Bella Restaurant',
+      type: 'restaurant',
+      brief: 'Fresh coastal food in Mombasa.',
+      fullPrompt: 'Build a restaurant website with the provided menu.',
+      menuItems,
+      selectedImages,
+      requestId: 'website-create-many-menu-images-1234',
+    }));
+    const persistedContent = mocks.website.create.mock.calls[0][0].data.content;
+    const persistedItems = persistedContent.menuCategories.flatMap((category: { items: unknown[] }) => category.items);
+
+    expect(response.status).toBe(201);
+    expect(persistedItems).toHaveLength(24);
+    expect(persistedItems[23]).toMatchObject({ name: 'Dish 24', price: '2400', currency: 'KSh' });
+    expect(persistedItems.map((item: { imageSlotId: string }) => item.imageSlotId)).toEqual(selectedImages.map((item) => item.requirementId));
+    expect(persistedContent.imageSlots).toHaveLength(24);
   });
 
   it('returns owner-scoped Pro usage, hosting status, and billing history', async () => {
@@ -315,7 +580,13 @@ describe('Websites API ownership and AI contract', () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(body.usage).toEqual(expect.objectContaining({ projectLimit: 5, editLimit: 50, activePro: true }));
+    expect(body.imageGeneration).toEqual({
+      limit: 15,
+      generated: 0,
+      remaining: 15,
+      resetsAt: '2027-01-01T00:00:00.000Z',
+    });
+    expect(body.usage).toEqual(expect.objectContaining({ projectLimit: 5, editLimit: 15, activePro: true }));
     expect(body.hosting[0]).toEqual(expect.objectContaining({ websiteId: 'site-1', status: 'active' }));
     expect(body.hostingAccount).toEqual(expect.objectContaining({
       tier: 'SITES_3',
@@ -335,6 +606,8 @@ describe('Websites API ownership and AI contract', () => {
       title: 'Bella Restaurant',
       type: 'restaurant',
       brief: 'Swahili and seafood dishes in Mombasa.',
+      fullPrompt: 'Create a warm coastal restaurant website with a menu and contact details.',
+      selectedImages: [],
       requestId: 'website-create-1234',
     }));
 
@@ -344,6 +617,7 @@ describe('Websites API ownership and AI contract', () => {
       { responseMimeType: 'application/json', maxOutputTokens: 8192 },
       { responseMimeType: 'application/json', maxOutputTokens: 8192 },
     ]);
+    expect(mocks.askGemini.mock.calls[0][0][0].parts[0].text).toContain('layoutVariant":"cinematic|split|centered-editorial (hero only)');
     expect(mocks.executeAIRequest).toHaveBeenCalledWith(expect.objectContaining({
       feature: 'website',
       amount: 1,
@@ -351,11 +625,205 @@ describe('Websites API ownership and AI contract', () => {
     }));
     expect(mocks.website.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({
+        id: expect.any(String),
         userId: 'user-1',
         type: 'restaurant',
         versions: { create: expect.objectContaining({ version: 1, source: 'initial' }) },
       }),
     }));
+    expect(mocks.buildWebsiteApiView).toHaveBeenCalledWith(expect.objectContaining({ id: expect.any(String), content: expect.any(Object) }));
+  });
+
+  it('persists owner-provided trust details exactly and rejects unsafe booking links', async () => {
+    const businessDetails = {
+      address: 'Mombasa',
+      phone: '+254 700 000 000',
+      whatsappNumber: '+254 711 111 111',
+      mapsUrl: 'https://maps.google.com/?q=Mombasa',
+      email: 'hello@bella.example',
+      openingHours: 'Monday-Friday: 9:00-17:00',
+      serviceArea: 'Mombasa County',
+      servicesAndPricing: 'Private event catering — KSh 2,500 per guest',
+      testimonials: '“A lovely evening.” — A. Customer',
+      bookingUrl: 'https://bella.example/book',
+    };
+    const response = await generateWebsite(request('https://mento.test/api/websites/generate', {
+      title: 'Bella Restaurant',
+      type: 'restaurant',
+      brief: 'Swahili and seafood dishes in Mombasa.',
+      fullPrompt: 'Create a useful restaurant website.',
+      businessDetails,
+      selectedImages: [],
+      requestId: 'website-create-trust-details-1234',
+    }));
+    const savedContent = mocks.website.create.mock.calls[0][0].data.content;
+
+    expect(response.status).toBe(201);
+    expect(savedContent.contact).toEqual({ ...businessDetails, whatsappNumber: '+254711111111' });
+    expect(mocks.askGemini.mock.calls[0][0][0].parts[0].text).toContain('exact owner-approved testimonials');
+
+    const invalid = await generateWebsite(request('https://mento.test/api/websites/generate', {
+      title: 'Bella Restaurant',
+      type: 'restaurant',
+      brief: 'Swahili and seafood dishes in Mombasa.',
+      fullPrompt: 'Create a useful restaurant website.',
+      businessDetails: { ...businessDetails, bookingUrl: 'javascript:alert(1)' },
+      selectedImages: [],
+      requestId: 'website-create-unsafe-booking-url-1234',
+    }));
+    expect(invalid.status).toBe(400);
+    expect(mocks.askGemini).toHaveBeenCalledTimes(1);
+  });
+
+  it('verifies and persists selected Unsplash assets on generation, then tracks after persistence', async () => {
+    mocks.isWebsTestingMode.mockReturnValue(true);
+    mocks.askGemini.mockResolvedValueOnce(JSON.stringify({
+      ...content,
+      pages: [{ ...content.pages[0], sections: [{ ...content.pages[0].sections[0], id: 'hero-section', imageSlotId: 'hero-main' }] }],
+      imageSlots: [{
+        id: 'hero-main',
+        role: 'hero',
+        targetId: 'hero-section',
+        query: 'coastal restaurant',
+        alt: 'A coastal restaurant',
+        assetId: null,
+      }],
+    }));
+
+    const response = await generateWebsite(request('https://mento.test/api/websites/generate', {
+      title: 'Bella Restaurant',
+      type: 'restaurant',
+      brief: 'Swahili and seafood dishes in Mombasa.',
+      fullPrompt: 'Create a warm coastal restaurant website.',
+      selectedImages: [{
+        requirementId: 'hero-main',
+        role: 'hero',
+        query: 'coastal restaurant',
+        alt: 'A coastal restaurant',
+        source: 'unsplash',
+        photoId: 'photo-1',
+      }],
+      requestId: 'website-create-unsplash-1234',
+    }));
+
+    expect(response.status).toBe(201);
+    expect(mocks.getVerifiedUnsplashPhoto).toHaveBeenCalledWith('photo-1');
+    expect(mocks.website.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        assets: { create: [expect.objectContaining({
+          source: 'unsplash',
+          providerAssetId: 'photo-1',
+          remoteUrl: 'https://images.unsplash.com/photo-1?ixid=demo',
+          attributionRequired: true,
+          creatorName: 'Photographer',
+        })] },
+      }),
+    }));
+    expect(mocks.trackUnsplashPhotoDownload).toHaveBeenCalledWith('https://api.unsplash.com/photos/photo-1/download');
+  });
+
+  it('saves an Unsplash replacement to a validated image slot without invoking AI edit billing', async () => {
+    mocks.isWebsTestingMode.mockReturnValue(true);
+    mocks.website.findFirst.mockResolvedValueOnce({
+      ...ownerWebsite,
+      revision: 2,
+      content: {
+        ...content,
+        pages: [{ ...content.pages[0], sections: [{ ...content.pages[0].sections[0], id: 'hero-section', imageSlotId: null }] }],
+        imageSlots: [],
+      },
+    });
+    mocks.website.updateMany.mockResolvedValueOnce({ count: 1 });
+    mocks.website.findFirst.mockResolvedValueOnce({ ...ownerWebsite, revision: 3 });
+    mocks.websiteAsset.create.mockResolvedValueOnce({});
+
+    const response = await selectWebsitePhoto(
+      request('https://mento.test/api/websites/site-1/images/select', {
+        slotId: 'hero-slot-new',
+        photoId: 'photo-1',
+        revision: 2,
+        role: 'hero',
+        targetId: 'hero-section',
+        query: 'coastal restaurant',
+        alt: 'A coastal restaurant',
+      }),
+      { params: Promise.resolve({ websiteId: 'site-1' }) },
+    );
+
+    expect(response.status).toBe(200);
+    expect(mocks.websiteAsset.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ source: 'unsplash', providerAssetId: 'photo-1', slotId: 'hero-slot-new' }),
+    }));
+    expect(mocks.trackUnsplashPhotoDownload).toHaveBeenCalledOnce();
+    expect(mocks.executeAIRequest).not.toHaveBeenCalled();
+  });
+
+  it('removes private website image objects after an owner deletes a website', async () => {
+    const updateDeployments = vi.fn().mockResolvedValue({ count: 1 });
+    const updateDomains = vi.fn().mockResolvedValue({ count: 1 });
+    mocks.website.findFirst.mockResolvedValueOnce({ id: 'site-1' });
+    mocks.transaction.mockImplementationOnce(async (callback: (tx: any) => Promise<any>) => callback({
+      website: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+      websiteDeployment: { updateMany: updateDeployments },
+      websiteDomain: { updateMany: updateDomains },
+    }));
+    mocks.websiteAsset.findMany.mockResolvedValueOnce([{
+      objectKey: 'website-assets/user-1/site-1/image.jpg',
+      r2ObjectKey: 'websites/site-1/assets/asset-1/image.jpg',
+    }]);
+
+    const response = await deleteWebsite(
+      new Request('https://mento.test/api/websites/site-1', { method: 'DELETE' }),
+      { params: Promise.resolve({ websiteId: 'site-1' }) },
+    );
+
+    expect(response.status).toBe(204);
+    expect(mocks.deletePrivateWebsiteUpload).toHaveBeenCalledWith('website-assets/user-1/site-1/image.jpg');
+    expect(mocks.deletePrivateWebsiteAssetFromR2).toHaveBeenCalledWith('websites/site-1/assets/asset-1/image.jpg');
+  });
+
+  it('allows an owner to retry private image cleanup after website soft deletion', async () => {
+    mocks.website.findFirst.mockResolvedValueOnce({ id: 'site-1' });
+    mocks.transaction.mockImplementationOnce(async (callback: (tx: any) => Promise<any>) => callback({
+      website: { updateMany: vi.fn().mockResolvedValue({ count: 0 }) },
+      websiteDeployment: { updateMany: mocks.websiteDeployment.updateMany },
+      websiteDomain: { updateMany: mocks.websiteDomain.updateMany },
+    }));
+    mocks.websiteAsset.findMany.mockResolvedValueOnce([{
+      objectKey: 'website-assets/user-1/site-1/image.jpg',
+      r2ObjectKey: 'websites/site-1/assets/asset-1/image.jpg',
+    }]);
+
+    const response = await deleteWebsite(
+      new Request('https://mento.test/api/websites/site-1', { method: 'DELETE' }),
+      { params: Promise.resolve({ websiteId: 'site-1' }) },
+    );
+
+    expect(response.status).toBe(204);
+    expect(mocks.websiteAsset.findMany).toHaveBeenCalledWith(expect.objectContaining({ where: { websiteId: 'site-1' } }));
+    expect(mocks.deletePrivateWebsiteUpload).toHaveBeenCalledWith('website-assets/user-1/site-1/image.jpg');
+    expect(mocks.deletePrivateWebsiteAssetFromR2).toHaveBeenCalledWith('websites/site-1/assets/asset-1/image.jpg');
+  });
+
+  it('rejects deprecated stock-photo selections during website generation', async () => {
+    const response = await generateWebsite(request('https://mento.test/api/websites/generate', {
+      title: 'Bella Restaurant',
+      type: 'restaurant',
+      brief: 'Coastal dining in Mombasa.',
+      fullPrompt: 'Build an elegant restaurant website.',
+      selectedImages: [{
+        requirementId: 'hero-main',
+        role: 'hero',
+        query: 'coastal restaurant',
+        alt: 'A welcoming coastal restaurant',
+        source: 'pixabay',
+        providerAssetId: '12345',
+      }],
+      requestId: 'website-create-deprecated-stock-photo',
+    }));
+
+    expect(response.status).toBe(400);
+    expect(mocks.executeAIRequest).not.toHaveBeenCalled();
   });
 
   it('blocks a sixth project in the current Pro billing period before AI generation', async () => {
@@ -365,12 +833,22 @@ describe('Websites API ownership and AI contract', () => {
       title: 'Another site',
       type: 'restaurant',
       brief: 'A coastal restaurant.',
+      fullPrompt: 'Create a premium seafood restaurant website.',
+      selectedImages: [],
       requestId: 'website-create-over-limit',
     }));
 
     expect(response.status).toBe(403);
     expect(mocks.executeAIRequest).not.toHaveBeenCalled();
-    expect(mocks.website.count).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ userId: 'user-1', deletedAt: null }) }));
+    expect(mocks.website.count).toHaveBeenCalledWith({
+      where: {
+        userId: 'user-1',
+        createdAt: {
+          gte: new Date('2026-10-01T00:00:00.000Z'),
+          lt: new Date('2099-01-01T00:00:00.000Z'),
+        },
+      },
+    });
     expect(mocks.securityEvent.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ eventType: 'WEBSITE_POLICY_DENIED', details: { mode: 'create', reason: 'project_limit' } }) }));
   });
 
@@ -443,11 +921,50 @@ describe('Websites API ownership and AI contract', () => {
   });
 
   it('publishes a draft and stores the published version, then unpublishes it back to draft', async () => {
-    mocks.website.findFirst.mockResolvedValueOnce({ ...ownerWebsite, status: 'draft', revision: 2, currentVersion: 2, publishedVersion: null })
+    const contentWithImage = {
+      ...content,
+      pages: [{
+        title: 'Home',
+        slug: 'home',
+        sections: [
+          { id: 'hero-section', type: 'hero', title: 'Welcome', body: 'Visit us', imageSlotId: 'hero-slot' },
+          { id: 'gallery-section', type: 'gallery', title: 'Gallery', body: '', imageSlotId: 'gallery-slot' },
+        ],
+      }],
+      imageSlots: [
+        { id: 'hero-slot', role: 'hero', targetId: 'hero-section', query: 'restaurant', alt: 'Dining room', assetId: 'pexels-1' },
+        { id: 'gallery-slot', role: 'gallery', targetId: 'gallery-section', query: 'restaurant', alt: 'Dining room', assetId: 'upload-1' },
+      ],
+    };
+    mocks.website.findFirst.mockResolvedValueOnce({ ...ownerWebsite, content: contentWithImage, status: 'draft', revision: 2, currentVersion: 2, publishedVersion: null })
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({ ...ownerWebsite, status: 'published', revision: 2, currentVersion: 2, publishedVersion: 2 });
+    mocks.websiteAsset.findMany.mockResolvedValueOnce([{
+      id: 'pexels-1',
+      slotId: 'hero-slot',
+      source: 'pexels',
+      objectKey: null,
+      remoteUrl: 'https://images.pexels.com/photos/123/example.jpg',
+      sourcePageUrl: 'https://www.pexels.com/photo/example',
+      creatorName: 'Photographer',
+      creatorProfileUrl: 'https://www.pexels.com/@photographer',
+      alt: 'Dining room',
+      mimeType: null,
+    }, {
+      id: 'upload-1',
+      slotId: 'gallery-slot',
+      source: 'user_upload',
+      objectKey: 'website-assets/user-1/site-1/photo.jpg',
+      remoteUrl: null,
+      sourcePageUrl: null,
+      creatorName: null,
+      creatorProfileUrl: null,
+      alt: 'Dining room',
+      mimeType: 'image/jpeg',
+    }]);
     const deploymentCreate = vi.fn().mockResolvedValue({ id: 'deployment-1', websiteId: 'site-1', version: 2, status: 'published', hostname: 'bella-restaurant.mento.site', storagePath: 'websites/site-1/deployments/2', publishedAt: new Date() });
-    const websitePublishUpdate = vi.fn().mockResolvedValue({ ...ownerWebsite, status: 'published', slug: 'bella-restaurant', publishedVersion: 2, publishedDeploymentId: 'deployment-1', currentVersion: 2, revision: 2 });
+    const websitePublishUpdate = vi.fn().mockResolvedValue({ ...ownerWebsite, status: 'published', slug: 'bella-by-the-sea', publishedVersion: 2, publishedDeploymentId: 'deployment-1', currentVersion: 2, revision: 2 });
+    mocks.websiteDomain.create.mockResolvedValueOnce({ id: 'website-domain-1', hostname: 'web-bella-by-the-sea.trymentoapp.com' });
     mocks.transaction.mockImplementationOnce(async (callback: (tx: any) => Promise<any>) => callback({
       $queryRaw: vi.fn().mockResolvedValue([]),
       websiteHostingAccount: { findUnique: vi.fn().mockResolvedValue(activeHostingAccount()), update: vi.fn() },
@@ -466,21 +983,41 @@ describe('Websites API ownership and AI contract', () => {
     }));
     mocks.website.update.mockResolvedValueOnce({ ...ownerWebsite, status: 'draft', publishedVersion: null, publishedDeploymentId: null, currentVersion: 2, revision: 2 });
 
-    const publishResponse = await publishWebsite(request('https://mento.test/api/websites/site-1/publish', { version: 2, revision: 2 }), { params: Promise.resolve({ websiteId: 'site-1' }) });
+    const publishResponse = await publishWebsite(request('https://mento.test/api/websites/site-1/publish', { version: 2, revision: 2, slug: 'bella-by-the-sea' }), { params: Promise.resolve({ websiteId: 'site-1' }) });
     const publishBody = await publishResponse.json();
 
     expect(publishResponse.status).toBe(200);
-    expect(mocks.ensureWebsiteWorkerDomain).toHaveBeenCalledWith('web-bella-restaurant.trymentoapp.com');
+    expect(mocks.uploadWebsiteDeployment).toHaveBeenCalledWith(expect.objectContaining({
+      content: contentWithImage,
+      assets: expect.arrayContaining([
+        expect.objectContaining({
+          id: 'pexels-1',
+          slotId: 'hero-slot',
+          source: 'pexels',
+          remoteUrl: 'https://images.pexels.com/photos/123/example.jpg',
+          creatorName: 'Photographer',
+        }),
+        expect.objectContaining({
+          id: 'upload-1',
+          slotId: 'gallery-slot',
+          source: 'user_upload',
+          mimeType: 'image/jpeg',
+          bytes: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+        }),
+      ]),
+    }));
+    expect(mocks.readPrivateWebsiteUpload).toHaveBeenCalledWith('website-assets/user-1/site-1/photo.jpg');
+    expect(mocks.ensureWebsiteWorkerDomain).toHaveBeenCalledWith('web-bella-by-the-sea.trymentoapp.com');
     expect(mocks.transaction).toHaveBeenCalled();
     expect(deploymentCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
-      hostname: 'web-bella-restaurant.trymentoapp.com',
+      hostname: 'web-bella-by-the-sea.trymentoapp.com',
       r2Prefix: 'websites/site-1/deployments/deployment-1',
       manifestKey: 'websites/site-1/deployments/deployment-1/manifest.json',
     }) }));
-    expect(websitePublishUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ slug: 'bella-restaurant' }) }));
+    expect(websitePublishUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ slug: 'bella-by-the-sea' }) }));
     expect(publishBody.website.status).toBe('published');
-    expect(publishBody.website.slug).toBe('bella-restaurant');
-    expect(publishBody.hostname).toBe('web-bella-restaurant.trymentoapp.com');
+    expect(publishBody.website.slug).toBe('bella-by-the-sea');
+    expect(publishBody.hostname).toBe('web-bella-by-the-sea.trymentoapp.com');
     expect(publishBody.website.publishedVersion).toBe(2);
     expect(publishBody.website.publishedDeploymentId).toBe('deployment-1');
 
@@ -713,6 +1250,49 @@ describe('Websites API ownership and AI contract', () => {
     expect(body.code).toBe('website_slug_conflict');
     expect(mocks.transaction).not.toHaveBeenCalled();
     expect(mocks.websiteDeployment.create).not.toHaveBeenCalled();
+  });
+
+  it('requires active Pro before staging or publishing a website', async () => {
+    mocks.website.findFirst.mockResolvedValueOnce({ ...ownerWebsite, status: 'draft', revision: 2, currentVersion: 2 });
+    mocks.userWallet.findUnique.mockResolvedValueOnce({
+      userId: 'user-1',
+      subscriptionStatus: 'inactive',
+      subscriptionExpiresAt: null,
+      subscriptionPeriodStart: null,
+      subscriptionStartedAt: null,
+      plan: { name: 'FREE' },
+    });
+
+    const response = await publishWebsite(
+      request('https://mento.test/api/websites/site-1/publish', { version: 2, revision: 2 }),
+      { params: Promise.resolve({ websiteId: 'site-1' }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(403);
+    expect(body.code).toBe('website_pro_required');
+    expect(mocks.uploadWebsiteDeployment).not.toHaveBeenCalled();
+    expect(mocks.ensureWebsiteWorkerDomain).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
+  });
+
+  it('blocks publishing in Blue Webs testing mode before touching live hosting', async () => {
+    vi.stubEnv('MENTO_BACKEND_ENV', 'blue');
+    vi.stubEnv('WEBS_TEST_MODE', 'true');
+    mocks.isWebsTestingMode.mockReturnValue(true);
+    mocks.website.findFirst.mockResolvedValueOnce({ ...ownerWebsite, status: 'draft', revision: 2, currentVersion: 2 });
+
+    const response = await publishWebsite(
+      request('https://mento.test/api/websites/site-1/publish', { version: 2, revision: 2 }),
+      { params: Promise.resolve({ websiteId: 'site-1' }) },
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(403);
+    expect(body.code).toBe('website_test_publish_disabled');
+    expect(mocks.uploadWebsiteDeployment).not.toHaveBeenCalled();
+    expect(mocks.ensureWebsiteWorkerDomain).not.toHaveBeenCalled();
+    expect(mocks.transaction).not.toHaveBeenCalled();
   });
 
   it('returns a slug conflict when a concurrent publish wins the unique-slug race', async () => {
@@ -1064,7 +1644,7 @@ describe('Websites API ownership and AI contract', () => {
           id: 'home',
           title: 'Home',
           slug: 'home',
-          sections: [{ id: 'hero-section', type: 'hero', title: 'Taste the coast', body: 'Fresh seafood and Swahili favorites.', imageSlotId: 'hero-image' }],
+          sections: [{ id: 'hero-section', type: 'hero', title: 'Taste the coast', body: 'Fresh seafood and Swahili favorites.', imageSlotId: 'hero-image', layoutVariant: 'split' }],
         }],
         menuCategories: [{
           id: 'mains',
@@ -1079,7 +1659,23 @@ describe('Websites API ownership and AI contract', () => {
     mocks.website.findFirst.mockResolvedValueOnce(websiteWithAssets);
     mocks.askGemini
       .mockResolvedValueOnce('invalid JSON')
-      .mockResolvedValueOnce(JSON.stringify(websiteWithAssets.content));
+      .mockResolvedValueOnce(JSON.stringify({
+        ...websiteWithAssets.content,
+        pages: [{
+          ...websiteWithAssets.content.pages[0],
+          sections: [{
+            ...websiteWithAssets.content.pages[0].sections[0],
+            id: 'model-generated-hero-id',
+            imageSlotId: null,
+            layoutVariant: undefined,
+          }],
+        }],
+        imageSlots: [{
+          ...websiteWithAssets.content.imageSlots[0],
+          targetId: 'model-generated-hero-id',
+          assetId: null,
+        }],
+      }));
     const editedWebsite = { ...ownerWebsite, revision: 3, currentVersion: 2 };
     const version = { id: 'version-2', version: 2, source: 'ai_edit', summary: 'Make it more premium' };
     const tx = {
@@ -1107,6 +1703,7 @@ describe('Websites API ownership and AI contract', () => {
     const systemPrompt = mocks.askGemini.mock.calls[0][0].find((message) => message.role === 'system')?.parts[0]?.text;
     const userPrompt = mocks.askGemini.mock.calls[0][0].find((message) => message.role === 'user')?.parts[0]?.text;
     expect(systemPrompt).toContain('"imageSlots"');
+    expect(systemPrompt).toContain('"layoutVariant"');
     expect(systemPrompt).toContain('"socialLinks"');
     expect(systemPrompt).toContain('"seo"');
     expect(userPrompt).toContain('"assetId":"asset-image-1"');
@@ -1118,7 +1715,11 @@ describe('Websites API ownership and AI contract', () => {
           pages: expect.arrayContaining([
             expect.objectContaining({
               id: 'home',
-              sections: expect.arrayContaining([expect.objectContaining({ id: 'hero-section', imageSlotId: 'hero-image' })]),
+              sections: expect.arrayContaining([expect.objectContaining({
+                id: 'hero-section',
+                imageSlotId: 'hero-image',
+                layoutVariant: 'split',
+              })]),
             }),
           ]),
           imageSlots: [expect.objectContaining({ id: 'hero-image', assetId: 'asset-image-1' })],

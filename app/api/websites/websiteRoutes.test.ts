@@ -616,10 +616,13 @@ describe('Websites API ownership and AI contract', () => {
 
     expect(response.status).toBe(201);
     expect(mocks.askGemini).toHaveBeenCalledTimes(2);
-    expect(mocks.askGemini.mock.calls.map((call) => call[5])).toEqual([
-      { responseMimeType: 'application/json', maxOutputTokens: 8192 },
-      { responseMimeType: 'application/json', maxOutputTokens: 8192 },
-    ]);
+    const generationOptions = mocks.askGemini.mock.calls[0][5];
+    expect(generationOptions).toMatchObject({
+      responseMimeType: 'application/json',
+      maxOutputTokens: 8192,
+      responseJsonSchema: { required: ['type', 'title', 'description', 'pages', 'imageSlots'] },
+    });
+    expect(mocks.askGemini.mock.calls[1][5]).toBe(generationOptions);
     expect(mocks.executeAIRequest).toHaveBeenCalledWith(expect.objectContaining({
       feature: 'website',
       amount: 1,

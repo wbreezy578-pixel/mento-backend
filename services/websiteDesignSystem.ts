@@ -134,6 +134,63 @@ export function buildWebsiteGenerationSchemaInstruction(): string {
   return `Return JSON with this exact shape: {"type":"business|restaurant|portfolio|professional|other","title":"...","description":"...","designPreset":"coastal-editorial|trustworthy-professional|creative-portfolio|local-service|modern-business","designPreferences":{"designPreset":"coastal-editorial|trustworthy-professional|creative-portfolio|local-service|modern-business","heroImageMode":"background|beside|none","backgroundStyle":"warm|cool|neutral|sage","overlayStrength":"soft|balanced|strong","imageCrop":"center|top|bottom","imageMood":"..."},"theme":{"primaryColor":"#123456","secondaryColor":"#345678","backgroundColor":"#F8F8F5","surfaceColor":"#EEEEEA"},"pages":[{"id":"stable-id","title":"...","slug":"...","sections":[{"id":"stable-id","type":"hero|about|services|menu|gallery|location|contact|whatsapp","title":"...","body":"...","imageSlotId":null,"layoutVariant":"cinematic|split|centered-editorial (hero only)","overlayStrength":"soft|balanced|strong (hero only)","imageCrop":"center|top|bottom (hero only)"}]}],"menuCategories":[{"id":"stable-id","name":"...","items":[{"id":"stable-id","name":"...","description":"...","price":"650","currency":"KSh","imageUrl":null,"imageSlotId":null,"available":true}]}],"imageSlots":[{"id":"selected requirementId","role":"hero|gallery|menu_item|section","targetId":"existing section or menu item id, or null","query":"selected image requirement query","alt":"selected image alternative text","assetId":null}],"galleryImageUrls":[],"contact":{"address":"","phone":"","whatsappNumber":"","mapsUrl":"","email":"","openingHours":"","serviceArea":"","servicesAndPricing":"","testimonials":"","bookingUrl":""}}. Use 2 to 6 pages and create exactly one image slot for each selected image, with the exact requirementId, role, query, and alt text supplied. If no images are selected, return an empty imageSlots array and do not add any image slots. Attach each selected hero image to the hero section, menu_item images to a relevant menu item, gallery images to the gallery, and section images to the most relevant about/services section. Do not add unselected images, substitute selected images, or return image URLs. Do not invent contact details, menu prices, or factual claims. For restaurants, create menu categories/items only when requested. Return JSON only.`;
 }
 
+export function buildWebsiteGenerationResponseSchema() {
+  const stringSchema = { type: 'string' };
+  const nullableStringSchema = { anyOf: [{ type: 'string' }, { type: 'null' }] };
+  return {
+    type: 'object',
+    properties: {
+      type: { type: 'string', enum: ['business', 'restaurant', 'portfolio', 'professional', 'other'] },
+      title: stringSchema,
+      description: stringSchema,
+      pages: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: stringSchema,
+            title: stringSchema,
+            slug: stringSchema,
+            sections: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: stringSchema,
+                  type: { type: 'string', enum: ['hero', 'about', 'services', 'menu', 'gallery', 'location', 'contact', 'whatsapp'] },
+                  title: stringSchema,
+                  body: stringSchema,
+                  imageSlotId: nullableStringSchema,
+                  layoutVariant: { type: 'string', enum: ['cinematic', 'split', 'centered-editorial'] },
+                  overlayStrength: { type: 'string', enum: ['soft', 'balanced', 'strong'] },
+                  imageCrop: { type: 'string', enum: ['center', 'top', 'bottom'] },
+                },
+                required: ['id', 'type', 'title'],
+              },
+            },
+          },
+          required: ['title', 'sections'],
+        },
+      },
+      imageSlots: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            id: stringSchema,
+            role: { type: 'string', enum: ['hero', 'gallery', 'menu_item', 'section'] },
+            targetId: nullableStringSchema,
+            query: stringSchema,
+            alt: stringSchema,
+          },
+          required: ['id', 'role', 'query', 'alt'],
+        },
+      },
+    },
+    required: ['type', 'title', 'description', 'pages', 'imageSlots'],
+  };
+}
+
 export function buildWebsiteGenerationInstruction(type: WebsiteType): string {
   return `You are Mento Webs, a design and website-building intelligence. Create a site a real ${type} business could proudly publish: specific, useful, visually intentional, mobile-first, and distinct from generic AI templates. Do not emit HTML, CSS, JavaScript, markdown, or unstructured prose. Return one JSON object that exactly matches the supplied WebsiteContent schema.\n\nDESIGN STANDARD\n- Select one designPreset from: ${WEBSITE_DESIGN_PRESETS.join(', ')}. ${presetGuidance[DEFAULT_DESIGN_PRESET[type]]}\n    - Establish the brand palette before composing pages or components. Infer its mood from the business and intended audience; a refined salon should feel different from a playful children's shop. Return exactly four valid six-digit hex colors: primaryColor for the brand and main actions, secondaryColor for restrained accents, backgroundColor for the page, and surfaceColor for subtle panels. Use two coordinated brand colors with quiet neutrals and readable contrast; avoid unrelated colors and rainbow gradients.
   - Use one consistent heading font and one body font throughout the site. Apply a clear responsive type scale: a prominent hero title, distinct section headings, smaller subsection headings, and readable body copy with comfortable line-height and limited line length. Keep heading and paragraph margins consistent.

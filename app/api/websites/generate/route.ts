@@ -16,7 +16,7 @@ import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import logger from '../../../../lib/logger';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../lib/userSettings';
 import { applyWebsiteDesignPreferences, buildWebsiteTrustInstruction, isWebsiteType, parseWebsiteContact, parseWebsiteContent, WebsiteContentParseError, type WebsiteContent, type WebsiteType } from '../../../../services/websiteContent';
-import { buildCompactWebsiteGenerationInstruction, buildWebsiteGenerationSchemaInstruction } from '../../../../services/websiteDesignSystem';
+import { buildCompactWebsiteGenerationInstruction, buildWebsiteGenerationResponseSchema, buildWebsiteGenerationSchemaInstruction } from '../../../../services/websiteDesignSystem';
 import { parseWebsiteDesignPreferences, type WebsiteDesignPreferences } from '../../../../services/websiteDesignPreferences';
 import type { WebsiteAssetCreateData } from '../../../../services/websiteAssetService';
 import { buildWebsiteApiView } from '../../../../services/websiteAssetApi';
@@ -284,7 +284,11 @@ export async function POST(req: Request) {
           return reportProviderAttempt(model);
         };
         const model = decision.modelUsed ?? undefined;
-        const generationOptions = { responseMimeType: 'application/json', maxOutputTokens: 8192 };
+        const generationOptions = {
+          responseMimeType: 'application/json',
+          responseJsonSchema: buildWebsiteGenerationResponseSchema(),
+          maxOutputTokens: 8192,
+        };
         const response = await askGemini(generationContents, model, reportUsage, reportModelAttempt, req.signal, generationOptions);
         let parsed: WebsiteContent;
         try {

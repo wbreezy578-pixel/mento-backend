@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { applyWebsiteDesignPreferences, buildWebsiteTrustInstruction, normalizeWebsiteContent, parseWebsiteContact, parseWebsiteContent, preserveWebsiteContentExceptHeroLayout, preserveWebsiteHeroLayout, preserveWebsiteImageSlots, requestsWebsiteHeroLayoutChange, WebsiteContentParseError } from './websiteContent';
 import { defaultWebsiteDesignPreferences, parseWebsiteDesignPreferences } from './websiteDesignPreferences';
-import { buildCompactWebsiteGenerationInstruction, buildWebsiteGenerationInstruction, buildWebsiteGenerationSchemaInstruction, DEFAULT_WEBSITE_PALETTE, normalizeWebsitePalette } from './websiteDesignSystem';
+import { buildCompactWebsiteGenerationInstruction, buildWebsiteGenerationInstruction, buildWebsiteGenerationResponseSchema, buildWebsiteGenerationSchemaInstruction, DEFAULT_WEBSITE_PALETTE, normalizeWebsitePalette } from './websiteDesignSystem';
 
 const website = {
   title: 'Bella Restaurant',
@@ -360,4 +360,23 @@ test('website generation schema instruction explicitly defines hero variants and
   assert.match(instruction, /layoutVariant":"cinematic\|split\|centered-editorial \(hero only\)/);
   assert.match(instruction, /exactly one image slot for each selected image/);
   assert.match(instruction, /Do not add unselected images, substitute selected images, or return image URLs/);
+});
+
+test('website response schema constrains the generated website structure', () => {
+  const schema = buildWebsiteGenerationResponseSchema();
+  assert.deepEqual(schema.required, ['type', 'title', 'description', 'pages', 'imageSlots']);
+  const properties = schema.properties as Record<string, { items?: { properties?: Record<string, unknown> } }>;
+  const pageProperties = properties.pages.items?.properties;
+  assert.ok(pageProperties);
+  const pageSections = pageProperties.sections as { items?: { properties?: Record<string, unknown> } };
+  assert.deepEqual(
+    (pageSections.items?.properties?.type as { enum?: string[] }).enum,
+    ['hero', 'about', 'services', 'menu', 'gallery', 'location', 'contact', 'whatsapp'],
+  );
+  const imageSlots = properties.imageSlots.items?.properties;
+  assert.ok(imageSlots);
+  assert.deepEqual(
+    (imageSlots.role as { enum?: string[] }).enum,
+    ['hero', 'gallery', 'menu_item', 'section'],
+  );
 });

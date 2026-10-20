@@ -728,6 +728,7 @@ export async function askGemini(
   operationSignal?: AbortSignal,
   generationOptions?: {
     responseMimeType?: string;
+    responseJsonSchema?: unknown;
     maxOutputTokens?: number;
     googleSearch?: boolean;
     onGrounding?: (grounding: GeminiGroundingInfo) => void;
@@ -768,6 +769,7 @@ export async function askGemini(
             ...getGeminiGenerationTuning(model),
             maxOutputTokens: effectiveMaxOutputTokens,
             ...(generationOptions?.responseMimeType ? { responseMimeType: generationOptions.responseMimeType } : {}),
+            ...(generationOptions?.responseJsonSchema ? { responseJsonSchema: generationOptions.responseJsonSchema } : {}),
             ...(generationOptions?.googleSearch && model === NORMAL_CHAT_GOOGLE_SEARCH_MODEL
               ? { tools: [{ googleSearch: {} }] }
               : {}),

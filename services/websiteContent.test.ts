@@ -357,18 +357,23 @@ test('compact website generation guidance preserves image, hero, and factuality 
 
 test('website generation schema instruction explicitly defines hero variants and exact selected-image assignments', () => {
   const instruction = buildWebsiteGenerationSchemaInstruction();
-  assert.match(instruction, /layoutVariant":"cinematic\|split\|centered-editorial \(hero only\)/);
-  assert.match(instruction, /exactly one image slot for each selected image/);
-  assert.match(instruction, /Do not add unselected images, substitute selected images, or return image URLs/);
+  assert.match(instruction, /with exactly these fields and no others/);
+  assert.match(instruction, /exactly one imageSlots entry for each selected image/);
+  assert.match(instruction, /server applies the selected design preferences/);
+  assert.match(instruction, /Do not add unselected images/);
 });
 
 test('website response schema constrains the generated website structure', () => {
   const schema = buildWebsiteGenerationResponseSchema();
   assert.deepEqual(schema.required, ['type', 'title', 'description', 'pages', 'imageSlots']);
+  assert.equal(schema.additionalProperties, false);
   const properties = schema.properties as Record<string, { items?: { properties?: Record<string, unknown> } }>;
   const pageProperties = properties.pages.items?.properties;
   assert.ok(pageProperties);
   const pageSections = pageProperties.sections as { items?: { properties?: Record<string, unknown> } };
+  assert.equal((properties.pages.items as { additionalProperties?: boolean }).additionalProperties, false);
+  assert.equal((pageSections.items as { additionalProperties?: boolean }).additionalProperties, false);
+  assert.equal(pageSections.items?.properties?.layoutVariant, undefined);
   assert.deepEqual(
     (pageSections.items?.properties?.type as { enum?: string[] }).enum,
     ['hero', 'about', 'services', 'menu', 'gallery', 'location', 'contact', 'whatsapp'],

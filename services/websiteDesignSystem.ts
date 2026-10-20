@@ -131,7 +131,7 @@ Preserve owner-provided wording, prices, contact details, hours, and testimonial
 }
 
 export function buildWebsiteGenerationSchemaInstruction(): string {
-  return `Return JSON with this exact shape: {"type":"business|restaurant|portfolio|professional|other","title":"...","description":"...","designPreset":"coastal-editorial|trustworthy-professional|creative-portfolio|local-service|modern-business","designPreferences":{"designPreset":"coastal-editorial|trustworthy-professional|creative-portfolio|local-service|modern-business","heroImageMode":"background|beside|none","backgroundStyle":"warm|cool|neutral|sage","overlayStrength":"soft|balanced|strong","imageCrop":"center|top|bottom","imageMood":"..."},"theme":{"primaryColor":"#123456","secondaryColor":"#345678","backgroundColor":"#F8F8F5","surfaceColor":"#EEEEEA"},"pages":[{"id":"stable-id","title":"...","slug":"...","sections":[{"id":"stable-id","type":"hero|about|services|menu|gallery|location|contact|whatsapp","title":"...","body":"...","imageSlotId":null,"layoutVariant":"cinematic|split|centered-editorial (hero only)","overlayStrength":"soft|balanced|strong (hero only)","imageCrop":"center|top|bottom (hero only)"}]}],"menuCategories":[{"id":"stable-id","name":"...","items":[{"id":"stable-id","name":"...","description":"...","price":"650","currency":"KSh","imageUrl":null,"imageSlotId":null,"available":true}]}],"imageSlots":[{"id":"selected requirementId","role":"hero|gallery|menu_item|section","targetId":"existing section or menu item id, or null","query":"selected image requirement query","alt":"selected image alternative text","assetId":null}],"galleryImageUrls":[],"contact":{"address":"","phone":"","whatsappNumber":"","mapsUrl":"","email":"","openingHours":"","serviceArea":"","servicesAndPricing":"","testimonials":"","bookingUrl":""}}. Use 2 to 6 pages and create exactly one image slot for each selected image, with the exact requirementId, role, query, and alt text supplied. If no images are selected, return an empty imageSlots array and do not add any image slots. Attach each selected hero image to the hero section, menu_item images to a relevant menu item, gallery images to the gallery, and section images to the most relevant about/services section. Do not add unselected images, substitute selected images, or return image URLs. Do not invent contact details, menu prices, or factual claims. For restaurants, create menu categories/items only when requested. Return JSON only.`;
+  return `Return one JSON object with exactly these fields and no others: {"type":"business|restaurant|portfolio|professional|other","title":"...","description":"...","pages":[{"id":"unique-id","title":"...","slug":"...","sections":[{"id":"unique-id","type":"hero|about|services|menu|gallery|location|contact|whatsapp","title":"...","body":"...","imageSlotId":null}]}],"imageSlots":[{"id":"exact selected requirementId","role":"hero|gallery|menu_item|section","query":"exact selected image query","alt":"exact selected image alt text"}]}. Return 2 to 6 pages with at least one section each. Create exactly one imageSlots entry for each selected image, using its exact requirementId, role, query, and alt text; return an empty imageSlots array when no images are selected. Attach selected hero images to the hero section, gallery images to the gallery, and section images to the most relevant about/services section by setting imageSlotId to the exact requirementId. For menu_item images, preserve the selected role and exact requirementId. Do not add unselected images, invent image URLs, or return fields not in this shape. The server applies the selected design preferences and inserts owner-provided contact and menu details. Never invent contact details, prices, or factual claims. Return JSON only.`;
 }
 
 export function buildWebsiteGenerationResponseSchema() {
@@ -147,6 +147,7 @@ export function buildWebsiteGenerationResponseSchema() {
         type: 'array',
         items: {
           type: 'object',
+          additionalProperties: false,
           properties: {
             id: stringSchema,
             title: stringSchema,
@@ -155,15 +156,13 @@ export function buildWebsiteGenerationResponseSchema() {
               type: 'array',
               items: {
                 type: 'object',
+                additionalProperties: false,
                 properties: {
                   id: stringSchema,
                   type: { type: 'string', enum: ['hero', 'about', 'services', 'menu', 'gallery', 'location', 'contact', 'whatsapp'] },
                   title: stringSchema,
                   body: stringSchema,
                   imageSlotId: nullableStringSchema,
-                  layoutVariant: { type: 'string', enum: ['cinematic', 'split', 'centered-editorial'] },
-                  overlayStrength: { type: 'string', enum: ['soft', 'balanced', 'strong'] },
-                  imageCrop: { type: 'string', enum: ['center', 'top', 'bottom'] },
                 },
                 required: ['id', 'type', 'title'],
               },
@@ -176,6 +175,7 @@ export function buildWebsiteGenerationResponseSchema() {
         type: 'array',
         items: {
           type: 'object',
+          additionalProperties: false,
           properties: {
             id: stringSchema,
             role: { type: 'string', enum: ['hero', 'gallery', 'menu_item', 'section'] },
@@ -187,6 +187,7 @@ export function buildWebsiteGenerationResponseSchema() {
         },
       },
     },
+    additionalProperties: false,
     required: ['type', 'title', 'description', 'pages', 'imageSlots'],
   };
 }

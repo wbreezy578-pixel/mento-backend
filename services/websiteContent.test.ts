@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { applyWebsiteDesignPreferences, buildWebsiteTrustInstruction, normalizeWebsiteContent, parseWebsiteContact, parseWebsiteContent, preserveWebsiteContentExceptHeroLayout, preserveWebsiteHeroLayout, preserveWebsiteImageSlots, requestsWebsiteHeroLayoutChange } from './websiteContent';
+import { applyWebsiteDesignPreferences, buildWebsiteTrustInstruction, normalizeWebsiteContent, parseWebsiteContact, parseWebsiteContent, preserveWebsiteContentExceptHeroLayout, preserveWebsiteHeroLayout, preserveWebsiteImageSlots, requestsWebsiteHeroLayoutChange, WebsiteContentParseError } from './websiteContent';
 import { defaultWebsiteDesignPreferences, parseWebsiteDesignPreferences } from './websiteDesignPreferences';
-import { buildWebsiteGenerationInstruction, DEFAULT_WEBSITE_PALETTE, normalizeWebsitePalette } from './websiteDesignSystem';
+import { buildCompactWebsiteGenerationInstruction, buildWebsiteGenerationInstruction, buildWebsiteGenerationSchemaInstruction, DEFAULT_WEBSITE_PALETTE, normalizeWebsitePalette } from './websiteDesignSystem';
 
 const website = {
   title: 'Bella Restaurant',
@@ -338,5 +338,26 @@ test('rejects malformed sections, duplicate page slugs, and unsafe prices', () =
 
 test('parses only valid JSON structures', () => {
   assert.equal(parseWebsiteContent(JSON.stringify(website)).title, 'Bella Restaurant');
-  assert.throws(() => parseWebsiteContent('not json'), /valid website JSON/);
+  assert.throws(() => parseWebsiteContent('not json'), (error) => (
+    error instanceof WebsiteContentParseError && error.code === 'invalid_json'
+  ));
+  assert.throws(() => parseWebsiteContent(JSON.stringify({ title: 'Missing required pages' })), (error) => (
+    error instanceof WebsiteContentParseError && error.code === 'unsupported_structure'
+  ));
+});
+
+test('compact website generation guidance preserves image, hero, and factuality constraints', () => {
+  const instruction = buildCompactWebsiteGenerationInstruction('restaurant');
+  assert.match(instruction, /layoutVariant cinematic, split, or centered-editorial/);
+  assert.match(instruction, /exactly one imageSlots entry per selected image/);
+  assert.match(instruction, /Never invent bookings, ordering, contact details, prices/);
+  assert.match(instruction, /prevent horizontal overflow/);
+});
+
+test('website generation schema instruction explicitly defines hero variants and exact selected-image assignments', () => {
+  const instruction = buildWebsiteGenerationSchemaInstruction();
+  assert.match(instruction, /layoutVariant":"cinematic\|split\|centered-editorial \(hero only\)/);
+  assert.match(instruction, /exactly one image slot for each selected image/);
+  assert.match(instruction, /Do not add unselected images, substitute selected images, or return image URLs/);
+  assert.ok(instruction.length < 2_000);
 });

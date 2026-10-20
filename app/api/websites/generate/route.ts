@@ -15,8 +15,8 @@ import { readJsonBodyWithLimit, RequestBodyError } from '../../../../lib/request
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import logger from '../../../../lib/logger';
 import { buildTutorLanguageInstruction, getTutorLanguage } from '../../../../lib/userSettings';
-import { applyWebsiteDesignPreferences, buildWebsiteTrustInstruction, isWebsiteType, parseWebsiteContact, parseWebsiteContent, type WebsiteContent, type WebsiteType } from '../../../../services/websiteContent';
-import { buildWebsiteGenerationInstruction } from '../../../../services/websiteDesignSystem';
+import { applyWebsiteDesignPreferences, buildWebsiteTrustInstruction, isWebsiteType, parseWebsiteContact, parseWebsiteContent, WebsiteContentParseError, type WebsiteContent, type WebsiteType } from '../../../../services/websiteContent';
+import { buildCompactWebsiteGenerationInstruction, buildWebsiteGenerationSchemaInstruction } from '../../../../services/websiteDesignSystem';
 import { parseWebsiteDesignPreferences, type WebsiteDesignPreferences } from '../../../../services/websiteDesignPreferences';
 import type { WebsiteAssetCreateData } from '../../../../services/websiteAssetService';
 import { buildWebsiteApiView } from '../../../../services/websiteAssetApi';
@@ -159,19 +159,35 @@ export async function POST(req: Request) {
       openingHours: '', serviceArea: '', servicesAndPricing: '', testimonials: '', bookingUrl: '',
     });
     if (!title || title.length > 100 || !brief || brief.length > 600 || !fullPrompt || fullPrompt.length > MAX_PROMPT_LENGTH || !validType || !selectedImages || !requestedMenuItems || !businessDetails || !designPreferences || (body.type !== 'restaurant' && requestedMenuItems.length > 0)) {
+      logger.warn('Website generation request rejected', {
+        category: 'website_generation_request_rejected',
+        reasonCode: 'invalid_website_request',
+      });
       return NextResponse.json({ error: 'Add a website name, supported type, short description, full website prompt, valid business details, and image selections.', code: 'invalid_website_request' }, { status: 400, headers: jsonHeaders(req) });
     }
     if (body.designPreferences !== undefined && (
       (designPreferences.heroImageMode === 'none' && selectedImages.some((selection) => selection.role === 'hero'))
       || (designPreferences.heroImageMode !== 'none' && !selectedImages.some((selection) => selection.role === 'hero'))
     )) {
+      logger.warn('Website generation request rejected', {
+        category: 'website_generation_request_rejected',
+        reasonCode: 'hero_image_mode_mismatch',
+      });
       return NextResponse.json({ error: 'Choose a hero photo when using it as a background or beside the text, or choose “No hero photo”.', code: 'hero_image_mode_mismatch' }, { status: 400, headers: jsonHeaders(req) });
     }
     const requestedMenuIds = new Set(requestedMenuItems.map((item) => item.id));
     if (selectedImages.some((selection) => selection.role === 'menu_item' && selection.targetId && !requestedMenuIds.has(selection.targetId))) {
+      logger.warn('Website generation request rejected', {
+        category: 'website_generation_request_rejected',
+        reasonCode: 'invalid_menu_image_target',
+      });
       return NextResponse.json({ error: 'A selected menu photo does not match a menu item in this request.', code: 'invalid_menu_image_target' }, { status: 400, headers: jsonHeaders(req) });
     }
     if (!slugifyWebsiteName(title)) {
+      logger.warn('Website generation request rejected', {
+        category: 'website_generation_request_rejected',
+        reasonCode: 'invalid_website_slug',
+      });
       return NextResponse.json({ error: 'Choose a website name that can be used in a website address.', code: 'invalid_website_slug' }, { status: 400, headers: jsonHeaders(req) });
     }
     const draftSlug = createDraftWebsiteSlug(title);
@@ -197,6 +213,7 @@ export async function POST(req: Request) {
     } catch (error) {
       logger.warn('Selected Unsplash photo could not be verified', {
         category: 'unsplash_photo_verification_failed',
+        reasonCode: error instanceof UnsplashSearchError ? error.kind : 'verification_failed',
         errorName: error instanceof Error ? error.name : 'UnknownError',
       });
       if (error instanceof UnsplashSearchError && error.kind !== 'invalid_response') {
@@ -247,26 +264,56 @@ export async function POST(req: Request) {
           : '';
         const userPrompt = `${brief}\n\n${fullPrompt}\n\nStructured design direction (honor these exact safe options):\n${JSON.stringify(designPreferences)}\n\nOwner-provided trust details (preserve exactly; omit empty values):\n${JSON.stringify(businessDetails)}${menuInstructions}\n\nSelected image assets (use these exact requirement IDs, roles, and menu targets; do not substitute or invent image URLs):\n${JSON.stringify(selectedImageInstructions)}`;
         const language = await getTutorLanguage(userId);
-        const contents: GeminiMessage[] = [
+        const generationContents: GeminiMessage[] = [
           {
             role: 'system',
-            parts: [{ text: `${buildTutorLanguageInstruction(language)}\n${buildWebsiteGenerationInstruction(body.type as WebsiteType)}\n${buildWebsiteTrustInstruction()}\n\nReturn JSON with this exact shape: {"type":"business|restaurant|portfolio|professional|other","title":"...","description":"...","designPreset":"coastal-editorial|trustworthy-professional|creative-portfolio|local-service|modern-business","designPreferences":{"designPreset":"coastal-editorial|trustworthy-professional|creative-portfolio|local-service|modern-business","heroImageMode":"background|beside|none","backgroundStyle":"warm|cool|neutral|sage","overlayStrength":"soft|balanced|strong","imageCrop":"center|top|bottom","imageMood":"..."},"theme":{"primaryColor":"#123456","secondaryColor":"#345678","backgroundColor":"#F8F8F5","surfaceColor":"#EEEEEA"},"pages":[{"id":"stable-id","title":"...","slug":"...","sections":[{"id":"stable-id","type":"hero|about|services|menu|gallery|location|contact|whatsapp","title":"...","body":"...","imageSlotId":null,"layoutVariant":"cinematic|split|centered-editorial (hero only)","overlayStrength":"soft|balanced|strong (hero only)","imageCrop":"center|top|bottom (hero only)"}]}],"menuCategories":[{"id":"stable-id","name":"...","items":[{"id":"stable-id","name":"...","description":"...","price":"650","currency":"KSh","imageUrl":null,"imageSlotId":null,"available":true}]}],"imageSlots":[{"id":"selected requirementId","role":"hero|gallery|menu_item|section","targetId":"existing section or menu item id, or null","query":"selected image requirement query","alt":"selected image alternative text","assetId":null}],"galleryImageUrls":[],"contact":{"address":"","phone":"","whatsappNumber":"","mapsUrl":"","email":"","openingHours":"","serviceArea":"","servicesAndPricing":"","testimonials":"","bookingUrl":""}}. Use 2 to 6 pages and create exactly one image slot for each selected image, with the exact requirementId, role, query, and alt text supplied. If no images are selected, return an empty imageSlots array and do not add any image slots. Attach each selected hero image to the hero section, menu_item images to a relevant menu item, gallery images to the gallery, and section images to the most relevant about/services section. Do not add unselected images, substitute selected images, or return image URLs. Do not invent contact details, menu prices, or factual claims. For restaurants, create menu categories/items only when requested. Return JSON only.` }],
+            parts: [{
+              text: `${buildTutorLanguageInstruction(language)}\nCreate Mento Webs structured content. Follow the output schema and safety requirements in the request. Return JSON only; never emit HTML, CSS, JavaScript, or executable code.`,
+            }],
           },
-          { role: 'user', parts: [{ text: sanitizedInput ?? userPrompt }] },
+          {
+            role: 'user',
+            parts: [{
+              text: `${sanitizedInput ?? userPrompt}\n\n${buildCompactWebsiteGenerationInstruction(body.type as WebsiteType)}\n${buildWebsiteTrustInstruction()}\n\n${buildWebsiteGenerationSchemaInstruction()}`,
+            }],
+          },
         ];
+        let attemptedModel: string | null = null;
+        const reportModelAttempt = async (model: string) => {
+          attemptedModel = model;
+          return reportProviderAttempt(model);
+        };
         const model = decision.modelUsed ?? undefined;
         const generationOptions = { responseMimeType: 'application/json', maxOutputTokens: 8192 };
-        const response = await askGemini(contents, model, reportUsage, reportProviderAttempt, req.signal, generationOptions);
+        const response = await askGemini(generationContents, model, reportUsage, reportModelAttempt, req.signal, generationOptions);
         let parsed: WebsiteContent;
         try {
           parsed = parseWebsiteContent(response, body.type as WebsiteType);
-        } catch {
+        } catch (error) {
+          logger.warn('Website generation response rejected', {
+            category: 'website_generation_output_rejected',
+            stage: 'initial',
+            reasonCode: error instanceof WebsiteContentParseError ? error.code : 'unknown_validation_error',
+            providerModel: attemptedModel ?? 'unknown',
+            responseBytes: Buffer.byteLength(response, 'utf8'),
+          });
           const repairedResponse = await askGemini([
-            ...contents,
+            ...generationContents,
             { role: 'model', parts: [{ text: response }] },
-            { role: 'user', parts: [{ text: 'The previous response did not match the required website JSON shape. Return a corrected complete JSON object only. Preserve the requested website content and do not include code.' }] },
-          ], model, reportUsage, reportProviderAttempt, req.signal, generationOptions);
-          parsed = parseWebsiteContent(repairedResponse, body.type as WebsiteType);
+            { role: 'user', parts: [{ text: `The previous website response failed validation (${error instanceof WebsiteContentParseError ? error.code : 'unknown_validation_error'}). Return a complete corrected JSON object that matches the supplied schema. Preserve the requested content and selected image-slot assignments. Do not return HTML, CSS, JavaScript, or explanations.` }] },
+          ], model, reportUsage, reportModelAttempt, req.signal, generationOptions);
+          try {
+            parsed = parseWebsiteContent(repairedResponse, body.type as WebsiteType);
+          } catch (repairError) {
+            logger.warn('Website generation repair response rejected', {
+              category: 'website_generation_output_rejected',
+              stage: 'repair',
+              reasonCode: repairError instanceof WebsiteContentParseError ? repairError.code : 'unknown_validation_error',
+              providerModel: attemptedModel ?? 'unknown',
+              responseBytes: Buffer.byteLength(repairedResponse, 'utf8'),
+            });
+            throw repairError;
+          }
         }
         parsed = body.designPreferences !== undefined
           ? applyWebsiteDesignPreferences(parsed, designPreferences as WebsiteDesignPreferences)
@@ -516,6 +563,17 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: error.message, code: error.code }, { status: error.status, headers: jsonHeaders(req) });
     }
     if (error instanceof AIRequestGatewayError) {
+      const body = error.body && typeof error.body === 'object' && !Array.isArray(error.body)
+        ? error.body as Record<string, unknown>
+        : null;
+      const reasonCode = typeof body?.code === 'string' && /^[a-z0-9_]{1,64}$/.test(body.code)
+        ? body.code
+        : 'gateway_rejected';
+      logger.warn('Website generation blocked by AI gateway', {
+        category: 'website_generation_gateway_rejected',
+        status: error.status,
+        reasonCode,
+      });
       return NextResponse.json(error.body, { status: error.status, headers: { ...error.headers, ...jsonHeaders(req) } });
     }
     if (error instanceof WebsiteAccessError) return NextResponse.json({ error: error.message }, { status: error.status, headers: jsonHeaders(req) });

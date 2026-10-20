@@ -522,14 +522,23 @@ export function preserveWebsiteContentExceptHeroLayout(existing: WebsiteContent,
   };
 }
 
+export class WebsiteContentParseError extends Error {
+  constructor(readonly code: 'invalid_json' | 'unsupported_structure') {
+    super(code === 'invalid_json'
+      ? 'Gemini did not return valid website JSON.'
+      : 'Gemini returned website content outside the supported structure.');
+    this.name = 'WebsiteContentParseError';
+  }
+}
+
 export function parseWebsiteContent(response: string, fallbackType: WebsiteType = 'other'): WebsiteContent {
   let parsed: unknown;
   try {
     parsed = JSON.parse(response);
   } catch {
-    throw new Error('Gemini did not return valid website JSON.');
+    throw new WebsiteContentParseError('invalid_json');
   }
   const content = normalizeWebsiteContent(parsed, fallbackType);
-  if (!content) throw new Error('Gemini returned website content outside the supported structure.');
+  if (!content) throw new WebsiteContentParseError('unsupported_structure');
   return content;
 }

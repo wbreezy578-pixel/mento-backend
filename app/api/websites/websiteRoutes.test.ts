@@ -41,6 +41,7 @@ const mocks = vi.hoisted(() => ({
   deletePrivateWebsiteUpload: vi.fn(),
   deleteWebsiteDeploymentArtifacts: vi.fn(),
   loggerError: vi.fn(),
+  loggerWarn: vi.fn(),
   ensureWebsiteWorkerDomain: vi.fn(),
   isWebsTestingMode: vi.fn(),
   getVerifiedUnsplashPhoto: vi.fn(),
@@ -50,8 +51,9 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../../lib/aiSecurityGateway', () => ({
   AIRequestGatewayError: class AIRequestGatewayError extends Error {
-    status = 500;
-    body: unknown = null;
+    constructor(public status = 500, public body: unknown = null) {
+      super('AI request rejected');
+    }
     headers = {};
   },
   authenticateAIRequest: mocks.authenticateAIRequest,
@@ -114,8 +116,9 @@ vi.mock('../../../lib/userSettings', () => ({
   getTutorLanguage: mocks.getTutorLanguage,
   buildTutorLanguageInstruction: mocks.buildTutorLanguageInstruction,
 }));
-vi.mock('../../../lib/logger', () => ({ default: { error: mocks.loggerError, info: vi.fn(), warn: vi.fn() } }));
+vi.mock('../../../lib/logger', () => ({ default: { error: mocks.loggerError, info: vi.fn(), warn: mocks.loggerWarn } }));
 
+import { AIRequestGatewayError } from '../../../lib/aiSecurityGateway';
 import { GET as listWebsites } from './route';
 import { GET as getWebsiteBilling } from './billing/route';
 import { POST as generateWebsite } from './generate/route';
@@ -633,6 +636,91 @@ describe('Websites API ownership and AI contract', () => {
     expect(mocks.buildWebsiteApiView).toHaveBeenCalledWith(expect.objectContaining({ id: expect.any(String), content: expect.any(Object) }));
   });
 
+  it('rejects a hero image left selected after choosing no hero photo and logs only its reason code', async () => {
+    const response = await generateWebsite(request('https://mento.test/api/websites/generate', {
+      title: 'Bella Restaurant',
+      type: 'restaurant',
+      brief: 'Swahili and seafood dishes in Mombasa.',
+      fullPrompt: 'Create a useful restaurant website.',
+      designPreferences: {
+        designPreset: 'coastal-editorial',
+        heroImageMode: 'none',
+        backgroundStyle: 'warm',
+        overlayStrength: 'balanced',
+        imageCrop: 'center',
+        imageMood: '',
+      },
+      selectedImages: [{
+        requirementId: 'hero-main',
+        role: 'hero',
+        query: 'coastal restaurant',
+        alt: 'Coastal restaurant',
+        source: 'user_upload',
+      }],
+      requestId: 'website-create-stale-hero-1234',
+    }));
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ code: 'hero_image_mode_mismatch' });
+    expect(mocks.askGemini).not.toHaveBeenCalled();
+    expect(mocks.loggerWarn).toHaveBeenCalledWith('Website generation request rejected', {
+      category: 'website_generation_request_rejected',
+      reasonCode: 'hero_image_mode_mismatch',
+    });
+  });
+
+  it('logs a safe reason code for AI gateway rate limits', async () => {
+    mocks.enforceAIGatewayRateLimit.mockRejectedValueOnce(new AIRequestGatewayError(429, {
+      error: 'AI requests are temporarily limited.',
+      code: 'rate_limit_exceeded',
+    }));
+
+    const response = await generateWebsite(request('https://mento.test/api/websites/generate', {}));
+
+    expect(response.status).toBe(429);
+    expect(mocks.loggerWarn).toHaveBeenCalledWith('Website generation blocked by AI gateway', {
+      category: 'website_generation_gateway_rejected',
+      status: 429,
+      reasonCode: 'rate_limit_exceeded',
+    });
+  });
+
+  it('logs model and validation-stage codes when Gemini output and its repair are invalid', async () => {
+    mocks.askGemini.mockImplementation(async (
+      _contents: unknown,
+      model: string | undefined,
+      _reportUsage: unknown,
+      reportProviderAttempt: (model: string) => Promise<unknown>,
+    ) => {
+      await reportProviderAttempt(model ?? 'unknown-model');
+      return 'not JSON';
+    });
+
+    const response = await generateWebsite(request('https://mento.test/api/websites/generate', {
+      title: 'Bella Restaurant',
+      type: 'restaurant',
+      brief: 'Swahili and seafood dishes in Mombasa.',
+      fullPrompt: 'Create a useful restaurant website.',
+      selectedImages: [],
+      requestId: 'website-create-invalid-json-1234',
+    }));
+
+    expect(response.status).toBe(500);
+    expect(mocks.loggerWarn).toHaveBeenCalledWith('Website generation response rejected', expect.objectContaining({
+      category: 'website_generation_output_rejected',
+      stage: 'initial',
+      reasonCode: 'invalid_json',
+      providerModel: 'gemini-test',
+    }));
+    expect(mocks.loggerWarn).toHaveBeenCalledWith('Website generation repair response rejected', expect.objectContaining({
+      category: 'website_generation_output_rejected',
+      stage: 'repair',
+      reasonCode: 'invalid_json',
+      providerModel: 'gemini-test',
+    }));
+    expect(JSON.stringify(mocks.loggerWarn.mock.calls)).not.toContain('not JSON');
+  });
+
   it('persists owner-provided trust details exactly and rejects unsafe booking links', async () => {
     const businessDetails = {
       address: 'Mombasa',
@@ -659,7 +747,7 @@ describe('Websites API ownership and AI contract', () => {
 
     expect(response.status).toBe(201);
     expect(savedContent.contact).toEqual({ ...businessDetails, whatsappNumber: '+254711111111' });
-    expect(mocks.askGemini.mock.calls[0][0][0].parts[0].text).toContain('exact owner-approved testimonials');
+    expect(mocks.askGemini.mock.calls[0][0][1].parts[0].text).toContain('exact owner-approved testimonials');
 
     const invalid = await generateWebsite(request('https://mento.test/api/websites/generate', {
       title: 'Bella Restaurant',
@@ -707,8 +795,12 @@ describe('Websites API ownership and AI contract', () => {
 
     expect(response.status).toBe(201);
     const generationSystemPrompt = mocks.askGemini.mock.calls[0][0].find((message) => message.role === 'system')?.parts[0]?.text;
-    expect(generationSystemPrompt).toContain('layoutVariant":"cinematic|split|centered-editorial (hero only)');
-    expect(generationSystemPrompt).toContain('For each hero section, set layoutVariant to exactly one of: cinematic, split, centered-editorial.');
+    const generationUserPrompt = mocks.askGemini.mock.calls[0][0].find((message) => message.role === 'user')?.parts[0]?.text;
+    expect(generationSystemPrompt).toContain('Create Mento Webs structured content');
+    expect(generationSystemPrompt).not.toContain('Return JSON with this exact shape');
+    expect(generationUserPrompt).toContain('layoutVariant":"cinematic|split|centered-editorial (hero only)');
+    expect(generationUserPrompt).toContain('For every hero, choose layoutVariant cinematic, split, or centered-editorial.');
+    expect(generationSystemPrompt!.length).toBeLessThan(2500);
     expect(mocks.getVerifiedUnsplashPhoto).toHaveBeenCalledWith('photo-1');
     expect(mocks.website.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({

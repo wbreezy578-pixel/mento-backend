@@ -16,6 +16,10 @@ export function isFreeWebsTestingUsage(feature: string, metadata: Record<string,
     && metadata.source === 'websites';
 }
 
+export function shouldBypassWebsUserAllowance(feature: string, metadata: Record<string, unknown>): boolean {
+  return isFreeWebsTestingUsage(feature, metadata);
+}
+
 export function resolveWebsUserCharge(
   feature: string,
   metadata: Record<string, unknown>,

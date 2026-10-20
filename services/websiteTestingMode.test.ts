@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { isFreeWebsTestingUsage, isWebsTestingMode, resolveWebsUserCharge } from './websiteTestingMode';
+import { isFreeWebsTestingUsage, isWebsTestingMode, resolveWebsUserCharge, shouldBypassWebsUserAllowance } from './websiteTestingMode';
 
 afterEach(() => {
   vi.unstubAllEnvs();
@@ -30,5 +30,17 @@ describe('Blue Webs testing mode', () => {
     expect(isFreeWebsTestingUsage('chat', { source: 'websites' })).toBe(false);
     expect(resolveWebsUserCharge('website', { source: 'websites' }, 1.25)).toBe(0);
     expect(resolveWebsUserCharge('chat', { source: 'websites' }, 1.25)).toBe(1.25);
+  });
+
+  it('bypasses per-user plan allowances only for website-source website and image requests in Blue test mode', () => {
+    vi.stubEnv('MENTO_BACKEND_ENV', 'blue');
+    vi.stubEnv('WEBS_TEST_MODE', 'true');
+    expect(shouldBypassWebsUserAllowance('website', { source: 'websites' })).toBe(true);
+    expect(shouldBypassWebsUserAllowance('image', { source: 'websites' })).toBe(true);
+    expect(shouldBypassWebsUserAllowance('image', { source: 'profile-photo' })).toBe(false);
+    expect(shouldBypassWebsUserAllowance('chat', { source: 'websites' })).toBe(false);
+
+    vi.stubEnv('WEBS_TEST_MODE', 'false');
+    expect(shouldBypassWebsUserAllowance('image', { source: 'websites' })).toBe(false);
   });
 });

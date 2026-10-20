@@ -97,6 +97,20 @@ describe('Normal Chat billing reservation path', () => {
     expect(editQuota).toBeGreaterThan(idempotencyRead);
     expect(reservationWrite).toBeGreaterThan(projectQuota);
     expect(reservationWrite).toBeGreaterThan(editQuota);
+    expect(body).toContain('shouldBypassWebsUserAllowance(validatedInput.feature, validatedInput.metadata)');
+    expect(body).toMatch(/const allowed = freeWebsTestUsage \|\|/);
+    expect(body).toContain('!freeWebsTestUsage');
+    expect(body).toContain('assertAndLockGeminiDailyBudget(tx');
+  });
+
+  it('waives Blue Websites test-mode user charges at reservation and finalization', () => {
+    const reservation = reserveUsageBody();
+    const finalizationStart = billingSource.indexOf('export async function finalizeUsage(');
+    const finalizationEnd = billingSource.indexOf('\nexport async function ', finalizationStart + 1);
+    const finalization = billingSource.slice(finalizationStart, finalizationEnd);
+
+    expect(reservation).toContain('resolveWebsUserCharge(validatedInput.feature, validatedInput.metadata, calculatedUserChargeUSD)');
+    expect(finalization).toContain('resolveWebsUserCharge(');
   });
 
   it('records an allowed chat request as pending until the provider finishes', () => {

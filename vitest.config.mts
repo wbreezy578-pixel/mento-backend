@@ -84,6 +84,7 @@ export default defineConfig({
       "services/accountDeletionService.test.ts",
       "services/nativeStoreService.googlePlay.test.ts",
       "services/websiteStaticSite.test.ts",
+      "services/websiteTestingMode.test.ts",
       "services/websiteQrService.test.ts",
       "services/websiteDeploymentStorage.test.ts",
       "workers/mento-webs-router/src/index.test.ts",

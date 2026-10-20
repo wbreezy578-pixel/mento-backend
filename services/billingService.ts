@@ -10,6 +10,7 @@ import { incrementMonitoringFailure, observeMonitoringLatency } from '../lib/mon
 import logger from '../lib/logger';
 import '../lib/metrics';
 import { canStartLiveTutorSession } from './liveTutorBillingPolicy';
+import { resolveWebsUserCharge, shouldBypassWebsUserAllowance } from './websiteTestingMode';
 import { evaluateCompletedAllowance, getProductPolicy, getUtcDayWindow, getFreeMonthlyWindow, resolveAllowanceReset, resolvePolicyModel, type AllowanceLimitScope } from './productPolicy';
 import { allocateLiveTutorConsumption, getAvailableLiveTutorSeconds } from './entitlementService';
 import { calculateGeminiProviderCostUSD, GEMINI_PRICING_SOURCE, GEMINI_PRICING_VERSION, isSupportedNormalChatModel } from './geminiPricing';
@@ -840,6 +841,7 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
     transactionTotal: null,
   };
   const validatedInput = validateBillingReservationInput(input);
+  const freeWebsTestUsage = shouldBypassWebsUserAllowance(validatedInput.feature, validatedInput.metadata);
   const plansStartedAt = Date.now();
   const defaultPlans = await ensureDefaultPlans();
   reservationStageMs.plans = Date.now() - plansStartedAt;
@@ -857,13 +859,17 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
     secondsUsed: validatedInput.secondsUsed,
   };
   const pricingStartedAt = Date.now();
-  const [providerCostUSD, userChargeUSD, profitUSD] = isZeroCostPendingGeminiChatReservation(validatedInput)
+  const [providerCostUSD, calculatedUserChargeUSD, calculatedProfitUSD] = isZeroCostPendingGeminiChatReservation(validatedInput)
     ? [0, 0, 0]
     : await Promise.all([
         calculateProviderCost(economicsInput),
         calculateUserCharge(economicsInput),
         calculateProfit(economicsInput),
       ]);
+  const userChargeUSD = resolveWebsUserCharge(validatedInput.feature, validatedInput.metadata, calculatedUserChargeUSD);
+  const profitUSD = userChargeUSD === calculatedUserChargeUSD
+    ? calculatedProfitUSD
+    : userChargeUSD - providerCostUSD;
   reservationStageMs.pricing = Date.now() - pricingStartedAt;
   logger.info('Billing reservation preflight completed', {
     requestId: validatedInput.requestId ?? null,
@@ -1077,9 +1083,9 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const websiteAiEdit = validatedInput.feature === 'website' && websiteOperationType === 'website.ai_edit';
       let websiteProjectLimitExceeded = false;
       let websiteEditLimitExceeded = false;
-      const websiteProRequired = validatedInput.feature === 'website' && effectivePlan.name !== 'PRO';
+      const websiteProRequired = validatedInput.feature === 'website' && effectivePlan.name !== 'PRO' && !freeWebsTestUsage;
 
-      if ((websiteGeneration || websiteAiEdit) && !websiteProRequired) {
+      if ((websiteGeneration || websiteAiEdit) && !websiteProRequired && !freeWebsTestUsage) {
         const periodWindow = { gte: monthlyStart, lt: monthlyEnd };
         if (websiteGeneration) {
           const [createdProjects, pendingCreations] = await Promise.all([
@@ -1170,11 +1176,11 @@ export async function reserveUsage(input: BillingReservationInput): Promise<Bill
       const remainingUsage = dailyRemaining === null ? monthlyRemaining
         : monthlyRemaining === null ? dailyRemaining
         : Math.min(dailyRemaining, monthlyRemaining);
-      const allowed = !websiteProRequired
+      const allowed = freeWebsTestUsage || (!websiteProRequired
         && !websiteProjectLimitExceeded
         && !websiteEditLimitExceeded
         && (allowance?.allowed ?? ((typeof usageLimit !== 'number' || used + validatedInput.amount <= usageLimit)
-          && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit)));
+          && (monthlyLimit === null || monthlyUsed + validatedInput.amount <= monthlyLimit))));
       const effectiveAllowed = pendingReservation ? allowed : (validatedInput.success === false ? false : allowed);
       const reason = pendingReservation
         ? 'Usage reservation pending.'
@@ -1464,13 +1470,18 @@ export async function finalizeUsage(input: BillingReservationInput): Promise<Bil
         tokensOutput: billableOutputTokens,
         secondsUsed: validatedInput.secondsUsed,
       }));
-  const userChargeUSD = await calculateUserCharge({
+  const calculatedUserChargeUSD = await calculateUserCharge({
     feature: validatedInput.feature,
     provider,
     tokensInput: validatedInput.tokensInput,
     tokensOutput: billableOutputTokens,
     secondsUsed: validatedInput.secondsUsed,
   });
+  const userChargeUSD = resolveWebsUserCharge(
+    validatedInput.feature,
+    validatedInput.metadata,
+    calculatedUserChargeUSD,
+  );
   const profitUSD = userChargeUSD - providerCostUSD;
   const finalizedMetadata = provider === 'Gemini'
     ? { ...validatedInput.metadata, pricingSource: GEMINI_PRICING_SOURCE, pricingVersion: GEMINI_PRICING_VERSION }
@@ -2009,4 +2020,3 @@ export async function rollbackUsage(input: BillingReservationInput): Promise<Bil
     throw error;
   }
 }
-

@@ -102,6 +102,14 @@ const presetGuidance: Record<WebsiteDesignPreset, string> = {
   'modern-business': 'Use a distinctive, clean editorial layout with a specific business goal and clear primary action. Keep the shared Mento standard photo-led and polished, with a clear brand header, coordinated page surfaces, and a calm visual rhythm. Use business-matched imagery and coordinated, understated backgrounds; do not default to generic SaaS cards or gradients.',
 };
 
+const compactPresetGuidance: Record<WebsiteDesignPreset, string> = {
+  'coastal-editorial': 'Use warm editorial food photography and prioritize menu discovery.',
+  'trustworthy-professional': 'Use restrained colors, legible type, and clear service and contact hierarchy.',
+  'creative-portfolio': 'Lead with project imagery, expressive type, and concise project navigation.',
+  'local-service': 'Prioritize service area, contact actions, and relevant real-world imagery.',
+  'modern-business': 'Use clean editorial composition and goal-focused navigation, not generic SaaS cards.',
+};
+
 export function resolveDesignPreset(type: WebsiteType, candidate: unknown): WebsiteDesignPreset {
   return typeof candidate === 'string' && WEBSITE_DESIGN_PRESETS.includes(candidate as WebsiteDesignPreset)
     ? candidate as WebsiteDesignPreset
@@ -111,7 +119,7 @@ export function resolveDesignPreset(type: WebsiteType, candidate: unknown): Webs
 export function buildCompactWebsiteGenerationInstruction(type: WebsiteType): string {
   return `Create a distinctive, publishable ${type} website as one JSON object matching the supplied schema. Never return HTML, CSS, JavaScript, markdown, or prose outside the JSON.
 
-Design: choose one designPreset from ${WEBSITE_DESIGN_PRESETS.join(', ')}. ${presetGuidance[DEFAULT_DESIGN_PRESET[type]]} Match the palette to the business with four readable six-digit hex colors, one heading font, one body font, consistent spacing, and a mobile-first type hierarchy. Avoid generic templates, filler, unrelated colors, arbitrary gradients, and decorative animation.
+Design: choose one designPreset from ${WEBSITE_DESIGN_PRESETS.join(', ')}. ${compactPresetGuidance[DEFAULT_DESIGN_PRESET[type]]} Match the palette to the business with four readable six-digit hex colors, one heading font, one body font, consistent spacing, and a mobile-first type hierarchy. Avoid generic templates, filler, unrelated colors, arbitrary gradients, and decorative animation.
 
 Hero and content: make the headline specific to the offer and audience; explain its value concisely. Avoid generic openers. Include one action supported by the brief. Never invent bookings, ordering, contact details, prices, credentials, awards, customers, guarantees, or statistics. Omit missing facts. Keep IDs unique and stable. For restaurants, organize only provided or requested menu details into clear categories.
 

@@ -352,6 +352,7 @@ test('compact website generation guidance preserves image, hero, and factuality 
   assert.match(instruction, /exactly one imageSlots entry per selected image/);
   assert.match(instruction, /Never invent bookings, ordering, contact details, prices/);
   assert.match(instruction, /prevent horizontal overflow/);
+  assert.ok(instruction.length < 2_000);
 });
 
 test('website generation schema instruction explicitly defines hero variants and exact selected-image assignments', () => {
@@ -359,5 +360,4 @@ test('website generation schema instruction explicitly defines hero variants and
   assert.match(instruction, /layoutVariant":"cinematic\|split\|centered-editorial \(hero only\)/);
   assert.match(instruction, /exactly one image slot for each selected image/);
   assert.match(instruction, /Do not add unselected images, substitute selected images, or return image URLs/);
-  assert.ok(instruction.length < 2_000);
 });

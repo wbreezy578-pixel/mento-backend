@@ -286,7 +286,7 @@ export async function POST(req: Request) {
         const model = decision.modelUsed ?? undefined;
         const generationOptions = {
           responseMimeType: 'application/json',
-          responseJsonSchema: buildWebsiteGenerationResponseSchema(),
+          responseJsonSchema: buildWebsiteGenerationResponseSchema(selectedImages),
           maxOutputTokens: 8192,
         };
         const response = await askGemini(generationContents, model, reportUsage, reportModelAttempt, req.signal, generationOptions);

@@ -364,12 +364,17 @@ test('website generation schema instruction explicitly defines hero variants and
 });
 
 test('website response schema constrains the generated website structure', () => {
-  const schema = buildWebsiteGenerationResponseSchema();
+  const schema = buildWebsiteGenerationResponseSchema([
+    { requirementId: 'hero-main', role: 'hero', query: 'restaurant dining room', alt: 'Coastal dining room' },
+  ]);
   assert.deepEqual(schema.required, ['type', 'title', 'description', 'pages', 'imageSlots']);
   assert.equal(schema.additionalProperties, false);
   const properties = schema.properties as Record<string, { items?: { properties?: Record<string, unknown> } }>;
   const pageProperties = properties.pages.items?.properties;
   assert.ok(pageProperties);
+  assert.equal((properties.pages as { minItems: number }).minItems, 2);
+  assert.equal((properties.pages as { maxItems: number }).maxItems, 6);
+  assert.deepEqual((pageProperties.slug as unknown), { type: 'string' });
   const pageSections = pageProperties.sections as { items?: { properties?: Record<string, unknown> } };
   assert.equal((properties.pages.items as { additionalProperties?: boolean }).additionalProperties, false);
   assert.equal((pageSections.items as { additionalProperties?: boolean }).additionalProperties, false);
@@ -380,8 +385,12 @@ test('website response schema constrains the generated website structure', () =>
   );
   const imageSlots = properties.imageSlots.items?.properties;
   assert.ok(imageSlots);
+  assert.equal((properties.imageSlots as { minItems: number }).minItems, 1);
+  assert.equal((properties.imageSlots as { maxItems: number }).maxItems, 1);
+  assert.deepEqual(imageSlots.id, { type: 'string', enum: ['hero-main'] });
+  assert.deepEqual(imageSlots.query, { type: 'string', enum: ['restaurant dining room'] });
   assert.deepEqual(
     (imageSlots.role as { enum?: string[] }).enum,
-    ['hero', 'gallery', 'menu_item', 'section'],
+    ['hero'],
   );
 });

@@ -134,9 +134,38 @@ export function buildWebsiteGenerationSchemaInstruction(): string {
   return `Return one JSON object with exactly these fields and no others: {"type":"business|restaurant|portfolio|professional|other","title":"...","description":"...","pages":[{"id":"unique-id","title":"...","slug":"...","sections":[{"id":"unique-id","type":"hero|about|services|menu|gallery|location|contact|whatsapp","title":"...","body":"...","imageSlotId":null}]}],"imageSlots":[{"id":"exact selected requirementId","role":"hero|gallery|menu_item|section","query":"exact selected image query","alt":"exact selected image alt text"}]}. Return 2 to 6 pages with at least one section each. Create exactly one imageSlots entry for each selected image, using its exact requirementId, role, query, and alt text; return an empty imageSlots array when no images are selected. Attach selected hero images to the hero section, gallery images to the gallery, and section images to the most relevant about/services section by setting imageSlotId to the exact requirementId. For menu_item images, preserve the selected role and exact requirementId. Do not add unselected images, invent image URLs, or return fields not in this shape. The server applies the selected design preferences and inserts owner-provided contact and menu details. Never invent contact details, prices, or factual claims. Return JSON only.`;
 }
 
-export function buildWebsiteGenerationResponseSchema() {
+export function buildWebsiteGenerationResponseSchema(
+  selectedImages: readonly { requirementId: string; role: string; query: string; alt: string }[] = [],
+) {
   const stringSchema = { type: 'string' };
-  const nullableStringSchema = { anyOf: [{ type: 'string' }, { type: 'null' }] };
+  const selectedRequirementIds = selectedImages.map((image) => image.requirementId);
+  const nullableStringSchema = selectedRequirementIds.length
+    ? { anyOf: [{ type: 'string', enum: selectedRequirementIds }, { type: 'null' }] }
+    : { type: 'null' };
+  const responseImageSlots = {
+    type: 'array',
+    minItems: selectedImages.length,
+    maxItems: selectedImages.length,
+    items: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        id: selectedImages.length
+          ? { type: 'string', enum: selectedRequirementIds }
+          : stringSchema,
+        role: selectedImages.length
+          ? { type: 'string', enum: [...new Set(selectedImages.map((image) => image.role))] }
+          : { type: 'string', enum: ['hero', 'gallery', 'menu_item', 'section'] },
+        query: selectedImages.length
+          ? { type: 'string', enum: [...new Set(selectedImages.map((image) => image.query))] }
+          : stringSchema,
+        alt: selectedImages.length
+          ? { type: 'string', enum: [...new Set(selectedImages.map((image) => image.alt))] }
+          : stringSchema,
+      },
+      required: ['id', 'role', 'query', 'alt'],
+    },
+  };
   return {
     type: 'object',
     properties: {
@@ -145,6 +174,8 @@ export function buildWebsiteGenerationResponseSchema() {
       description: stringSchema,
       pages: {
         type: 'array',
+        minItems: 2,
+        maxItems: 6,
         items: {
           type: 'object',
           additionalProperties: false,
@@ -154,6 +185,8 @@ export function buildWebsiteGenerationResponseSchema() {
             slug: stringSchema,
             sections: {
               type: 'array',
+              minItems: 1,
+              maxItems: 12,
               items: {
                 type: 'object',
                 additionalProperties: false,
@@ -168,24 +201,10 @@ export function buildWebsiteGenerationResponseSchema() {
               },
             },
           },
-          required: ['title', 'sections'],
+          required: ['id', 'title', 'slug', 'sections'],
         },
       },
-      imageSlots: {
-        type: 'array',
-        items: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            id: stringSchema,
-            role: { type: 'string', enum: ['hero', 'gallery', 'menu_item', 'section'] },
-            targetId: nullableStringSchema,
-            query: stringSchema,
-            alt: stringSchema,
-          },
-          required: ['id', 'role', 'query', 'alt'],
-        },
-      },
+      imageSlots: responseImageSlots,
     },
     additionalProperties: false,
     required: ['type', 'title', 'description', 'pages', 'imageSlots'],

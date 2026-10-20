@@ -7,6 +7,8 @@ import { readJsonBodyWithLimit, RequestBodyError } from '../../../../../lib/requ
 import { buildCorsHeaders } from '../../../../../lib/securityHeaders';
 import { isWebsiteSlugUniqueConstraintError, slugifyWebsiteName } from '../../../../../services/websiteDeploymentService';
 import { ensureWebsiteWorkerDomain, WebsiteHostnameProvisioningError } from '../../../../../services/websiteCloudflareDomainService';
+import { readPrivateWebsiteUpload } from '../../../../../services/websiteAssetService';
+import { normalizeWebsiteContent } from '../../../../../services/websiteContent';
 import {
   createWebsiteHostname,
   deleteWebsiteDeploymentArtifacts,
@@ -16,9 +18,11 @@ import {
 } from '../../../../../services/websiteDeploymentStorage';
 import {
   getScheduledWebsiteHostingLimit,
+  getWebsiteBillingSnapshot,
   getWebsiteHostingEntitlement,
   type WebsiteHostingAccountSnapshot,
 } from '../../../../../services/websiteBillingService';
+import { isWebsTestingMode } from '../../../../../services/websiteTestingMode';
 
 const MAX_BODY_BYTES = 8 * 1024;
 type RouteContext = { params: Promise<{ websiteId: string }> };
@@ -36,7 +40,7 @@ export async function POST(req: Request, context: RouteContext) {
     await enforceAIGatewayRateLimit(user.id, getClientIp(req));
     const { websiteId } = await context.params;
 
-    let body: { version?: unknown; revision?: unknown };
+    let body: { version?: unknown; revision?: unknown; slug?: unknown };
     try {
       body = await readJsonBodyWithLimit(req, MAX_BODY_BYTES);
     } catch (error) {
@@ -46,9 +50,23 @@ export async function POST(req: Request, context: RouteContext) {
 
     const website = await prisma.website.findFirst({
       where: { id: websiteId, userId: user.id, deletedAt: null },
-      select: { id: true, userId: true, revision: true, currentVersion: true, publishedVersion: true, status: true, title: true },
+      select: { id: true, userId: true, revision: true, currentVersion: true, publishedVersion: true, status: true, title: true, content: true },
     });
     if (!website) return NextResponse.json({ error: 'Website not found.' }, { status: 404, headers: headers(req) });
+
+    if (isWebsTestingMode()) {
+      return NextResponse.json({
+        error: 'Website publishing is disabled during internal Blue Webs testing. You can save and preview drafts.',
+        code: 'website_test_publish_disabled',
+      }, { status: 403, headers: headers(req) });
+    }
+    const billingSnapshot = await getWebsiteBillingSnapshot(user.id);
+    if (!billingSnapshot.activePro) {
+      return NextResponse.json({
+        error: 'An active Mento Pro subscription is required to publish a website.',
+        code: 'website_pro_required',
+      }, { status: 403, headers: headers(req) });
+    }
 
     if (body.revision !== undefined && (!Number.isSafeInteger(body.revision) || (body.revision as number) !== website.revision)) {
       return NextResponse.json({ error: 'This website changed elsewhere. Reload it before publishing.', code: 'website_revision_conflict' }, { status: 409, headers: headers(req) });
@@ -59,9 +77,9 @@ export async function POST(req: Request, context: RouteContext) {
       return NextResponse.json({ error: 'Choose a valid website version to publish.', code: 'invalid_website_version' }, { status: 400, headers: headers(req) });
     }
 
-    const slug = slugifyWebsiteName(website.title);
-    if (!slug) {
-      return NextResponse.json({ error: 'Choose a website name that can be used in a website address.', code: 'invalid_website_slug' }, { status: 400, headers: headers(req) });
+    const slug = typeof body.slug === 'string' ? slugifyWebsiteName(body.slug) : slugifyWebsiteName(website.title);
+    if (!slug || (body.slug !== undefined && (typeof body.slug !== 'string' || body.slug !== slug))) {
+      return NextResponse.json({ error: 'Choose a subdomain using letters, numbers, and hyphens only.', code: 'invalid_website_slug' }, { status: 400, headers: headers(req) });
     }
     const hostname = createWebsiteHostname(slug);
     const conflictingWebsite = await prisma.website.findFirst({
@@ -79,10 +97,62 @@ export async function POST(req: Request, context: RouteContext) {
     if (!version) {
       return NextResponse.json({ error: 'The selected website version could not be found.', code: 'website_version_not_found' }, { status: 404, headers: headers(req) });
     }
+    const deploymentContent = requestedVersion === website.currentVersion ? website.content : version.content;
+    const normalizedContent = normalizeWebsiteContent(deploymentContent);
+    if (!normalizedContent) {
+      return NextResponse.json({ error: 'This website version is invalid and cannot be published.', code: 'invalid_website_content' }, { status: 409, headers: headers(req) });
+    }
+    const referencedAssets = normalizedContent.imageSlots.flatMap((slot) => (
+      slot.assetId ? [{ id: slot.assetId, slotId: slot.id }] : []
+    ));
+    const storedAssets = referencedAssets.length
+      ? await prisma.websiteAsset.findMany({
+          where: { websiteId, id: { in: referencedAssets.map((asset) => asset.id) } },
+        })
+      : [];
+    const storedAssetIds = new Set(storedAssets.map((asset) => asset.id));
+    if (referencedAssets.some((asset) => !storedAssetIds.has(asset.id))) {
+      return NextResponse.json({ error: 'A selected website image is no longer available. Remove it or choose it again before publishing.', code: 'website_image_missing' }, { status: 409, headers: headers(req) });
+    }
+    const deploymentAssets = await Promise.all(storedAssets.map(async (asset) => {
+      const slot = referencedAssets.find((referenced) => referenced.id === asset.id);
+      if (!slot || asset.slotId !== slot.slotId) {
+        throw new Error('A website image is attached to an unexpected image slot.');
+      }
+      if (asset.source === 'pexels' || asset.source === 'unsplash') {
+        return {
+          id: asset.id,
+          slotId: asset.slotId,
+          source: asset.source as 'pexels' | 'unsplash',
+          remoteUrl: asset.remoteUrl,
+          sourcePageUrl: asset.sourcePageUrl,
+          creatorName: asset.creatorName,
+          creatorProfileUrl: asset.creatorProfileUrl,
+          alt: asset.alt,
+          mimeType: asset.mimeType,
+        };
+      }
+      if (!['pixabay', 'user_upload', 'imagen_generated', 'gemini_generated'].includes(asset.source) || !asset.objectKey) {
+        throw new Error('A selected website image cannot be read for publishing.');
+      }
+      return {
+        id: asset.id,
+        slotId: asset.slotId,
+        source: asset.source as 'pixabay' | 'user_upload' | 'imagen_generated' | 'gemini_generated',
+        remoteUrl: null,
+        sourcePageUrl: asset.sourcePageUrl,
+        creatorName: asset.creatorName,
+        creatorProfileUrl: asset.creatorProfileUrl,
+        alt: asset.alt,
+        mimeType: asset.mimeType,
+        bytes: await readPrivateWebsiteUpload(asset.objectKey),
+      };
+    }));
     stagedArtifact = await uploadWebsiteDeployment({
       websiteId,
       version: requestedVersion,
-      content: version.content,
+      content: deploymentContent,
+      assets: deploymentAssets,
     });
 
     const published = await prisma.$transaction(async (tx) => {

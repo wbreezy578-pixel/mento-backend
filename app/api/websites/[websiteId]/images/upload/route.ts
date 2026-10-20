@@ -9,6 +9,9 @@ import { buildWebsiteApiView } from '../../../../../../services/websiteAssetApi'
 import { deletePrivateWebsiteUpload, isAllowedWebsiteImageUploadMimeType, savePrivateWebsiteUpload } from '../../../../../../services/websiteAssetService';
 import { normalizeWebsiteContent, type WebsiteContent } from '../../../../../../services/websiteContent';
 import { assertWebsiteFeatureAccess, WebsiteAccessError } from '../../../../../../services/websiteBillingService';
+import { isWebsTestingMode } from '../../../../../../services/websiteTestingMode';
+import { deletePrivateWebsiteAssetFromR2, uploadPrivateWebsiteAssetToR2 } from '../../../../../../services/websiteDeploymentStorage';
+import logger from '../../../../../../lib/logger';
 
 type RouteContext = { params: Promise<{ websiteId: string }> };
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
@@ -28,6 +31,7 @@ export async function OPTIONS(req: Request) {
 
 export async function POST(req: Request, context: RouteContext) {
   let uploadedObjectKey: string | null = null;
+  let uploadedR2ObjectKey: string | null = null;
   let persisted = false;
   try {
     const user = await authenticateAIRequest(req);
@@ -69,6 +73,13 @@ export async function POST(req: Request, context: RouteContext) {
     const stored = await savePrivateWebsiteUpload({ userId: user.id, websiteId, buffer: sourceBuffer, mimeType: declaredMimeType });
     uploadedObjectKey = stored.objectKey;
     const assetId = randomUUID();
+    if (!isWebsTestingMode()) {
+      uploadedR2ObjectKey = await uploadPrivateWebsiteAssetToR2({
+        websiteId,
+        assetId,
+        buffer: stored.buffer,
+      });
+    }
     const nextContent: WebsiteContent = {
       ...currentContent,
       imageSlots: currentContent.imageSlots.map((imageSlot) => imageSlot.id === slotId ? { ...imageSlot, assetId } : imageSlot),
@@ -85,9 +96,11 @@ export async function POST(req: Request, context: RouteContext) {
           id: assetId,
           websiteId,
           slotId,
+          version: website.currentVersion,
           source: 'user_upload',
           providerAssetId: null,
           objectKey: stored.objectKey,
+          r2ObjectKey: uploadedR2ObjectKey,
           remoteUrl: null,
           sourcePageUrl: null,
           creatorName: null,
@@ -102,14 +115,23 @@ export async function POST(req: Request, context: RouteContext) {
     });
     if (!updated) {
       await deletePrivateWebsiteUpload(uploadedObjectKey);
+      if (uploadedR2ObjectKey) await deletePrivateWebsiteAssetFromR2(uploadedR2ObjectKey);
       uploadedObjectKey = null;
+      uploadedR2ObjectKey = null;
       return errorResponse(req, 'This website changed elsewhere. Reload it before uploading.', 409, 'website_revision_conflict');
     }
     persisted = true;
 
     return NextResponse.json({ website: await buildWebsiteApiView(updated) }, { status: 201, headers: headers(req) });
   } catch (error) {
-    if (uploadedObjectKey && !persisted) await deletePrivateWebsiteUpload(uploadedObjectKey).catch(() => undefined);
+    if (!persisted && (uploadedObjectKey || uploadedR2ObjectKey)) {
+      const cleanup = await Promise.allSettled([
+        uploadedObjectKey ? deletePrivateWebsiteUpload(uploadedObjectKey) : Promise.resolve(),
+        uploadedR2ObjectKey ? deletePrivateWebsiteAssetFromR2(uploadedR2ObjectKey) : Promise.resolve(),
+      ]);
+      const failedCleanupCount = cleanup.filter((result) => result.status === 'rejected').length;
+      if (failedCleanupCount > 0) logger.error('Uploaded website image cleanup failed', { failedCleanupCount });
+    }
     if (error instanceof WebsiteAccessError) return errorResponse(req, error.message, error.status, 'website_pro_required');
     if (error instanceof AIRequestGatewayError) return NextResponse.json(error.body, { status: error.status, headers: { ...error.headers, ...headers(req) } });
     const message = error instanceof Error ? error.message : 'Image upload is unavailable.';

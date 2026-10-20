@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   userWallet: { findUnique: vi.fn() },
@@ -16,9 +16,18 @@ vi.mock('../lib/prisma', () => ({
 
 import { assertWebsiteFeatureAccess, WEBSITE_EDIT_LIMIT_PER_PERIOD, WEBSITE_PROJECT_LIMIT } from './websiteBillingService';
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe('website billing policy', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('sets the monthly Pro website and AI-edit quotas', () => {
+    expect(WEBSITE_PROJECT_LIMIT).toBe(5);
+    expect(WEBSITE_EDIT_LIMIT_PER_PERIOD).toBe(15);
   });
 
   it('requires an active Pro subscription before website features are allowed', async () => {
@@ -43,7 +52,13 @@ describe('website billing policy', () => {
     });
     mocks.website.count.mockResolvedValue(WEBSITE_PROJECT_LIMIT);
 
-    await expect(assertWebsiteFeatureAccess('user-1', 'create')).rejects.toThrow(`5 website projects`);
+    await expect(assertWebsiteFeatureAccess('user-1', 'create')).rejects.toThrow(`limit of 5 website creations`);
+    expect(mocks.website.count).toHaveBeenCalledWith({
+      where: {
+        userId: 'user-1',
+        createdAt: { gte: expect.any(Date), lt: expect.any(Date) },
+      },
+    });
   });
 
   it('blocks website AI edits once the Pro usage quota is reached for the billing period', async () => {
@@ -56,6 +71,19 @@ describe('website billing policy', () => {
     });
     mocks.usageLog.count.mockResolvedValue(WEBSITE_EDIT_LIMIT_PER_PERIOD);
 
-    await expect(assertWebsiteFeatureAccess('user-1', 'edit')).rejects.toThrow(`50 successful website edits`);
+    await expect(assertWebsiteFeatureAccess('user-1', 'edit')).rejects.toThrow(`limit of 15 successful AI edits`);
+  });
+
+  it('waives Pro and Webs quotas only in Blue testing mode', async () => {
+    vi.stubEnv('MENTO_BACKEND_ENV', 'blue');
+    vi.stubEnv('WEBS_TEST_MODE', 'true');
+    mocks.userWallet.findUnique.mockResolvedValue(null);
+    mocks.website.count.mockResolvedValue(WEBSITE_PROJECT_LIMIT);
+    mocks.usageLog.count.mockResolvedValue(WEBSITE_EDIT_LIMIT_PER_PERIOD);
+
+    const snapshot = await assertWebsiteFeatureAccess('user-1', 'create');
+
+    expect(snapshot.activePro).toBe(false);
+    await expect(assertWebsiteFeatureAccess('user-1', 'edit')).resolves.toMatchObject({ activePro: false });
   });
 });

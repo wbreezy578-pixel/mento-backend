@@ -3,7 +3,7 @@ import { prisma } from '../lib/prisma';
 import { getWebsiteAssetPreviewUrl } from './websiteAssetService';
 import { normalizeWebsiteContent } from './websiteContent';
 
-export type WebsiteAssetView = Omit<WebsiteAsset, 'objectKey'> & { previewUrl: string | null };
+export type WebsiteAssetView = Omit<WebsiteAsset, 'objectKey' | 'r2ObjectKey'> & { previewUrl: string | null };
 
 export async function getWebsiteAssetViews(websiteId: string, rawContent: unknown): Promise<WebsiteAssetView[]> {
   const content = normalizeWebsiteContent(rawContent);
@@ -11,7 +11,8 @@ export async function getWebsiteAssetViews(websiteId: string, rawContent: unknow
   if (!assetIds.length) return [];
   const assets = await prisma.websiteAsset.findMany({ where: { websiteId, id: { in: assetIds } } });
   return Promise.all(assets.map(async (asset) => {
-    const { objectKey, ...publicAsset } = asset;
+    const { objectKey, r2ObjectKey, ...publicAsset } = asset;
+    void r2ObjectKey;
     return {
       ...publicAsset,
       previewUrl: await getWebsiteAssetPreviewUrl({ source: asset.source, remoteUrl: asset.remoteUrl, objectKey }),

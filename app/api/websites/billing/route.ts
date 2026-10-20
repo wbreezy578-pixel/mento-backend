@@ -12,6 +12,8 @@ import {
   WEBSITE_PAYMENT_GRACE_DAYS,
   type WebsiteHostingAccountSnapshot,
 } from '../../../../services/websiteBillingService';
+import { isWebsTestingMode } from '../../../../services/websiteTestingMode';
+import { getWebsiteImageGenerationUsage } from '../../../../services/websiteImageGenerationQuota';
 
 function headers(req: Request) {
   return { ...buildCorsHeaders(req.headers.get('origin')), 'Cache-Control': 'no-store, private' };
@@ -20,7 +22,7 @@ function headers(req: Request) {
 export async function GET(req: Request) {
   try {
     const user = await authenticateAIRequest(req);
-    const [usage, websites, payments, account] = await Promise.all([
+    const [usage, websites, payments, account, imageGeneration] = await Promise.all([
       getWebsiteBillingSnapshot(user.id),
       prisma.website.findMany({
         where: { userId: user.id, deletedAt: null },
@@ -34,6 +36,7 @@ export async function GET(req: Request) {
         take: 100,
       }),
       prisma.websiteHostingAccount.findUnique({ where: { userId: user.id } }),
+      getWebsiteImageGenerationUsage(user.id),
     ]);
 
     const hosting = await Promise.all(websites.map(async (website) => ({
@@ -46,6 +49,7 @@ export async function GET(req: Request) {
     const hostingAccount = account as (WebsiteHostingAccountSnapshot & {
       providerPurchaseTokenHash: string | null;
     }) | null;
+    const testMode = isWebsTestingMode();
     const hostingEntitlement = getWebsiteHostingEntitlement(hostingAccount);
     const scheduledLimit = hostingAccount ? getScheduledWebsiteHostingLimit(hostingAccount) : null;
     const effectiveLimit = hostingAccount?.scheduledEffectiveAt && hostingAccount.scheduledEffectiveAt <= new Date()
@@ -86,6 +90,7 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       usage,
+      imageGeneration,
       hosting,
       hostingAccount: hostingAccount ? {
         tier: hostingAccount.tier,
@@ -119,6 +124,7 @@ export async function GET(req: Request) {
       history,
       hostingPriceUsdPerSitePerMonth: WEBSITE_HOSTING_PRICE_USD,
       paymentGraceDays: WEBSITE_PAYMENT_GRACE_DAYS,
+      testMode,
     }, { headers: headers(req) });
   } catch (error) {
     if (error instanceof AIRequestGatewayError) return NextResponse.json(error.body, { status: error.status, headers: { ...error.headers, ...headers(req) } });

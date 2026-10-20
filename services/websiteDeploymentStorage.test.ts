@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createWebsiteHostname, isWebsiteHostname, uploadWebsiteDeployment, WebsiteDeploymentConfigurationError } from './websiteDeploymentStorage';
+import {
+  createWebsiteHostname,
+  deletePrivateWebsiteAssetFromR2,
+  isWebsiteHostname,
+  uploadPrivateWebsiteAssetToR2,
+  uploadWebsiteDeployment,
+  WebsiteDeploymentConfigurationError,
+} from './websiteDeploymentStorage';
 
 const content = {
   type: 'business',
@@ -89,6 +96,72 @@ describe('website deployment storage configuration', () => {
     expect(JSON.parse(calls.at(-1)!.body)).toMatchObject({ websiteId: 'website-1', deploymentId: 'deployment-4', version: 4 });
     expect(calls.every((call) => call.headers.get('authorization')?.startsWith('AWS4-HMAC-SHA256 '))).toBe(true);
     expect(Object.keys(deployment.manifest)).toContain('index.html');
+  });
+
+  it('stores selected images as private R2 objects and supports cleanup', async () => {
+    setStagingEnvironment();
+    const calls: Array<{ method: string; url: string; headers: Headers }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ method: init?.method ?? 'GET', url: String(input), headers: new Headers(init?.headers) });
+      return new Response(null, { status: 200 });
+    }));
+
+    const key = await uploadPrivateWebsiteAssetToR2({
+      websiteId: 'website-1',
+      assetId: 'asset-1',
+      buffer: Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+    });
+    await deletePrivateWebsiteAssetFromR2(key);
+
+    expect(key).toBe('websites/website-1/assets/asset-1/image.jpg');
+    expect(calls.map((call) => call.method)).toEqual(['PUT', 'DELETE']);
+    expect(calls.every((call) => call.url.endsWith(`/${key}`))).toBe(true);
+    expect(calls[0].headers.get('cache-control')).toBe('private, no-store, max-age=0');
+  });
+
+  it('uploads user photos as immutable binary files included in the deployment manifest', async () => {
+    setStagingEnvironment();
+    const calls: Array<{ url: string; body: Uint8Array; headers: Headers }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const body = init?.body instanceof Uint8Array ? init.body : new Uint8Array();
+      calls.push({ url: String(input), body, headers: new Headers(init?.headers) });
+      return new Response(null, { status: 200 });
+    }));
+
+    const deployment = await uploadWebsiteDeployment({
+      websiteId: 'website-1',
+      version: 4,
+      deploymentId: 'deployment-images',
+      content: {
+        ...content,
+        pages: [{
+          title: 'Home',
+          slug: 'home',
+          sections: [{ id: 'hero-section', type: 'hero', title: 'Hello', body: 'World', imageSlotId: 'hero-slot' }],
+        }],
+        imageSlots: [{ id: 'hero-slot', role: 'hero', targetId: 'hero-section', query: 'cafe', alt: 'Cafe interior', assetId: 'upload-1' }],
+      },
+      assets: [{
+        id: 'upload-1',
+        slotId: 'hero-slot',
+        source: 'user_upload',
+        remoteUrl: null,
+        sourcePageUrl: null,
+        creatorName: null,
+        creatorProfileUrl: null,
+        alt: 'Cafe interior',
+        mimeType: 'image/jpeg',
+        bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+      }],
+    });
+
+    const photoUpload = calls.find((call) => call.url.endsWith('/assets/images/upload-1.jpg'));
+    expect(photoUpload?.body).toEqual(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]));
+    expect(photoUpload?.headers.get('content-type')).toBe('image/jpeg');
+    expect(deployment.manifest['assets/images/upload-1.jpg']).toMatchObject({
+      contentType: 'image/jpeg',
+      cacheControl: 'public, max-age=31536000, immutable',
+    });
   });
 
   it('uploads production deployments only to the dedicated production bucket', async () => {

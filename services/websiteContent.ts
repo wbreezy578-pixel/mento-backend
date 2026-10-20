@@ -1,5 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { resolveDesignPreset, type WebsiteDesignPreset } from './websiteDesignSystem';
+import { normalizeWebsitePalette, resolveDesignPreset, type WebsiteDesignPreset } from './websiteDesignSystem';
+import {
+  defaultWebsiteDesignPreferences,
+  parseWebsiteDesignPreferences,
+  WEBSITE_BACKGROUND_PALETTES,
+  WEBSITE_IMAGE_CROPS,
+  WEBSITE_OVERLAY_STRENGTHS,
+  type WebsiteDesignPreferences,
+  type WebsiteImageCrop,
+  type WebsiteOverlayStrength,
+} from './websiteDesignPreferences';
 
 export const WEBSITE_TYPES = ['business', 'restaurant', 'portfolio', 'professional', 'other'] as const;
 export type WebsiteType = typeof WEBSITE_TYPES[number];
@@ -7,12 +17,18 @@ export type WebsiteType = typeof WEBSITE_TYPES[number];
 export const WEBSITE_SECTION_TYPES = ['hero', 'about', 'services', 'menu', 'gallery', 'location', 'contact', 'whatsapp'] as const;
 export type WebsiteSectionType = typeof WEBSITE_SECTION_TYPES[number];
 
+export const WEBSITE_HERO_LAYOUT_VARIANTS = ['cinematic', 'split', 'centered-editorial'] as const;
+export type WebsiteHeroLayoutVariant = typeof WEBSITE_HERO_LAYOUT_VARIANTS[number];
+
 export interface WebsiteSection {
   id: string;
   type: WebsiteSectionType;
   title: string;
   body: string;
   imageSlotId: string | null;
+  layoutVariant?: WebsiteHeroLayoutVariant;
+  overlayStrength?: WebsiteOverlayStrength;
+  imageCrop?: WebsiteImageCrop;
 }
 
 export interface WebsitePage {
@@ -56,7 +72,13 @@ export interface WebsiteContent {
   title: string;
   description: string;
   designPreset: WebsiteDesignPreset;
-  theme: { primaryColor: string };
+  designPreferences: WebsiteDesignPreferences;
+  theme: {
+    primaryColor: string;
+    secondaryColor: string;
+    backgroundColor: string;
+    surfaceColor: string;
+  };
   pages: WebsitePage[];
   menuCategories: WebsiteMenuCategory[];
   imageSlots: WebsiteImageSlot[];
@@ -66,6 +88,12 @@ export interface WebsiteContent {
     phone: string;
     whatsappNumber: string;
     mapsUrl: string;
+    email: string;
+    openingHours: string;
+    serviceArea: string;
+    servicesAndPricing: string;
+    testimonials: string;
+    bookingUrl: string;
   };
   socialLinks: {
     instagram: string;
@@ -82,11 +110,32 @@ const MAX_PAGES = 8;
 const MAX_SECTIONS_PER_PAGE = 12;
 const MAX_MENU_CATEGORIES = 12;
 const MAX_MENU_ITEMS_PER_CATEGORY = 40;
-const MAX_IMAGE_SLOTS = 8;
+const MAX_IMAGE_SLOTS = 32;
 const SAFE_IMAGE_HOSTS = new Set(['images.unsplash.com', 'images.pexels.com']);
+const WEBSITE_CONTACT_TEXT_LIMITS = {
+  address: 240,
+  phone: 40,
+  whatsappNumber: 24,
+  email: 254,
+  openingHours: 800,
+  serviceArea: 240,
+  servicesAndPricing: 1200,
+  testimonials: 1200,
+} as const;
+
+export type WebsiteContact = {
+  -readonly [Key in keyof typeof WEBSITE_CONTACT_TEXT_LIMITS]: string;
+} & {
+  mapsUrl: string;
+  bookingUrl: string;
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+export function isWebsiteHeroLayoutVariant(value: unknown): value is WebsiteHeroLayoutVariant {
+  return typeof value === 'string' && WEBSITE_HERO_LAYOUT_VARIANTS.includes(value as WebsiteHeroLayoutVariant);
 }
 
 function boundedText(value: unknown, maxLength: number): string | null {
@@ -130,6 +179,31 @@ function safeExternalUrl(value: unknown, maxLength = 2048): string {
   }
 }
 
+export function buildWebsiteTrustInstruction(): string {
+  return 'Use verified information only. Include contact channels, opening hours, service area/location, services/prices, exact owner-approved testimonials, and booking/enquiry links only when the owner supplies them. Never invent or embellish these facts. Omit missing details without placeholders or “coming soon/add this later” copy. Preserve all supplied prices, hours, contact information, and testimonial wording exactly. Put supplied servicesAndPricing in the services or menu section when one exists, otherwise in contact; do not duplicate it. Return contact with address, phone, whatsappNumber, mapsUrl, email, openingHours, serviceArea, servicesAndPricing, testimonials, and bookingUrl strings.';
+}
+
+export function parseWebsiteContact(value: unknown): WebsiteContact | null {
+  if (!isRecord(value)) return null;
+  const textFields = Object.entries(WEBSITE_CONTACT_TEXT_LIMITS) as Array<[keyof typeof WEBSITE_CONTACT_TEXT_LIMITS, number]>;
+  const contact = {} as WebsiteContact;
+  for (const [field, maxLength] of textFields) {
+    const raw = value[field];
+    if (typeof raw !== 'string' || raw.length > maxLength) return null;
+    contact[field] = raw.trim();
+  }
+  for (const field of ['mapsUrl', 'bookingUrl'] as const) {
+    const raw = value[field];
+    if (typeof raw !== 'string' || raw.length > 2048) return null;
+    const url = safeExternalUrl(raw);
+    if (raw.trim() && !url) return null;
+    contact[field] = url;
+  }
+  if (contact.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact.email)) return null;
+  contact.whatsappNumber = contact.whatsappNumber.replace(/[^\d+]/g, '').slice(0, 16);
+  return contact;
+}
+
 function normalizeMenuCategories(value: unknown, usedIds: Set<string>): WebsiteMenuCategory[] | null {
   if (!Array.isArray(value) || value.length > MAX_MENU_CATEGORIES) return null;
   const categories: WebsiteMenuCategory[] = [];
@@ -143,7 +217,7 @@ function normalizeMenuCategories(value: unknown, usedIds: Set<string>): WebsiteM
       const itemName = boundedText(rawItem.name, 100);
       const price = optionalText(rawItem.price, 16);
       const currency = optionalText(rawItem.currency, 8);
-      if (!itemName || (price && !/^\d{1,9}(?:[.,]\d{1,2})?$/.test(price)) || (currency && !/^[\p{L}]{1,8}$/u.test(currency))) return null;
+      if (!itemName || (price && !/^\d{1,7}(?:[.,]\d{1,2})?$/.test(price)) || (currency && !/^[\p{L}]{1,8}$/u.test(currency))) return null;
       items.push({
         id: stableId(rawItem.id, 'item', usedIds),
         name: itemName,
@@ -175,6 +249,15 @@ function normalizePages(value: unknown, usedIds: Set<string>): WebsitePage[] | n
     const sections: WebsiteSection[] = [];
     for (const rawSection of rawPage.sections) {
       if (!isRecord(rawSection) || !WEBSITE_SECTION_TYPES.includes(rawSection.type as WebsiteSectionType)) return null;
+      if (rawSection.layoutVariant !== undefined && (
+        rawSection.type !== 'hero' || !isWebsiteHeroLayoutVariant(rawSection.layoutVariant)
+      )) return null;
+      if (rawSection.overlayStrength !== undefined && (
+        rawSection.type !== 'hero' || !WEBSITE_OVERLAY_STRENGTHS.includes(rawSection.overlayStrength as WebsiteOverlayStrength)
+      )) return null;
+      if (rawSection.imageCrop !== undefined && (
+        rawSection.type !== 'hero' || !WEBSITE_IMAGE_CROPS.includes(rawSection.imageCrop as WebsiteImageCrop)
+      )) return null;
       const sectionTitle = boundedText(rawSection.title, 100);
       if (!sectionTitle) return null;
       sections.push({
@@ -183,6 +266,9 @@ function normalizePages(value: unknown, usedIds: Set<string>): WebsitePage[] | n
         title: sectionTitle,
         body: optionalText(rawSection.body, 1200),
         imageSlotId: typeof rawSection.imageSlotId === 'string' ? rawSection.imageSlotId.slice(0, 80) : null,
+        ...(rawSection.layoutVariant === undefined ? {} : { layoutVariant: rawSection.layoutVariant }),
+        ...(rawSection.overlayStrength === undefined ? {} : { overlayStrength: rawSection.overlayStrength as WebsiteOverlayStrength }),
+        ...(rawSection.imageCrop === undefined ? {} : { imageCrop: rawSection.imageCrop as WebsiteImageCrop }),
       });
     }
     pages.push({ id: stableId(rawPage.id, 'page', usedIds), slug, title, sections });
@@ -242,10 +328,30 @@ export function normalizeWebsiteContent(value: unknown, fallbackType: WebsiteTyp
   }
 
   const rawTheme = isRecord(value.theme) ? value.theme : {};
-  const primaryColor = typeof rawTheme.primaryColor === 'string' && /^#[0-9A-Fa-f]{6}$/.test(rawTheme.primaryColor)
-    ? rawTheme.primaryColor.toUpperCase()
-    : '#0F8F83';
+  const parsedDesignPreferences = value.designPreferences === undefined || value.designPreferences === null
+    ? null
+    : parseWebsiteDesignPreferences(value.designPreferences, type);
+  if (value.designPreferences !== undefined && value.designPreferences !== null && !parsedDesignPreferences) return null;
+  const designPreferences = parsedDesignPreferences ?? {
+    ...defaultWebsiteDesignPreferences(type),
+    designPreset: resolveDesignPreset(type, value.designPreset),
+  };
+  const designPreset = designPreferences.designPreset;
+  const theme = normalizeWebsitePalette(rawTheme, designPreset);
   const rawContact = isRecord(value.contact) ? value.contact : {};
+  const email = optionalText(rawContact.email, WEBSITE_CONTACT_TEXT_LIMITS.email);
+  const contact = {
+    address: optionalText(rawContact.address, WEBSITE_CONTACT_TEXT_LIMITS.address),
+    phone: optionalText(rawContact.phone, WEBSITE_CONTACT_TEXT_LIMITS.phone),
+    whatsappNumber: optionalText(rawContact.whatsappNumber, WEBSITE_CONTACT_TEXT_LIMITS.whatsappNumber).replace(/[^\d+]/g, '').slice(0, 16),
+    mapsUrl: safeExternalUrl(rawContact.mapsUrl),
+    email: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : '',
+    openingHours: optionalText(rawContact.openingHours, WEBSITE_CONTACT_TEXT_LIMITS.openingHours),
+    serviceArea: optionalText(rawContact.serviceArea, WEBSITE_CONTACT_TEXT_LIMITS.serviceArea),
+    servicesAndPricing: optionalText(rawContact.servicesAndPricing, WEBSITE_CONTACT_TEXT_LIMITS.servicesAndPricing),
+    testimonials: optionalText(rawContact.testimonials, WEBSITE_CONTACT_TEXT_LIMITS.testimonials),
+    bookingUrl: safeExternalUrl(rawContact.bookingUrl),
+  };
   const rawSocialLinks = isRecord(value.socialLinks) ? value.socialLinks : {};
   const rawSeo = isRecord(value.seo) ? value.seo : {};
   const galleryImageUrls = Array.isArray(value.galleryImageUrls)
@@ -257,18 +363,14 @@ export function normalizeWebsiteContent(value: unknown, fallbackType: WebsiteTyp
     type,
     title,
     description,
-    designPreset: resolveDesignPreset(type, value.designPreset),
-    theme: { primaryColor },
+    designPreset,
+    designPreferences,
+    theme,
     pages,
     menuCategories,
     imageSlots,
     galleryImageUrls,
-    contact: {
-      address: optionalText(rawContact.address, 240),
-      phone: optionalText(rawContact.phone, 40),
-      whatsappNumber: optionalText(rawContact.whatsappNumber, 24).replace(/[^\d+]/g, '').slice(0, 16),
-      mapsUrl: safeExternalUrl(rawContact.mapsUrl),
-    },
+    contact,
     socialLinks: {
       instagram: safeExternalUrl(rawSocialLinks.instagram),
       facebook: safeExternalUrl(rawSocialLinks.facebook),
@@ -278,6 +380,145 @@ export function normalizeWebsiteContent(value: unknown, fallbackType: WebsiteTyp
       title: optionalText(rawSeo.title, 100) || title,
       description: optionalText(rawSeo.description, 320) || description,
     },
+  };
+}
+
+export function applyWebsiteDesignPreferences(
+  content: WebsiteContent,
+  preferences: WebsiteDesignPreferences,
+): WebsiteContent {
+  const layoutVariant = preferences.heroImageMode === 'background'
+    ? 'cinematic'
+    : preferences.heroImageMode === 'beside' ? 'split' : 'centered-editorial';
+  const theme = normalizeWebsitePalette({
+    ...content.theme,
+    ...WEBSITE_BACKGROUND_PALETTES[preferences.backgroundStyle],
+  }, preferences.designPreset);
+  return {
+    ...content,
+    designPreset: preferences.designPreset,
+    designPreferences: preferences,
+    theme,
+    pages: content.pages.map((page) => ({
+      ...page,
+      sections: page.sections.map((section) => section.type === 'hero'
+        ? {
+            ...section,
+            layoutVariant,
+            overlayStrength: preferences.overlayStrength,
+            imageCrop: preferences.imageCrop,
+            imageSlotId: preferences.heroImageMode === 'none' ? null : section.imageSlotId,
+          }
+        : section),
+    })),
+  };
+}
+
+export function preserveWebsiteImageSlots(existing: WebsiteContent, edited: WebsiteContent): WebsiteContent {
+  const editedSections = new Map(edited.pages.flatMap((page) => page.sections.map((section) => [section.id, section] as const)));
+  const editedMenuItems = new Map(edited.menuCategories.flatMap((category) => category.items.map((item) => [item.id, item] as const)));
+  const preservedSlots = existing.imageSlots.filter((slot) => {
+    if (!slot.targetId) return true;
+    if (slot.role === 'menu_item') return editedMenuItems.has(slot.targetId);
+    const section = editedSections.get(slot.targetId);
+    if (!section) return false;
+    if (slot.role === 'hero') return section.type === 'hero';
+    if (slot.role === 'gallery') return section.type === 'gallery';
+    return section.type === 'about' || section.type === 'services';
+  });
+  const preservedSlotIds = new Set(preservedSlots.map((slot) => slot.id));
+  const imageSlots = edited.imageSlots.filter((slot) => !preservedSlots.some((previous) => (
+    previous.id === slot.id || (previous.role === slot.role && previous.targetId === slot.targetId)
+  )));
+  imageSlots.push(...preservedSlots);
+
+  return {
+    ...edited,
+    designPreferences: {
+      ...existing.designPreferences,
+      designPreset: edited.designPreset,
+    },
+    pages: edited.pages.map((page) => ({
+      ...page,
+      sections: page.sections.map((section) => {
+        const previous = existing.pages.flatMap((currentPage) => currentPage.sections)
+          .find((candidate) => candidate.id === section.id);
+        const slotId = previous?.imageSlotId;
+        return slotId && preservedSlotIds.has(slotId) ? { ...section, imageSlotId: slotId } : section;
+      }),
+    })),
+    menuCategories: edited.menuCategories.map((category) => ({
+      ...category,
+      items: category.items.map((item) => {
+        const previous = existing.menuCategories.flatMap((currentCategory) => currentCategory.items)
+          .find((candidate) => candidate.id === item.id);
+        const slotId = previous?.imageSlotId;
+        return slotId && preservedSlotIds.has(slotId) ? { ...item, imageSlotId: slotId } : item;
+      }),
+    })),
+    imageSlots,
+  };
+}
+
+export function requestsWebsiteHeroLayoutChange(prompt: string): boolean {
+  return /\b(?:hero|banner)\b[\s\S]{0,80}\b(?:cinematic|split|centered(?:[\s-]+editorial)?)\b/i.test(prompt)
+    || /\b(?:cinematic|split|centered(?:[\s-]+editorial)?)\b[\s\S]{0,80}\b(?:hero|banner)\b/i.test(prompt);
+}
+
+export function preserveWebsiteHeroLayout(
+  existing: WebsiteContent,
+  edited: WebsiteContent,
+  allowRequestedChange = false,
+): WebsiteContent {
+  const replacements = new Map<string, WebsiteSection>();
+  existing.pages.forEach((existingPage, pageIndex) => {
+    const editedPage = edited.pages.find((page) => page.id === existingPage.id)
+      ?? edited.pages.find((page) => page.slug === existingPage.slug)
+      ?? edited.pages[pageIndex];
+    if (!editedPage) return;
+
+    const existingHeroes = existingPage.sections.filter((section) => section.type === 'hero');
+    const editedHeroes = editedPage.sections.filter((section) => section.type === 'hero');
+    existingHeroes.forEach((previous, heroIndex) => {
+      const current = editedHeroes.find((section) => section.id === previous.id) ?? editedHeroes[heroIndex];
+      if (!current) return;
+
+      const layoutVariant = allowRequestedChange && current.layoutVariant
+        ? current.layoutVariant
+        : previous.layoutVariant;
+      const sectionWithoutLayout = { ...current };
+      delete sectionWithoutLayout.layoutVariant;
+      replacements.set(current.id, {
+        ...sectionWithoutLayout,
+        id: previous.id,
+        ...(layoutVariant ? { layoutVariant } : {}),
+      });
+    });
+  });
+
+  return {
+    ...edited,
+    pages: edited.pages.map((page) => ({
+      ...page,
+      sections: page.sections.map((section) => replacements.get(section.id) ?? section),
+    })),
+  };
+}
+
+export function preserveWebsiteContentExceptHeroLayout(existing: WebsiteContent, edited: WebsiteContent): WebsiteContent {
+  const editedSections = new Map(edited.pages.flatMap((page) => page.sections.map((section) => [section.id, section] as const)));
+  return {
+    ...existing,
+    pages: existing.pages.map((page) => ({
+      ...page,
+      sections: page.sections.map((section) => {
+        if (section.type !== 'hero') return section;
+        const editedSection = editedSections.get(section.id);
+        return editedSection?.type === 'hero' && editedSection.layoutVariant
+          ? { ...section, layoutVariant: editedSection.layoutVariant }
+          : section;
+      }),
+    })),
   };
 }
 

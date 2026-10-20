@@ -53,6 +53,8 @@ model User {
   userSetting            UserSetting?
   wallet                 UserWallet?
   websiteHostingAccount  WebsiteHostingAccount?
+  websiteImageGenerationQuotas       WebsiteImageGenerationQuota[]
+  websiteImageGenerationReservations WebsiteImageGenerationReservation[]
   supportReports         SupportReport[]
 }
 
@@ -214,25 +216,61 @@ model WebsiteVersion {
 }
 
 model WebsiteAsset {
-  id                String   @id @default(cuid())
-  websiteId         String
-  slotId            String
-  source            String
-  providerAssetId   String?
-  objectKey         String?  @unique
-  remoteUrl         String?
-  sourcePageUrl     String?
-  creatorName       String?
-  creatorProfileUrl String?
-  alt               String
-  mimeType          String?
-  width             Int?
-  height            Int?
-  createdAt         DateTime @default(now())
-  website           Website  @relation(fields: [websiteId], references: [id], onDelete: Cascade)
+  id                  String    @id @default(cuid())
+  websiteId           String
+  slotId              String
+  version             Int       @default(1)
+  source              String
+  providerAssetId     String?
+  objectKey           String?   @unique
+  r2ObjectKey         String?   @unique
+  remoteUrl           String?
+  providerImageUrl    String?
+  providerTags        String[]  @default([])
+  searchQuery         String?
+  retrievedAt         DateTime?
+  licenseName         String?
+  licenseUrl          String?
+  attributionRequired Boolean   @default(false)
+  sourcePageUrl       String?
+  creatorName         String?
+  creatorProfileUrl   String?
+  alt                 String
+  mimeType            String?
+  width               Int?
+  height              Int?
+  createdAt           DateTime  @default(now())
+  website             Website   @relation(fields: [websiteId], references: [id], onDelete: Cascade)
 
   @@index([websiteId, slotId, createdAt])
   @@index([websiteId, providerAssetId])
+}
+
+model WebsiteImageGenerationQuota {
+  id              String   @id @default(cuid())
+  userId          String
+  monthStart      DateTime @db.Date
+  generatedImages Int      @default(0)
+  reservedImages  Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, monthStart])
+  @@index([monthStart])
+}
+
+model WebsiteImageGenerationReservation {
+  id          String    @id @default(cuid())
+  userId      String
+  monthStart  DateTime  @db.Date
+  status      String    @default("reserved")
+  expiresAt   DateTime
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, monthStart, status, createdAt])
 }
 
 model ConsentRecord {

@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
-import { buildWebsiteStaticFiles } from './websiteStaticSite';
+import { buildWebsiteStaticFiles, type WebsiteStaticImageAsset } from './websiteStaticSite';
 
 export class WebsiteDeploymentConfigurationError extends Error {
   constructor(message: string) {
@@ -124,15 +124,39 @@ async function sendR2Object(
   }
 }
 
+export async function uploadPrivateWebsiteAssetToR2(input: {
+  websiteId: string;
+  assetId: string;
+  buffer: Buffer;
+}): Promise<string> {
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(input.websiteId) || !/^[A-Za-z0-9_-]{1,80}$/.test(input.assetId)) {
+    throw new Error('Website image identifiers are invalid for private storage.');
+  }
+  if (!input.buffer.length || input.buffer.length > 8 * 1024 * 1024) {
+    throw new Error('Website images must be non-empty and 8 MB or smaller.');
+  }
+  const key = `websites/${input.websiteId}/assets/${input.assetId}/image.jpg`;
+  await sendR2Object(getR2Config(), key, 'PUT', input.buffer, 'image/jpeg', 'private, no-store, max-age=0');
+  return key;
+}
+
+export async function deletePrivateWebsiteAssetFromR2(key: string): Promise<void> {
+  if (!/^websites\/[A-Za-z0-9_-]{1,80}\/assets\/[A-Za-z0-9_-]{1,80}\/image\.jpg$/.test(key)) {
+    throw new Error('Website image key is invalid for private storage deletion.');
+  }
+  await sendR2Object(getR2Config(), key, 'DELETE', Buffer.alloc(0), 'application/octet-stream', 'private, no-store, max-age=0');
+}
+
 export async function uploadWebsiteDeployment(input: {
   websiteId: string;
   version: number;
   content: unknown;
+  assets?: WebsiteStaticImageAsset[];
   deploymentId?: string;
 }): Promise<UploadedWebsiteDeployment> {
   const config = getR2Config();
   const deploymentId = input.deploymentId ?? randomUUID();
-  const { files } = buildWebsiteStaticFiles(input.content, input.websiteId, deploymentId);
+  const { files } = buildWebsiteStaticFiles(input.content, input.websiteId, deploymentId, input.assets);
   const r2Prefix = `websites/${input.websiteId}/deployments/${deploymentId}`;
   const manifestKey = `${r2Prefix}/manifest.json`;
   const manifest: UploadedWebsiteDeployment['manifest'] = {};
@@ -141,7 +165,7 @@ export async function uploadWebsiteDeployment(input: {
 
   try {
     for (const [relativePath, file] of files) {
-      const body = Buffer.from(file.body, 'utf8');
+      const body = typeof file.body === 'string' ? Buffer.from(file.body, 'utf8') : Buffer.from(file.body);
       const key = `${r2Prefix}/${relativePath}`;
       const sha256 = createHash('sha256').update(body).digest('hex');
       await sendR2Object(config, key, 'PUT', body, file.contentType, file.cacheControl);

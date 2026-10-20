@@ -2,10 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Storage } from '@google-cloud/storage';
 import sharp from 'sharp';
 import { validateImageBuffer } from '../lib/imageValidator';
-import type { WebsiteContent, WebsiteImageSlot } from './websiteContent';
-import { searchPexelsImages, type PexelsImageCandidate } from './pexelsService';
 
-const MAX_AUTOMATIC_PEXELS_SLOTS = 3;
 const USER_IMAGE_MAX_BYTES = 8 * 1024 * 1024;
 const SIGNED_PREVIEW_TTL_MS = 30 * 60 * 1000;
 let storageClient: Storage | null = null;
@@ -13,10 +10,19 @@ let storageClient: Storage | null = null;
 export interface WebsiteAssetCreateData {
   id: string;
   slotId: string;
-  source: 'pexels' | 'user_upload';
+  source: 'pexels' | 'pixabay' | 'unsplash' | 'user_upload' | 'imagen_generated' | 'gemini_generated';
   providerAssetId: string | null;
   objectKey: string | null;
+  r2ObjectKey?: string | null;
   remoteUrl: string | null;
+  providerImageUrl?: string | null;
+  providerTags?: string[];
+  searchQuery?: string | null;
+  retrievedAt?: Date | null;
+  licenseName?: string | null;
+  licenseUrl?: string | null;
+  attributionRequired?: boolean;
+  version?: number;
   sourcePageUrl: string | null;
   creatorName: string | null;
   creatorProfileUrl: string | null;
@@ -24,49 +30,6 @@ export interface WebsiteAssetCreateData {
   mimeType: string | null;
   width: number | null;
   height: number | null;
-}
-
-function createPexelsAsset(slot: WebsiteImageSlot, photo: PexelsImageCandidate): WebsiteAssetCreateData {
-  return {
-    id: randomUUID(),
-    slotId: slot.id,
-    source: 'pexels',
-    providerAssetId: photo.providerAssetId,
-    objectKey: null,
-    remoteUrl: photo.imageUrl,
-    sourcePageUrl: photo.sourcePageUrl,
-    creatorName: photo.creatorName,
-    creatorProfileUrl: photo.creatorProfileUrl,
-    alt: photo.alt || slot.alt,
-    mimeType: null,
-    width: photo.width,
-    height: photo.height,
-  };
-}
-
-export async function fillWebsiteImageSlots(content: WebsiteContent): Promise<{ content: WebsiteContent; assets: WebsiteAssetCreateData[] }> {
-  const assets: WebsiteAssetCreateData[] = [];
-  const selectedProviderIds = new Set<string>();
-  const nextSlots = [...content.imageSlots];
-  const missing = nextSlots.filter((slot) => !slot.assetId).slice(0, MAX_AUTOMATIC_PEXELS_SLOTS);
-
-  for (const slot of missing) {
-    try {
-      const orientation = slot.role === 'menu_item' ? 'square' : 'landscape';
-      const results = await searchPexelsImages(slot.query, orientation);
-      const photo = results.find((candidate) => !selectedProviderIds.has(candidate.providerAssetId));
-      if (!photo) continue;
-      selectedProviderIds.add(photo.providerAssetId);
-      const asset = createPexelsAsset(slot, photo);
-      assets.push(asset);
-      const index = nextSlots.findIndex((candidate) => candidate.id === slot.id);
-      if (index >= 0) nextSlots[index] = { ...nextSlots[index], assetId: asset.id };
-    } catch {
-      // Image search is an enhancement; website generation remains usable when Pexels is unavailable.
-    }
-  }
-
-  return { content: { ...content, imageSlots: nextSlots }, assets };
 }
 
 function getStorage(): Storage {
@@ -92,7 +55,7 @@ export async function savePrivateWebsiteUpload(input: {
   websiteId: string;
   buffer: Buffer;
   mimeType: string;
-}): Promise<{ objectKey: string; mimeType: string; width: number; height: number; previewUrl: string }> {
+}): Promise<{ objectKey: string; mimeType: string; width: number; height: number; previewUrl: string; buffer: Buffer }> {
   if (input.buffer.length > USER_IMAGE_MAX_BYTES) throw new Error('Website images must be 8 MB or smaller.');
   const validated = validateImageBuffer(input.buffer, input.mimeType);
   const output = await sharp(validated.buffer, { limitInputPixels: 25_000_000 })
@@ -119,6 +82,7 @@ export async function savePrivateWebsiteUpload(input: {
       mimeType: 'image/jpeg',
       width: output.info.width,
       height: output.info.height,
+      buffer: output.data,
       previewUrl,
     };
   } catch (error) {
@@ -132,13 +96,21 @@ export async function getWebsiteAssetPreviewUrl(asset: {
   remoteUrl: string | null;
   objectKey: string | null;
 }): Promise<string | null> {
-  if (asset.source === 'pexels') return asset.remoteUrl;
-  if (asset.source !== 'user_upload' || !asset.objectKey) return null;
+  if (asset.source === 'pexels' || asset.source === 'unsplash') return asset.remoteUrl;
+  if (!['pixabay', 'user_upload', 'imagen_generated', 'gemini_generated'].includes(asset.source) || !asset.objectKey) return null;
   const [url] = await getStorage().bucket(getBucketName()).file(asset.objectKey).getSignedUrl({
     action: 'read',
     expires: Date.now() + SIGNED_PREVIEW_TTL_MS,
   });
   return url;
+}
+
+export async function readPrivateWebsiteUpload(objectKey: string): Promise<Buffer> {
+  const [buffer] = await getStorage().bucket(getBucketName()).file(objectKey).download();
+  if (buffer.length === 0 || buffer.length > USER_IMAGE_MAX_BYTES) {
+    throw new Error('A saved website image is empty or exceeds the publishing limit.');
+  }
+  return buffer;
 }
 
 export async function deletePrivateWebsiteUpload(objectKey: string | null): Promise<void> {

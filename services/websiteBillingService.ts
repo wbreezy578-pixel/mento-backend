@@ -2,9 +2,10 @@ import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import logger from '../lib/logger';
 import { isSubscriptionActive } from './planService';
+import { isWebsTestingMode } from './websiteTestingMode';
 
 export const WEBSITE_PROJECT_LIMIT = 5;
-export const WEBSITE_EDIT_LIMIT_PER_PERIOD = 50;
+export const WEBSITE_EDIT_LIMIT_PER_PERIOD = 15;
 export const WEBSITE_HOSTING_PRICE_USD = 5;
 const configuredGraceDays = process.env.WEBSITE_PAYMENT_GRACE_DAYS;
 export const WEBSITE_PAYMENT_GRACE_DAYS = configuredGraceDays === undefined ? 7 : Number(configuredGraceDays);
@@ -109,7 +110,6 @@ export async function getWebsiteBillingSnapshot(userId: string, now = new Date()
     ? await prisma.website.count({
         where: {
           userId,
-          deletedAt: null,
           createdAt: { gte: start, lt: end },
         },
       })
@@ -141,6 +141,7 @@ export async function getWebsiteBillingSnapshot(userId: string, now = new Date()
 
 export async function assertWebsiteFeatureAccess(userId: string, mode: WebsiteAccessMode, now = new Date()): Promise<WebsiteQuotaSnapshot> {
   const snapshot = await getWebsiteBillingSnapshot(userId, now);
+  if (isWebsTestingMode()) return snapshot;
 
   if (!snapshot.activePro) {
     await recordWebsitePolicyDenial(userId, mode, 'pro_inactive');
@@ -149,12 +150,12 @@ export async function assertWebsiteFeatureAccess(userId: string, mode: WebsiteAc
 
   if (mode === 'create' && snapshot.projectUsed >= WEBSITE_PROJECT_LIMIT) {
     await recordWebsitePolicyDenial(userId, mode, 'project_limit');
-    throw new WebsiteAccessError(`You reached your 5 website projects limit for this Pro billing period.`);
+    throw new WebsiteAccessError('You reached the limit of 5 website creations for this Pro billing period.');
   }
 
   if (mode === 'edit' && snapshot.editUsed >= WEBSITE_EDIT_LIMIT_PER_PERIOD) {
     await recordWebsitePolicyDenial(userId, mode, 'edit_limit');
-    throw new WebsiteAccessError(`You reached your 50 successful website edits limit for this Pro billing period.`);
+    throw new WebsiteAccessError('You reached the limit of 15 successful AI edits for this Pro billing period.');
   }
 
   return snapshot;
@@ -169,6 +170,7 @@ export async function createWebsiteWithinProLimit<T>(
   try {
     return await prisma.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "UserWallet" WHERE "userId" = ${userId} FOR UPDATE`;
+      if (isWebsTestingMode()) return create(tx);
       const wallet = await tx.userWallet.findUnique({ where: { userId }, include: { plan: true } });
       const activePro = Boolean(wallet?.plan?.name === 'PRO' && isSubscriptionActive(
         wallet.subscriptionStatus,
@@ -182,7 +184,7 @@ export async function createWebsiteWithinProLimit<T>(
       if (!start || !end) throw new WebsiteAccessError('The Mento Pro billing period could not be resolved.');
       const pendingStart = new Date(Math.max(start.getTime(), now.getTime() - 5 * 60 * 1000));
       const [projects, pendingCreations] = await Promise.all([
-        tx.website.count({ where: { userId, deletedAt: null, createdAt: { gte: start, lt: end } } }),
+        tx.website.count({ where: { userId, createdAt: { gte: start, lt: end } } }),
         tx.usageLog.count({
           where: {
             userId,
@@ -195,7 +197,7 @@ export async function createWebsiteWithinProLimit<T>(
         }),
       ]);
       if (projects + pendingCreations >= WEBSITE_PROJECT_LIMIT) {
-        throw new WebsiteAccessError('You reached your 5 website projects limit for this Pro billing period.');
+        throw new WebsiteAccessError('You reached the limit of 5 website creations for this Pro billing period.');
       }
 
       return create(tx);

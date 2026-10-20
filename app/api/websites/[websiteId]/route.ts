@@ -6,6 +6,10 @@ import { readJsonBodyWithLimit, RequestBodyError } from '../../../../lib/request
 import { buildCorsHeaders } from '../../../../lib/securityHeaders';
 import { isWebsiteType, normalizeWebsiteContent } from '../../../../services/websiteContent';
 import { assertWebsiteFeatureAccess, WebsiteAccessError } from '../../../../services/websiteBillingService';
+import { deletePrivateWebsiteUpload } from '../../../../services/websiteAssetService';
+import { deletePrivateWebsiteAssetFromR2 } from '../../../../services/websiteDeploymentStorage';
+import logger from '../../../../lib/logger';
+import { buildWebsiteApiView } from '../../../../services/websiteAssetApi';
 
 type RouteContext = { params: Promise<{ websiteId: string }> };
 const MAX_BODY_BYTES = 96 * 1024;
@@ -31,7 +35,7 @@ export async function GET(req: Request, context: RouteContext) {
       },
     });
     if (!website) return NextResponse.json({ error: 'Website not found.' }, { status: 404, headers: headers(req) });
-    return NextResponse.json({ website }, { headers: headers(req) });
+    return NextResponse.json({ website: await buildWebsiteApiView(website) }, { headers: headers(req) });
   } catch (error) {
     if (error instanceof AIRequestGatewayError) return NextResponse.json(error.body, { status: error.status, headers: { ...error.headers, ...headers(req) } });
     return NextResponse.json({ error: 'Website could not be loaded.' }, { status: 500, headers: headers(req) });
@@ -102,7 +106,10 @@ export async function PATCH(req: Request, context: RouteContext) {
       return NextResponse.json({ error: exists ? 'This website changed elsewhere. Reload it before saving.' : 'Website not found.', code: exists ? 'website_revision_conflict' : 'website_not_found' }, { status: exists ? 409 : 404, headers: headers(req) });
     }
 
-    return NextResponse.json(result, { headers: headers(req) });
+    return NextResponse.json({
+      ...result,
+      website: await buildWebsiteApiView(result.website),
+    }, { headers: headers(req) });
   } catch (error) {
     if (error instanceof RequestBodyError) return NextResponse.json({ error: error.message, code: error.code }, { status: error.status, headers: headers(req) });
     if (error instanceof WebsiteAccessError) return NextResponse.json({ error: error.message }, { status: error.status, headers: headers(req) });
@@ -115,6 +122,11 @@ export async function DELETE(req: Request, context: RouteContext) {
   try {
     const user = await authenticateAIRequest(req);
     const { websiteId } = await context.params;
+    const ownedWebsite = await prisma.website.findFirst({
+      where: { id: websiteId, userId: user.id },
+      select: { id: true },
+    });
+    if (!ownedWebsite) return NextResponse.json({ error: 'Website not found.' }, { status: 404, headers: headers(req) });
     const now = new Date();
     const result = await prisma.$transaction(async (tx) => {
       const deleted = await tx.website.updateMany({
@@ -139,7 +151,19 @@ export async function DELETE(req: Request, context: RouteContext) {
       }
       return deleted;
     });
-    if (result.count === 0) return NextResponse.json({ error: 'Website not found.' }, { status: 404, headers: headers(req) });
+    const assets = await prisma.websiteAsset.findMany({
+      where: { websiteId },
+      select: { objectKey: true, r2ObjectKey: true },
+    });
+    const cleanup = await Promise.allSettled(assets.flatMap((asset) => [
+      ...(asset.objectKey ? [deletePrivateWebsiteUpload(asset.objectKey)] : []),
+      ...(asset.r2ObjectKey ? [deletePrivateWebsiteAssetFromR2(asset.r2ObjectKey)] : []),
+    ]));
+    const failedCleanupCount = cleanup.filter((item) => item.status === 'rejected').length;
+    if (failedCleanupCount > 0) {
+      logger.error('Deleted website image cleanup failed', { failedCleanupCount, alreadyDeleted: result.count === 0 });
+      return NextResponse.json({ error: 'The website was deleted, but some stored images could not be removed.' }, { status: 503, headers: headers(req) });
+    }
     return new NextResponse(null, { status: 204, headers: headers(req) });
   } catch (error) {
     if (error instanceof AIRequestGatewayError) return NextResponse.json(error.body, { status: error.status, headers: { ...error.headers, ...headers(req) } });
